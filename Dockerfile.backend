@@ -1,0 +1,49 @@
+# syntax=docker/dockerfile:1.7
+
+# 固定 uv 版本：仅用于复制 uv/uvx 二进制，保证依赖解析行为可复现。
+FROM ghcr.io/astral-sh/uv:0.12.23 AS uv
+
+# 固定 Python 3.12 slim 运行时；uv.lock 的 requires-python 为 ==3.12.*。
+FROM python:3.12-slim-bookworm AS runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_PROJECT_ENVIRONMENT=/opt/venv \
+    UV_CACHE_DIR=/tmp/uv-cache \
+    UV_PYTHON_DOWNLOADS=never \
+    HOME=/tmp \
+    PATH="/opt/venv/bin:$PATH" \
+    M_PHOTO_DATA_DIR=/data \
+    GEO_AI_MODE=mock
+
+COPY --from=uv /uv /uvx /bin/
+
+WORKDIR /app
+
+# 先复制锁文件与 pyproject 引用的 readme，最大化依赖层缓存；
+# --no-dev 只安装运行依赖，pytest/httpx 等开发依赖不进入镜像。
+COPY pyproject.toml uv.lock ./
+COPY backend/README.md ./backend/README.md
+RUN uv sync --frozen --no-dev --no-install-project
+
+# 新 FastAPI 后端及其根目录依赖模块；旧 Flask 代码不进入镜像。
+# .dockerignore 已排除 backend/.venv、backend/tests、storage/uploads、数据库等非运行文件。
+COPY backend/ ./backend/
+COPY ai/ ./ai/
+COPY reasoning/ ./reasoning/
+COPY services/ ./services/
+COPY config.py ./
+COPY data/ ./data/
+
+# 使用数值 UID 的非 root 运行身份，避免依赖 passwd 工具或额外 apt 安装。
+RUN mkdir -p /data /tmp/uv-cache \
+    && chown -R 10001:10001 /data /app /opt/venv /tmp/uv-cache
+
+USER 10001:10001
+
+EXPOSE 8000
+
+# 生产启动命令；uv run --no-sync 使用已安装的锁定依赖，不再联网同步。
+CMD ["uv", "run", "--frozen", "--no-sync", "uvicorn", "backend.app.main:app", "--host", "0.0.0.0", "--port", "8000"]

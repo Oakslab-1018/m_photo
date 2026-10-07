@@ -1,0 +1,46 @@
+# m-photo 第一阶段：仅包含新的 Geo 定位系统（FastAPI + Vue/Nginx）。
+# 旧 Flask 应用（app.py / login / game）不由本 Compose 启动。
+name: m-photo
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    image: m-photo-backend:local
+    environment:
+      # 所有可写数据（SQLite + 上传图片）都落在具名卷内。
+      M_PHOTO_DATA_DIR: /data
+      # 第一阶段固定 mock：镜像不安装 easyocr，也不下载模型权重。
+      GEO_AI_MODE: mock
+    volumes:
+      - backend-data:/data
+    expose:
+      - "8000"
+    healthcheck:
+      # 用运行时自带的 Python urllib 探测，无需在镜像中额外安装 curl。
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3).read()"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+      args:
+        NODE_VERSION: "24"
+    image: m-photo-frontend:local
+    ports:
+      # 第一阶段 geo 无用户鉴权：默认只绑定宿主机回环地址。
+      # 仅在同一台机器内访问；如需局域网访问，用 BIND_ADDRESS/APP_PORT 覆盖。
+      - "${BIND_ADDRESS:-127.0.0.1}:${APP_PORT:-8080}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  backend-data:

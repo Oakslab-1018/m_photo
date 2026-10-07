@@ -1,0 +1,23 @@
+# syntax=docker/dockerfile:1.7
+
+ARG NODE_VERSION=24
+
+# ---------- 构建阶段：npm ci + Vite 生产构建 ----------
+FROM node:${NODE_VERSION}-bookworm-slim AS build
+
+WORKDIR /app
+
+# package-lock.json 必须由前端 worker 提交，npm ci 依赖它保证可复现构建。
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+
+COPY frontend/ ./
+RUN npm run build
+
+# ---------- 运行阶段：Nginx 只托管 dist，不使用 Vite 生产服务器 ----------
+FROM nginx:1.27-alpine AS runtime
+
+COPY deploy/nginx/default.conf /etc/nginx/conf.d/default.conf
+COPY --from=build /app/dist/ /usr/share/nginx/html/
+
+EXPOSE 80

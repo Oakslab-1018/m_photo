@@ -1,0 +1,73 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.spec
+
+# uv 本地缓存与隔离解释器
+.uv-cache/
+.uv-python/
+
+# Node
+frontend/node_modules/
+node_modules/
+frontend/dist/
+
+# 环境变量与密钥
+.env
+.env.*
+!.env.example
+
+# 运行数据与日志（保留 data/countries.json 等只读资源）
+instance/
+logs/
+*.log
+*.log.*
+database.db
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+data/uploads/
+data/m_photo.db
+data/database.db
+
+# 本地模型权重
+models/*.onnx
+models/*.pt
+models/*.pth
+models/*.bin
+models/*.safetensors
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# 后端运行状态（新 Geo 系统只用 data/ 或容器内 /data）
+backend/storage/
+backend/uploads/
+backend/data/
+backend/*.db
+backend/*.sqlite*
+
+# 本地 legacy 备份（只在本机保留，不上传）
+.local-backup/
+
+# 通用用户数据/隐私目录
+storage/
+**/storage/
+uploads/
+**/uploads/
+static/images/
+**/static/images/

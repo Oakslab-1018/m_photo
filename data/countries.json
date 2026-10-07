@@ -1,0 +1,362 @@
+[
+  {
+    "name": "Japan",
+    "name_zh": "日本",
+    "iso": "JP",
+    "lat": 36.2048,
+    "lng": 138.2529,
+    "continent": "Asia",
+    "driving_side": "left",
+    "languages_spoken": ["ja"],
+    "features": {
+      "language": ["ja"],
+      "vegetation": ["temperate_forest"],
+      "building": ["modern_glass", "generic"],
+      "vehicle": ["white_silver_vehicle", "dark_vehicle"],
+      "climate": ["temperate", "temperate_maritime"],
+      "culture": ["shrine", "sakura"]
+    }
+  },
+  {
+    "name": "China",
+    "name_zh": "中国",
+    "iso": "CN",
+    "lat": 35.8617,
+    "lng": 104.1954,
+    "continent": "Asia",
+    "driving_side": "right",
+    "languages_spoken": ["zh"],
+    "features": {
+      "language": ["zh"],
+      "vegetation": ["temperate_forest", "grassland", "desert"],
+      "building": ["modern_glass", "colonial", "generic"],
+      "vehicle": ["white_silver_vehicle", "dark_vehicle"],
+      "climate": ["temperate", "arid", "mediterranean_sunny"],
+      "culture": ["pagoda", "lantern"]
+    }
+  },
+  {
+    "name": "South Korea",
+    "name_zh": "韩国",
+    "iso": "KR",
+    "lat": 35.9078,
+    "lng": 127.7669,
+    "continent": "Asia",
+    "driving_side": "right",
+    "languages_spoken": ["ko"],
+    "features": {
+      "language": ["ko"],
+      "vegetation": ["temperate_forest"],
+      "building": ["modern_glass", "generic"],
+      "vehicle": ["white_silver_vehicle", "dark_vehicle"],
+      "climate": ["temperate", "temperate_maritime"],
+      "culture": ["hanbok"]
+    }
+  },
+  {
+    "name": "France",
+    "name_zh": "法国",
+    "iso": "FR",
+    "lat": 46.2276,
+    "lng": 2.2137,
+    "continent": "Europe",
+    "driving_side": "right",
+    "languages_spoken": ["latin"],
+    "features": {
+      "language": ["latin"],
+      "vegetation": ["temperate_forest", "grassland"],
+      "building": ["gothic", "mediterranean", "generic"],
+      "vehicle": ["white_silver_vehicle", "dark_vehicle"],
+      "climate": ["temperate_maritime", "mediterranean_sunny", "temperate"],
+      "culture": ["eiffel", "cafe"]
+    }
+  },
+  {
+    "name": "Germany",
+    "name_zh": "德国",
+    "iso": "DE",
+    "lat": 51.1657,
+    "lng": 10.4515,
+    "continent": "Europe",
+    "driving_side": "right",
+    "languages_spoken": ["latin"],
+    "features": {
+      "language": ["latin"],
+      "vegetation": ["temperate_forest"],
+      "building": ["gothic", "modern_glass", "generic"],
+      "vehicle": ["dark_vehicle", "white_silver_vehicle"],
+      "climate": ["temperate", "temperate_maritime"],
+      "culture": ["castle"]
+    }
+  },
+  {
+    "name": "Italy",
+    "name_zh": "意大利",
+    "iso": "IT",
+    "lat": 41.8719,
+    "lng": 12.5674,
+    "continent": "Europe",
+    "driving_side": "right",
+    "languages_spoken": ["latin"],
+    "features": {
+      "language": ["latin"],
+      "vegetation": ["grassland", "savanna"],
+      "building": ["mediterranean", "gothic", "generic"],
+      "vehicle": ["white_silver_vehicle", "dark_vehicle"],
+      "climate": ["mediterranean_sunny", "arid"],
+      "culture": ["colosseum", "pizza"]
+    }
+  },
+  {
+    "name": "United Kingdom",
+    "name_zh": "英国",
+    "iso": "GB",
+    "lat": 55.3781,
+    "lng": 3.436,
+    "continent": "Europe",
+    "driving_side": "left",
+    "languages_spoken": ["latin"],
+    "features": {
+      "language": ["latin"],
+      "vegetation": ["temperate_forest", "grassland"],
+      "building": ["gothic", "generic"],
+      "vehicle": ["dark_vehicle", "white_silver_vehicle"],
+      "climate": ["temperate_maritime", "temperate"],
+      "culture": ["big_ben", "red_bus"]
+    }
+  },
+  {
+    "name": "Spain",
+    "name_zh": "西班牙",
+    "iso": "ES",
+    "lat": 40.4637,
+    "lng": 3.7492,
+    "continent": "Europe",
+    "driving_side": "right",
+    "languages_spoken": ["latin"],
+    "features": {
+      "language": ["latin"],
+      "vegetation": ["grassland", "savanna"],
+      "building": ["mediterranean", "generic"],
+      "vehicle": ["white_silver_vehicle", "dark_vehicle"],
+      "climate": ["mediterranean_sunny", "arid"],
+      "culture": ["flamenco"]
+    }
+  },
+  {
+    "name": "Greece",
+    "name_zh": "希腊",
+    "iso": "GR",
+    "lat": 39.0742,
+    "lng": 21.8243,
+    "continent": "Europe",
+    "driving_side": "right",
+    "languages_spoken": ["latin"],
+    "features": {
+      "language": ["latin"],
+      "vegetation": ["savanna", "grassland"],
+      "building": ["mediterranean", "generic"],
+      "vehicle": ["white_silver_vehicle", "dark_vehicle"],
+      "climate": ["mediterranean_sunny"],
+      "culture": ["acropolis"]
+    }
+  },
+  {
+    "name": "Russia",
+    "name_zh": "俄罗斯",
+    "iso": "RU",
+    "lat": 61.524,
+    "lng": 105.3188,
+    "continent": "Europe",
+    "driving_side": "right",
+    "languages_spoken": ["cyrillic"],
+    "features": {
+      "language": ["cyrillic"],
+      "vegetation": ["temperate_forest", "urban_sparse"],
+      "building": ["generic", "modern_glass", "gothic"],
+      "vehicle": ["dark_vehicle", "white_silver_vehicle"],
+      "climate": ["cold_polar", "temperate"],
+      "culture": ["kremlin"]
+    }
+  },
+  {
+    "name": "United States",
+    "name_zh": "美国",
+    "iso": "US",
+    "lat": 37.0902,
+    "lng": 95.7129,
+    "continent": "North America",
+    "driving_side": "right",
+    "languages_spoken": ["latin"],
+    "features": {
+      "language": ["latin"],
+      "vegetation": ["temperate_forest", "grassland", "desert"],
+      "building": ["modern_glass", "colonial", "generic"],
+      "vehicle": ["dark_vehicle", "white_silver_vehicle"],
+      "climate": ["temperate", "arid", "mediterranean_sunny", "cold_polar"],
+      "culture": ["statue_of_liberty"]
+    }
+  },
+  {
+    "name": "Canada",
+    "name_zh": "加拿大",
+    "iso": "CA",
+    "lat": 56.1304,
+    "lng": 106.3468,
+    "continent": "North America",
+    "driving_side": "right",
+    "languages_spoken": ["latin"],
+    "features": {
+      "language": ["latin"],
+      "vegetation": ["temperate_forest", "urban_sparse"],
+      "building": ["modern_glass", "generic"],
+      "vehicle": ["dark_vehicle", "white_silver_vehicle"],
+      "climate": ["cold_polar", "temperate"],
+      "culture": ["maple"]
+    }
+  },
+  {
+    "name": "Brazil",
+    "name_zh": "巴西",
+    "iso": "BR",
+    "lat": 14.235,
+    "lng": 51.9253,
+    "continent": "South America",
+    "driving_side": "right",
+    "languages_spoken": ["latin"],
+    "features": {
+      "language": ["latin"],
+      "vegetation": ["tropical_rainforest", "savanna"],
+      "building": ["modern_glass", "colonial", "generic"],
+      "vehicle": ["white_silver_vehicle", "dark_vehicle"],
+      "climate": ["temperate", "arid"],
+      "culture": ["samba"]
+    }
+  },
+  {
+    "name": "Australia",
+    "name_zh": "澳大利亚",
+    "iso": "AU",
+    "lat": 25.2744,
+    "lng": 133.7751,
+    "continent": "Oceania",
+    "driving_side": "left",
+    "languages_spoken": ["latin"],
+    "features": {
+      "language": ["latin"],
+      "vegetation": ["desert", "savanna", "grassland"],
+      "building": ["modern_glass", "generic"],
+      "vehicle": ["white_silver_vehicle", "dark_vehicle"],
+      "climate": ["arid", "mediterranean_sunny", "temperate"],
+      "culture": ["opera_house"]
+    }
+  },
+  {
+    "name": "India",
+    "name_zh": "印度",
+    "iso": "IN",
+    "lat": 20.5937,
+    "lng": 78.9629,
+    "continent": "Asia",
+    "driving_side": "left",
+    "languages_spoken": ["latin"],
+    "features": {
+      "language": ["latin"],
+      "vegetation": ["tropical_rainforest", "grassland", "desert"],
+      "building": ["generic", "colonial"],
+      "vehicle": ["white_silver_vehicle", "dark_vehicle"],
+      "climate": ["temperate", "arid"],
+      "culture": ["temple", "sari"]
+    }
+  },
+  {
+    "name": "Thailand",
+    "name_zh": "泰国",
+    "iso": "TH",
+    "lat": 15.87,
+    "lng": 100.9925,
+    "continent": "Asia",
+    "driving_side": "left",
+    "languages_spoken": ["thai"],
+    "features": {
+      "language": ["thai"],
+      "vegetation": ["tropical_rainforest", "savanna"],
+      "building": ["generic", "mediterranean"],
+      "vehicle": ["white_silver_vehicle", "dark_vehicle"],
+      "climate": ["temperate", "arid"],
+      "culture": ["temple", "elephant"]
+    }
+  },
+  {
+    "name": "Egypt",
+    "name_zh": "埃及",
+    "iso": "EG",
+    "lat": 26.8206,
+    "lng": 30.8025,
+    "continent": "Africa",
+    "driving_side": "right",
+    "languages_spoken": ["arabic"],
+    "features": {
+      "language": ["arabic"],
+      "vegetation": ["desert", "savanna"],
+      "building": ["generic", "mediterranean"],
+      "vehicle": ["white_silver_vehicle", "dark_vehicle"],
+      "climate": ["arid", "mediterranean_sunny"],
+      "culture": ["pyramid"]
+    }
+  },
+  {
+    "name": "Mexico",
+    "name_zh": "墨西哥",
+    "iso": "MX",
+    "lat": 23.6345,
+    "lng": 102.5528,
+    "continent": "North America",
+    "driving_side": "right",
+    "languages_spoken": ["latin"],
+    "features": {
+      "language": ["latin"],
+      "vegetation": ["desert", "savanna", "tropical_rainforest"],
+      "building": ["colonial", "generic"],
+      "vehicle": ["white_silver_vehicle", "dark_vehicle"],
+      "climate": ["arid", "mediterranean_sunny"],
+      "culture": ["aztec"]
+    }
+  },
+  {
+    "name": "Netherlands",
+    "name_zh": "荷兰",
+    "iso": "NL",
+    "lat": 52.1326,
+    "lng": 5.2913,
+    "continent": "Europe",
+    "driving_side": "right",
+    "languages_spoken": ["latin"],
+    "features": {
+      "language": ["latin"],
+      "vegetation": ["grassland", "temperate_forest"],
+      "building": ["generic", "gothic"],
+      "vehicle": ["dark_vehicle", "white_silver_vehicle"],
+      "climate": ["temperate_maritime", "temperate"],
+      "culture": ["windmill"]
+    }
+  },
+  {
+    "name": "Sweden",
+    "name_zh": "瑞典",
+    "iso": "SE",
+    "lat": 60.1282,
+    "lng": 18.6435,
+    "continent": "Europe",
+    "driving_side": "right",
+    "languages_spoken": ["latin"],
+    "features": {
+      "language": ["latin"],
+      "vegetation": ["temperate_forest", "urban_sparse"],
+      "building": ["modern_glass", "generic"],
+      "vehicle": ["dark_vehicle", "white_silver_vehicle"],
+      "climate": ["cold_polar", "temperate"],
+      "culture": ["viking"]
+    }
+  }
+]

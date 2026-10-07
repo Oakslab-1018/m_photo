@@ -1,0 +1,103 @@
+# ---------------------------------------------------------------------------
+# Docker 构建上下文排除项（两个镜像共用 root context）。
+# 目的：缩小上下文，避免把 Windows 本地状态、旧 Flask 产物和运行数据烘进镜像。
+# ---------------------------------------------------------------------------
+
+# 版本控制 / 编辑器 / 临时文件
+.git
+.gitignore
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+_enc_test.txt
+
+# 环境变量与密钥：绝不进入镜像，仅保留无密示例文件
+.env
+.env.*
+!.env.example
+
+# 本机环境与缓存（含 backend/.venv 等子目录）
+.venv/
+**/.venv/
+venv/
+**/venv/
+.uv-cache/
+.uv-python/
+.pytest_cache/
+**/.pytest_cache/
+.ruff_cache/
+**/.ruff_cache/
+.mypy_cache/
+**/.mypy_cache/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+**/*.py[cod]
+
+# Node 构建产物（镜像内部会重新 npm ci / npm run build）
+node_modules/
+**/node_modules/
+frontend/dist/
+
+# 旧 Flask 打包产物与入口（属于 legacy 系统，不进入新 Geo 镜像）
+build/
+dist/
+*.spec
+app.py
+templates/
+static/
+routes/
+models/
+start_server.py
+create_*.py
+download_*.py
+build.log
+server.*.log
+
+# 后端测试：不进运行镜像
+backend/tests/
+tests/
+
+# 运行时状态、日志与数据库：必须由具名卷提供，绝不烘进镜像
+instance/
+**/instance/
+logs/
+**/logs/
+storage/
+**/storage/
+uploads/
+**/uploads/
+*.log
+**/*.log
+*.log.*
+**/*.log.*
+database.db
+**/*.db
+*.db-*
+**/*.db-*
+*.sqlite
+**/*.sqlite
+*.sqlite3
+**/*.sqlite3
+backend/storage/
+backend/uploads/
+backend/data/
+
+# 本地模型权重（第一阶段只用 mock，不打包权重）
+models/*.onnx
+models/*.pt
+models/*.pth
+models/*.bin
+models/*.safetensors
+
+# 本地 legacy 备份（绝不进入镜像构建上下文）
+.local-backup/
+
+# 通用用户数据/隐私目录（由具名卷提供）
+storage/
+**/storage/
+uploads/
+**/uploads/
+static/images/
+**/static/images/
