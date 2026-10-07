@@ -33,10 +33,12 @@ class StaticImportTest(unittest.TestCase):
             with self.subTest(module=name):
                 self.assertIsNotNone(importlib.import_module(name))
 
-    def test_legacy_dependencies_are_reused_not_copied(self):
-        ai = importlib.import_module("ai")
+    def test_domain_dependencies_are_reused_not_copied(self):
+        domain = importlib.import_module("backend.app.domain.geolocation")
+        analysis = importlib.import_module("backend.app.domain.geolocation.analysis")
         chat = importlib.import_module("services.chat")
-        self.assertTrue(hasattr(ai, "AnalysisPipeline"))
+        self.assertFalse(hasattr(domain, "AnalysisPipeline"))
+        self.assertTrue(hasattr(analysis, "AnalysisPipeline"))
         self.assertTrue(hasattr(chat, "ChatService"))
         self.assertTrue(issubclass(
             importlib.import_module("backend.app.services.chat").ChatService,

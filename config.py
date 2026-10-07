@@ -12,7 +12,7 @@ DATA_DIR = BASE_DIR / "data"
 # mock 为默认值：镜像/本地无需 easyocr 模型即可启动。
 AI_MODE = os.environ.get("GEO_AI_MODE", "mock")
 
-# 推理引擎参数（ai/reasoning 当前实际使用）。
+# 推理引擎参数（backend/app/domain/geolocation 当前实际使用）。
 MIN_CLUE_CONFIDENCE = 0.3
 TOP_N_HYPOTHESES = 5
 CONFIRMATION_THRESHOLD = 0.65

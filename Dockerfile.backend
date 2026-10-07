@@ -31,8 +31,6 @@ RUN uv sync --frozen --no-dev --no-install-project
 # 新 FastAPI 后端及其根目录依赖模块；旧 Flask 代码不进入镜像。
 # .dockerignore 已排除 backend/.venv、backend/tests、storage/uploads、数据库等非运行文件。
 COPY backend/ ./backend/
-COPY ai/ ./ai/
-COPY reasoning/ ./reasoning/
 COPY services/ ./services/
 COPY config.py ./
 COPY data/ ./data/

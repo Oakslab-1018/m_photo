@@ -8,7 +8,7 @@ from __future__ import annotations
 from typing import List
 
 from .base import BaseAnalyzer
-from reasoning.clue import Clue, VALUE_LABELS
+from ..clue import Clue, VALUE_LABELS
 
 
 def detect_language_from_text(text: str) -> tuple[str, float]:

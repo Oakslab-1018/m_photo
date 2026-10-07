@@ -11,8 +11,8 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from config import CONFIRMATION_THRESHOLD
-from reasoning.clue import Clue, DIM_LABELS
-from reasoning.engine import CountryScore, ReasoningEngine
+from .clue import Clue, DIM_LABELS
+from .engine import CountryScore, ReasoningEngine
 
 
 @dataclass
@@ -78,7 +78,7 @@ class HypothesisManager:
     def _discriminating_dimension(self, a: CountryScore, b: CountryScore,
                                   clues: List[Clue]) -> Optional[str]:
         """找一个 a、b 特征不同且用户尚未确认的维度。"""
-        from reasoning import knowledge_graph as kg
+        from . import knowledge_graph as kg
         ca = kg.get_by_iso(a.iso)
         cb = kg.get_by_iso(b.iso)
         if not ca or not cb:

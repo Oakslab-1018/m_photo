@@ -1,7 +1,7 @@
 """Session service backed by plain SQLAlchemy 2.x.
 
 The class deliberately implements the same duck-typed interface that the
-legacy ``services.chat.ChatService`` expects (``get``, ``set_clues``,
+``services.chat.ChatService`` expects (``get``, ``set_clues``,
 ``add_clue``, ``add_exclusion``, ``set_confirmed``, ``add_message`` and
 ``list_messages``) so the existing chat/reasoning orchestration can be reused
 as an import dependency instead of being copied.

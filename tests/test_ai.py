@@ -6,8 +6,8 @@ from PIL import Image
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from ai import AnalysisPipeline
-from ai.text_language import detect_language_from_text
+from backend.app.domain.geolocation.analysis import AnalysisPipeline
+from backend.app.domain.geolocation.analysis.text_language import detect_language_from_text
 
 
 def make_test_image(path, color):

@@ -4,10 +4,10 @@ import os
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from reasoning.clue import Clue
-from reasoning.engine import ReasoningEngine
-from reasoning.hypotheses import HypothesisManager
-from reasoning import knowledge_graph as kg
+from backend.app.domain.geolocation.clue import Clue
+from backend.app.domain.geolocation.engine import ReasoningEngine
+from backend.app.domain.geolocation.hypotheses import HypothesisManager
+from backend.app.domain.geolocation import knowledge_graph as kg
 
 
 def test_load_countries():

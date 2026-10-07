@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import List
 
 from config import AI_MODE
-from reasoning.clue import Clue, clues_to_dicts
+from ..clue import Clue, clues_to_dicts
 
 from .base import BaseAnalyzer
 from .ocr import OCRAnalyzer

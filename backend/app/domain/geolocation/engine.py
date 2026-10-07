@@ -16,8 +16,8 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from config import MIN_CLUE_CONFIDENCE, TOP_N_HYPOTHESES
-from reasoning.clue import Clue
-from reasoning import knowledge_graph as kg
+from .clue import Clue
+from . import knowledge_graph as kg
 
 
 LANGUAGE_WEIGHT = 2.0  # 语言线索权重更高

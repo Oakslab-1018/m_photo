@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import List
 
 from .base import BaseAnalyzer
-from reasoning.clue import Clue
+from ..clue import Clue
 
 
 # easyocr 语言组合限制：ch_sim 只能与 en 同组；ja/ko/ru 可与 en 同组。

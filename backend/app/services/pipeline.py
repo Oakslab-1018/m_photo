@@ -1,12 +1,12 @@
-"""Adapter around the existing (legacy) AI analysis pipeline.
+"""Adapter around the geolocation domain analysis pipeline.
 
-The heavy lifting stays in the repository-level ``ai`` package; this service
-only injects the backend configuration (AI mode + analyzer construction) so we
-never copy or fork the algorithms.
+The algorithms live in ``backend.app.domain.geolocation.analysis``; this
+service only injects the backend configuration (AI mode + analyzer
+construction) so the backend never copies or forks the pipeline.
 
 ``GEO_AI_MODE`` defaults to ``mock`` and ``easyocr`` is imported lazily by
-``ai.ocr`` only when ``real`` mode is requested, so the backend imports and
-runs without easyocr installed.
+``analysis.ocr`` only when ``real`` mode is requested, so the backend imports
+and runs without easyocr installed.
 """
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from ..config import Settings
 
 
 class PipelineService:
-    """Thread-safe, lazily-constructed wrapper around ``ai.AnalysisPipeline``."""
+    """Thread-safe, lazily-constructed wrapper around ``AnalysisPipeline``."""
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
@@ -32,7 +32,9 @@ class PipelineService:
         if self._pipeline is None:
             with self._lock:
                 if self._pipeline is None:
-                    from ai import AnalysisPipeline  # lazy: keeps startup light
+                    from ..domain.geolocation.analysis import (  # lazy: keeps startup light
+                        AnalysisPipeline,
+                    )
 
                     self._pipeline = AnalysisPipeline(mode=self._settings.geo_ai_mode)
         return self._pipeline

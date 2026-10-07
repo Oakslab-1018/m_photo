@@ -7,7 +7,7 @@ Design notes
 * HTTP handlers are sync ``def`` functions, so FastAPI runs them in its
   threadpool; combined with the per-request session this keeps SQLAlchemy /
   SQLite usage free of cross-thread or shared-session races.
-* Heavy legacy services (``ai``, ``services.chat``) are imported lazily or
+* Heavy domain services (``domain.geolocation``, ``services.chat``) are imported lazily or
   constructed per request from objects stored on ``app.state``.
 """
 from __future__ import annotations

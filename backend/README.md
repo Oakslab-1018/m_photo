@@ -1,7 +1,10 @@
 # m_photo backend (FastAPI modular monolith)
 
-FastAPI rewrite of the legacy Flask backend. It **reuses** the existing
-`ai/`, `reasoning/` and `services/` packages as import dependencies — no
+FastAPI rewrite of the legacy Flask backend. The analysis and reasoning code
+now lives under `backend/app/domain/geolocation/`: the former `reasoning/`
+modules (clue, engine, hypotheses, knowledge graph) are directly in that
+package, and the former `ai/` modules are in its `analysis/` subpackage.
+Repository-level `services/chat.py` remains the chat adapter dependency — no
 algorithms were copied, and `easyocr` is **not** required (`GEO_AI_MODE`
 defaults to `mock`; no real-OCR support is claimed in this stage).
 
@@ -24,7 +27,9 @@ backend/
     routers/health.py    # GET  /api/health          (real SELECT 1 -> 503 on failure)
     routers/countries.py # GET  /api/geo/countries
     routers/geo.py       # upload / feedback / messages / analyze-point
-    services/            # thin adapters over the legacy packages
+    domain/geolocation/  # clue / engine / hypotheses / knowledge_graph
+      analysis/          # AnalysisPipeline + concrete analyzers
+    services/            # thin adapters over domain packages
   alembic/               # baseline migration (0001_initial) + env.py
   alembic.ini
   tests/                 # pytest *and* `python -m unittest` compatible
@@ -114,5 +119,5 @@ free_text, missing fields, unknown session), messages, analyze-point
 (404 / 422 / NaN / Infinity / 1×1 crop / temp-crop cleanup), JSON-safe 422
 payloads, config env aliases and **storage persistence across app restart**.
 
-> Deprecation warnings from the reused legacy `ai/` code (Pillow `getdata`,
+> Deprecation warnings from the migrated analysis code (Pillow `getdata`,
 > `datetime.utcnow`) are known and intentionally not addressed in this stage.

@@ -201,7 +201,10 @@ uv run pytest      # 后端测试（开发依赖，不进入生产镜像）
   阶段二是 `FROM python:3.12-slim-bookworm AS runtime`，通过
   `COPY --from=uv /uv /uvx /bin/` 取得 uv，然后执行
   `uv sync --frozen --no-dev --no-install-project`，严格按 `pyproject.toml` +
-  `uv.lock` 安装运行依赖。容器以非 root（UID 10001）运行，不安装 OCR 额外依赖，
+  `uv.lock` 安装运行依赖。容器以非 root（UID 10001）运行，不安装 OCR 额外依赖。
+  第一阶段不再单独复制根目录 `ai/` 或 `reasoning/`；`COPY backend/ ./backend/` 已包含
+  迁移后的领域实现 `backend/app/domain/geolocation/`（推理与知识图谱）及
+  `backend/app/domain/geolocation/analysis/`（分析流水线与分析器）。
   启动命令为 `uvicorn backend.app.main:app --host 0.0.0.0 --port 8000`。
 - `Dockerfile.frontend`：两个构建阶段。构建阶段为
   `FROM node:24-bookworm-slim AS build`，执行 `npm ci` + `npm run build`；

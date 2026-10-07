@@ -7,7 +7,7 @@ from typing import List, Tuple
 
 from PIL import Image
 
-from reasoning.clue import Clue
+from ..clue import Clue
 
 
 class BaseAnalyzer(ABC):

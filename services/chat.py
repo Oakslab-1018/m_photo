@@ -11,10 +11,10 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from reasoning.clue import Clue, DIM_LABELS, VALUE_LABELS, dicts_to_clues
-from reasoning.engine import ReasoningEngine
-from reasoning.hypotheses import HypothesisManager
-from reasoning import knowledge_graph as kg
+from backend.app.domain.geolocation.clue import Clue, DIM_LABELS, VALUE_LABELS, dicts_to_clues
+from backend.app.domain.geolocation.engine import ReasoningEngine
+from backend.app.domain.geolocation.hypotheses import HypothesisManager
+from backend.app.domain.geolocation import knowledge_graph as kg
 
 
 class ChatService:
