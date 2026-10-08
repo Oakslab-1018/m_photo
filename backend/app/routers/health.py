@@ -32,6 +32,9 @@ def health(
         ai_mode=settings.geo_ai_mode,
         data_dir=str(settings.data_dir),
         version=__version__,
+        streetclip_enabled=settings.streetclip_enabled,
+        deepseek_configured=bool((settings.deepseek_api_key or "").strip()),
+        deepseek_model=settings.deepseek_model,
     )
 
 

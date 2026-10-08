@@ -2,7 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import type { CountryScore } from '@/types'
 import { useMapViewport, toMapMarkers } from '@/composables/useMapViewport'
-import { scorePercent } from '@/utils/map'
+import { scoreLabel } from '@/utils/map'
 
 const props = defineProps<{
   scores: CountryScore[]
@@ -96,7 +96,7 @@ onBeforeUnmount(() => {
             <span class="candidate-rank">{{ index + 1 }}</span>
             <div>
               <div class="candidate-name">{{ candidate.name_zh }}</div>
-              <div class="candidate-score">匹配度 {{ scorePercent(candidate.score) }}</div>
+              <div class="candidate-score">{{ scoreLabel(candidate) }}</div>
             </div>
           </div>
           <div class="candidate-actions">

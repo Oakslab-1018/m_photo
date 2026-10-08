@@ -13,6 +13,8 @@ handlers executed in the threadpool).
 """
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
 from sqlalchemy import select
@@ -22,7 +24,10 @@ from ..database import ChatMessage, GeoSession
 
 
 class GeoSessionService:
-    """Persistence facade for :class:`GeoSession` / :class:`ChatMessage`."""
+    """Request-scoped persistence facade; mutation methods flush, never commit.
+
+    Callers must wrap each logical write operation in :meth:`transaction`.
+    """
 
     def __init__(self, session: Session) -> None:
         self.session = session
@@ -33,6 +38,39 @@ class GeoSessionService:
 
     def rollback(self) -> None:
         self.session.rollback()
+
+    @contextmanager
+    def transaction(self) -> Iterator[None]:
+        """Commit one complete operation, or roll back all of its mutations.
+
+        Queries may already have started SQLAlchemy's implicit transaction, so
+        this deliberately does not call ``Session.begin()``. Routes construct
+        their response inside this scope and return only after commit succeeds.
+        """
+        try:
+            yield
+            self.commit()
+        except BaseException:
+            self.rollback()
+            raise
+
+    def set_model_evidence(self, session_id: int, evidence: dict[str, Any] | None) -> None:
+        row = self.get(session_id)
+        if row is None:
+            raise ValueError("session not found")
+        row.model_evidence = evidence
+        self.session.flush()
+
+    def replace_last_ai_message(self, session_id: int, content: str, action: dict[str, Any]) -> None:
+        row = self.session.scalars(
+            select(ChatMessage).where(ChatMessage.session_id == session_id, ChatMessage.role == "ai")
+            .order_by(ChatMessage.id.desc()).limit(1)
+        ).first()
+        if row is None:
+            return
+        row.content = content
+        row.meta = {**row.meta, "action": action, "conversation_provider": "deepseek"}
+        self.session.flush()
 
     # ---- sessions ----
     def create(
@@ -47,7 +85,7 @@ class GeoSessionService:
             image_filename=image_filename,
         )
         self.session.add(geo_session)
-        self.session.commit()
+        self.session.flush()
         self.session.refresh(geo_session)
         return geo_session
 
@@ -58,7 +96,7 @@ class GeoSessionService:
         geo_session = self.get(session_id)
         if geo_session is not None:
             geo_session.clues = list(clues)
-            self.session.commit()
+            self.session.flush()
 
     def add_clue(self, session_id: int, clue: dict[str, Any]) -> None:
         geo_session = self.get(session_id)
@@ -66,7 +104,7 @@ class GeoSessionService:
             clues = geo_session.clues
             clues.append(clue)
             geo_session.clues = clues
-            self.session.commit()
+            self.session.flush()
 
     def add_exclusion(self, session_id: int, iso: str) -> None:
         geo_session = self.get(session_id)
@@ -74,14 +112,14 @@ class GeoSessionService:
             exclusions = geo_session.exclusions
             exclusions.append(iso)
             geo_session.exclusions = exclusions
-            self.session.commit()
+            self.session.flush()
 
     def set_confirmed(self, session_id: int, iso: str) -> None:
         geo_session = self.get(session_id)
         if geo_session is not None:
             geo_session.confirmed_iso = iso
             geo_session.status = "done"
-            self.session.commit()
+            self.session.flush()
 
     # ---- messages ----
     def add_message(
@@ -95,7 +133,7 @@ class GeoSessionService:
         if meta:
             message.meta = meta
         self.session.add(message)
-        self.session.commit()
+        self.session.flush()
         self.session.refresh(message)
         return message
 

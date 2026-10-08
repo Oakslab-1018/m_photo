@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import type { CountryScore } from '@/types'
-import { scorePercent } from '@/utils/map'
+import { scoreLabel } from '@/utils/map'
 
 const props = defineProps<{
   country: CountryScore
@@ -19,7 +19,7 @@ const emit = defineEmits<{
     <div class="confirm-box">
       <div class="confirm-msg">
         是否将「{{ country.name_zh }}」设置为照片拍摄地？
-        <div class="confirm-sub">当前匹配度 {{ scorePercent(country.score) }}</div>
+        <div class="confirm-sub">当前{{ scoreLabel(country) }}</div>
       </div>
       <div class="confirm-actions">
         <button type="button" class="confirm-cancel" :disabled="busy" @click="emit('cancel')">取消</button>

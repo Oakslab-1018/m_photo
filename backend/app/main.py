@@ -9,11 +9,10 @@ factory (used by tests, which inject their own :class:`Settings`).
 
 Schema management
 -----------------
-The authoritative schema lives in the Alembic baseline migration
-(``backend/alembic/versions/0001_initial.py``); run ``alembic upgrade head``.
-``init_db`` still calls ``Base.metadata.create_all`` as a *temporary*
-convenience for zero-setup local development and tests — that is **not** a
-migration substitute.
+Application lifespan runs Alembic upgrades before handling requests. A pre-
+Alembic Geo database is adopted only after its structure matches the initial
+migration; incompatible databases stop startup without being stamped or altered.
+
 """
 from __future__ import annotations
 

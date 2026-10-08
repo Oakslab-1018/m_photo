@@ -21,7 +21,8 @@ backend/
   app/
     main.py              # ASGI app + create_app() (CORS, /media, JSON-safe 422s)
     config.py            # Settings.from_env(): M_PHOTO_DATA_DIR & aliases
-    database.py          # SQLAlchemy 2.x Base/engine/session + GeoSession/ChatMessage
+    database.py          # SQLAlchemy engine/session + models; init runs migrations
+    migrations.py        # Alembic upgrades + validated pre-Alembic Geo adoption
     deps.py              # per-request session & service dependencies
     schemas.py           # Pydantic v2 request/response models
     routers/health.py    # GET  /api/health          (real SELECT 1 -> 503 on failure)
@@ -38,6 +39,13 @@ backend/
 HTTP handlers are **sync** `def` functions (threadpool) and every request gets
 (and closes) its own SQLAlchemy `Session`; there is no shared session across
 threads.
+
+Mutation methods in `GeoSessionService` flush without committing. Upload,
+feedback and point analysis each use one operation-level transaction, validating
+and checking JSON serialization of the response before committing. Failures roll
+back all database writes; failed uploads also remove their image, and point crops
+are cleaned up on success and failure. This does not add optimistic concurrency
+control for simultaneous feedback or crash-proof filesystem/database atomicity.
 
 ## Install / run
 
@@ -60,18 +68,50 @@ uv run --frozen uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 --reload
 
 ## Database & migrations
 
-The authoritative schema is the Alembic baseline:
+Application lifespan now runs Alembic **before** the backend becomes ready.
+`init_db(settings)` uses the runtime engine/connection, including injected test
+settings, rather than rereading environment variables. `create_all()` is no
+longer used during application startup; `create_schema=False` is only a
+low-level opt-out for callers that manage schema themselves.
+
+Startup behavior:
+
+- **Empty database**: run `upgrade head`.
+- **Alembic-managed database**: upgrade to the current head; repeated startup is
+  idempotent. Unknown revision identifiers stop startup.
+- **Existing unversioned Geo SQLite database**: compare schema metadata against
+  a disposable database built from the immutable `0001_initial` migration.
+  Check tables, columns/types/nullability/defaults, keys, indexes, constraints
+  and SQLite table options; reject unexpected views or triggers. The known
+  client-side defaults from the former `create_all()` schema are accepted.
+  Only a matching schema is stamped **at the baseline**, then upgraded to head.
+- **Incompatible unversioned database**: stop startup without stamping or altering schema.
+  Inspect and resolve the mismatch manually; do not blindly stamp or delete data.
+
+SQLite startup migration/adoption acquires `BEGIN IMMEDIATE`, so the schema
+check, revision registration and migration DDL share one transaction and roll
+back together on failure. This locking is specific to SQLite; no cross-database
+deployment lock is provided. Back up storage before upgrading a deployment.
+
+To run the same safe path without starting the server (from repo root):
+
+```bash
+uv run --frozen python -m backend.app.migrations
+uv run --frozen alembic -c backend/alembic.ini current
+```
+
+The ordinary Alembic CLI remains available for an empty or already-versioned
+DB, using the same environment configuration and SQLite PRAGMAs:
 
 ```bash
 uv run --frozen alembic -c backend/alembic.ini upgrade head
 ```
 
-`backend/app/database.py:init_db()` also calls `Base.metadata.create_all()` as
-a **temporary** zero-setup convenience for local runs and tests
-(`init_db(..., create_schema=False)` disables it). This is **not** a migration
-substitute and the baseline is **not** yet wired into app startup or the
-Docker entrypoint — that wiring is a follow-up stage. Legacy `database.db`
-compatibility is intentionally not provided.
+For a pre-Alembic Geo database, use application startup or the safe module command
+above **first**; a direct Alembic `upgrade head` does not perform automatic
+adoption. Legacy Flask `database.db` is not supported or automatically migrated.
+Docker already copies `backend/alembic.ini` and the scripts with `backend/`;
+migrations run against the mounted volume at runtime, never during image build.
 
 ## API
 
@@ -118,6 +158,24 @@ Covered: health (incl. forced DB failure → 503), countries, upload
 free_text, missing fields, unknown session), messages, analyze-point
 (404 / 422 / NaN / Infinity / 1×1 crop / temp-crop cleanup), JSON-safe 422
 payloads, config env aliases and **storage persistence across app restart**.
+Also covered: single-commit transactions, injected analysis/message/commit/
+response failures, safe migration adoption, incompatible schema rejection,
+future-revision upgrades, migration DDL rollback, repeated startup, injected
+settings, logging preservation, and CLI execution outside the repo.
 
 > Deprecation warnings from the migrated analysis code (Pillow `getdata`,
 > `datetime.utcnow`) are known and intentionally not addressed in this stage.
+
+## 本地 StreetCLIP 与可选 DeepSeek 对话
+
+模型环境独立在 `inference/streetclip/.venv`，使用同一张本机 GPU；业务容器只有 HTTP 适配器。
+首次安装执行 `scripts/setup-streetclip.ps1`，启动执行 `scripts/start-streetclip.ps1`。
+权重在 `inference/streetclip/storage/huggingface`，无需第三方 StreetCLIP API Key。
+
+根目录 `.env` 已准备：`STREETCLIP_ENABLED=true` 启用本机模型，
+`DEEPSEEK_API_KEY` 留空则使用模板对话。以后填写 Key，执行
+`docker compose up -d --no-build --force-recreate --wait` 即可重新读取；不要提交 Key 或使用 `down -v`。
+默认 DeepSeek 模型名 `deepseek-flash`，可配置；只发送有限文字上下文，不发送图片。
+
+详细启动、缓存、认证、数据迁移、故障兜底和验收说明见 `docs/streetclip-deployment-plan.md`。
+当前仅为 20 国候选排序；原始余弦不是概率，地图上的点是国家代表位置，不是照片 GPS。

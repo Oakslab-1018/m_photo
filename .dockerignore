@@ -101,3 +101,6 @@ uploads/
 **/uploads/
 static/images/
 **/static/images/
+# Host-only GPU environment and downloaded checkpoints never enter app images.
+inference/
+nul

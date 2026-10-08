@@ -32,6 +32,8 @@ export interface CountryScore {
   name: string
   name_zh: string
   score: number
+  raw_cosine?: number | null
+  score_type?: string
   matched_clues?: Array<Record<string, unknown>>
   lat: number
   lng: number

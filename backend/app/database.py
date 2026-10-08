@@ -6,10 +6,10 @@ The authoritative schema is the Alembic baseline migration
 (``backend/alembic/versions/0001_initial.py`` — run
 ``uv run --frozen alembic -c backend/alembic.ini upgrade head``).
 
-``init_db(settings)`` still calls ``Base.metadata.create_all`` as a
-**temporary convenience** for zero-setup local runs and tests (``create_schema=False``
-disables it). It is NOT a migration substitute and does not get applied to an
-existing Alembic-managed database with a different revision.
+``init_db(settings)`` runs Alembic before returning a session factory. Existing
+unversioned Geo databases are adopted only after validating their structure
+against the initial migration. ``create_schema=False`` skips schema management
+for low-level callers; application startup never uses that bypass.
 
 The engine/session factory are created from :class:`Settings`, so importing
 this module never creates a database file.
@@ -48,6 +48,7 @@ class GeoSession(Base):
     image_filename: Mapped[str] = mapped_column(String(255), nullable=False)
     clues_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
     exclusions_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    model_evidence_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     confirmed_iso: Mapped[str | None] = mapped_column(String(10), nullable=True)
     status: Mapped[str] = mapped_column(String(20), default="active", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
@@ -74,6 +75,22 @@ class GeoSession(Base):
     @exclusions.setter
     def exclusions(self, value: list[str]) -> None:
         self.exclusions_json = json.dumps(value, ensure_ascii=False)
+
+    @property
+    def model_evidence(self) -> dict[str, Any] | None:
+        if not self.model_evidence_json:
+            return None
+        try:
+            value = json.loads(self.model_evidence_json)
+            return value if isinstance(value, dict) else None
+        except (TypeError, ValueError):
+            return None
+
+    @model_evidence.setter
+    def model_evidence(self, value: dict[str, Any] | None) -> None:
+        self.model_evidence_json = (
+            json.dumps(value, ensure_ascii=False, allow_nan=False) if value is not None else None
+        )
 
     @property
     def media_url(self) -> str:
@@ -152,18 +169,20 @@ def create_session_factory(engine: Engine) -> sessionmaker[Session]:
 def init_db(
     settings: Settings, create_schema: bool = True
 ) -> tuple[Engine, sessionmaker[Session]]:
-    """Create parent directories, engine, session factory and (optionally) schema.
-
-    ``create_schema`` is the temporary ``create_all`` convenience; production
-    containers should run the Alembic baseline and may pass ``False``.
-    """
+    """Prepare directories and run migrations before exposing the DB to requests."""
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     settings.upload_dir.mkdir(parents=True, exist_ok=True)
 
     engine = create_db_engine(settings)
-    if create_schema:
-        Base.metadata.create_all(engine)
-    return engine, create_session_factory(engine)
+    try:
+        if create_schema:
+            from .migrations import migrate_database
+
+            migrate_database(engine)
+        return engine, create_session_factory(engine)
+    except BaseException:
+        engine.dispose()
+        raise
 
 
 def ensure_parent_dir(path: Path) -> None:

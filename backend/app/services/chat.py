@@ -1,16 +1,142 @@
-"""Adapter around the existing multi-turn chat/reasoning orchestration.
-
-``services.chat.ChatService`` (repository-level) already implements the
-"AI clue -> user feedback -> re-reasoning" loop. We subclass it unchanged and
-only note the contract: the injected session service must be bound to a
-per-request SQLAlchemy session.
-"""
+"""Existing transaction-safe orchestration plus a pure, pre-network conversation preview."""
 from __future__ import annotations
 
-from services.chat import ChatService as LegacyChatService
+from copy import deepcopy
+import json
+import logging
+from types import SimpleNamespace
 
-__all__ = ["ChatService"]
+from services.chat import ChatService as LegacyChatService
+from ..config import Settings
+from ..domain.geolocation.model_ranking import ModelAwareEngine, ModelAwareHypotheses
+from .deepseek import DeepSeekClient
+from .model_gateway import StreetClipGateway
+
+logger = logging.getLogger(__name__)
+
+
+class _PreviewSessions:
+    """In-memory planning only: never an ORM or a database write."""
+    def __init__(self, snapshot, messages):
+        self.row = deepcopy(snapshot)
+        self.messages = deepcopy(messages)
+
+    def get(self, session_id):
+        return self.row
+
+    def set_clues(self, session_id, clues):
+        self.row.clues = deepcopy(clues)
+
+    def add_clue(self, session_id, clue):
+        self.row.clues.append(deepcopy(clue))
+
+    def add_exclusion(self, session_id, iso):
+        if iso not in self.row.exclusions:
+            self.row.exclusions.append(iso)
+
+    def set_confirmed(self, session_id, iso):
+        self.row.confirmed_iso = iso
+        self.row.status = "done"
+
+    def add_message(self, session_id, role, content, meta=None):
+        self.messages.append({"id": len(self.messages) + 1, "role": role,
+                              "content": content, "meta": meta or {}, "created_at": None})
+        return self.messages[-1]
+
+    def list_messages(self, session_id):
+        return deepcopy(self.messages)
+
+
+def _signature(result):
+    return json.dumps({"scores": result.get("scores"), "action": result.get("action")},
+                      sort_keys=True, ensure_ascii=False, allow_nan=False)
 
 
 class ChatService(LegacyChatService):
-    """Backend-facing alias of the chat orchestration service."""
+    def __init__(self, session_service, settings: Settings | None = None):
+        super().__init__(session_service)
+        self.engine = ModelAwareEngine()
+        self.hypothesis = ModelAwareHypotheses(self.engine)
+        self.provider = DeepSeekClient(settings) if settings is not None else None
+        self._prepared = None
+
+    def _validated_prior(self, evidence):
+        if evidence is None:
+            return None
+        try:
+            settings = self.provider.settings if self.provider else Settings.from_env({})
+            return StreetClipGateway(settings).validate(evidence)
+        except Exception as exc:
+            logger.warning("Stored StreetCLIP evidence invalid; using rules (%s)", type(exc).__name__)
+            return None
+
+    def _set_prior(self, session_id):
+        row = self.session_service.get(session_id)
+        self.engine.evidence = self._validated_prior(row.model_evidence) if row else None
+
+    def _finish(self, result, session_id):
+        if self._prepared and result.get("action") and _signature(result) == self._prepared[0]:
+            message = self._prepared[1]
+            result["action"] = {**result["action"], "message": message}
+            self.session_service.replace_last_ai_message(session_id, message, result["action"])
+        self._prepared = None
+        return result
+
+    def initial_analysis(self, session_id):
+        self._set_prior(session_id)
+        return self._finish(super().initial_analysis(session_id), session_id)
+
+    def handle_feedback(self, session_id, feedback):
+        self._set_prior(session_id)
+        return self._finish(super().handle_feedback(session_id, feedback), session_id)
+
+    def reason_only(self, session_id, new_clues=None, click_pos=None):
+        self._set_prior(session_id)
+        return self._finish(super().reason_only(session_id, new_clues, click_pos), session_id)
+
+    def _prepare(self, snapshot, history, method, *, feedback=None, new_clues=None, click_pos=None):
+        self._prepared = None
+        if not self.provider or not (self.provider.settings.deepseek_api_key or "").strip():
+            return
+        memory = _PreviewSessions(snapshot, history)
+        preview = LegacyChatService(memory)
+        preview.engine = ModelAwareEngine()
+        preview.engine.evidence = snapshot.model_evidence
+        preview.hypothesis = ModelAwareHypotheses(preview.engine)
+        if method == "initial":
+            result = preview.initial_analysis(0)
+        elif method == "feedback":
+            result = preview.handle_feedback(0, feedback)
+        else:
+            for clue in new_clues or []:
+                memory.add_clue(0, clue)
+            result = preview.reason_only(0, new_clues=new_clues, click_pos=click_pos)
+        message = self.provider.narrate({"action": result.get("action"), "scores": result.get("scores", []),
+                                       "clues": memory.row.clues, "history": history,
+                                       "feedback": (feedback or {}).get("text", "")})
+        if message:
+            self._prepared = (_signature(result), message)
+
+    def prepare_initial(self, clues, evidence):
+        snapshot = SimpleNamespace(clues=deepcopy(clues), exclusions=[], model_evidence=self._validated_prior(evidence),
+                                   confirmed_iso=None, status="active")
+        self._prepare(snapshot, [], "initial")
+
+    def prepare_update(self, session_id, *, feedback=None, new_clues=None, click_pos=None):
+        row = self.session_service.get(session_id)
+        if row is None:
+            return
+        snapshot = SimpleNamespace(clues=deepcopy(row.clues), exclusions=list(row.exclusions),
+                                   model_evidence=self._validated_prior(row.model_evidence),
+                                   confirmed_iso=row.confirmed_iso, status=row.status)
+        history = self.session_service.list_messages(session_id)
+        # End the read transaction before the optional external API request.
+        self.session_service.rollback()
+        if feedback and feedback.get("type") == "confirm":
+            self._prepared = None
+            return
+        self._prepare(snapshot, history, "feedback" if feedback is not None else "point",
+                      feedback=feedback, new_clues=new_clues, click_pos=click_pos)
+
+
+__all__ = ["ChatService"]

@@ -25,7 +25,7 @@ values pass through unchanged; only ``mock`` is exercised in this stage.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -62,6 +62,14 @@ class Settings:
     media_url_prefix: str
     cors_origins: tuple[str, ...]
     geo_ai_mode: str
+    streetclip_enabled: bool = False
+    streetclip_url: str = "http://127.0.0.1:8001"
+    streetclip_api_key: str = field(default="", repr=False)
+    streetclip_timeout_seconds: float = 45.0
+    deepseek_api_key: str = field(default="", repr=False)
+    deepseek_base_url: str = "https://api.deepseek.com"
+    deepseek_model: str = "deepseek-flash"
+    deepseek_timeout_seconds: float = 15.0
 
     @property
     def countries_path(self) -> Path:
@@ -129,6 +137,14 @@ class Settings:
             media_url_prefix=media_prefix.rstrip("/") or "/media",
             cors_origins=cors_origins,
             geo_ai_mode=ai_mode,
+            streetclip_enabled=(get("STREETCLIP_ENABLED") or "false").lower() in {"1", "true", "yes", "on"},
+            streetclip_url=(get("STREETCLIP_URL") or "http://127.0.0.1:8001").rstrip("/"),
+            streetclip_api_key=(get("STREETCLIP_API_KEY") or "").strip(),
+            streetclip_timeout_seconds=float(get("STREETCLIP_TIMEOUT_SECONDS") or "45"),
+            deepseek_api_key=(get("DEEPSEEK_API_KEY") or "").strip(),
+            deepseek_base_url=(get("DEEPSEEK_BASE_URL") or "https://api.deepseek.com").rstrip("/"),
+            deepseek_model=get("DEEPSEEK_MODEL") or "deepseek-flash",
+            deepseek_timeout_seconds=float(get("DEEPSEEK_TIMEOUT_SECONDS") or "15"),
         )
 
 

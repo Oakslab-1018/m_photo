@@ -6,17 +6,17 @@ session obtained from :mod:`backend.app.deps`.
 """
 from __future__ import annotations
 
+import json
 import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from PIL import Image, UnidentifiedImageError
-from sqlalchemy.orm import Session
+from pydantic import BaseModel
 
 from ..config import ALLOWED_CONTENT_TYPES, ALLOWED_EXTENSIONS, MAX_UPLOAD_BYTES, Settings
 from ..deps import (
     get_chat_service,
-    get_db_session,
     get_geo_service,
     get_pipeline_service,
     get_settings,
@@ -32,10 +32,16 @@ from ..schemas import (
 from ..services.chat import ChatService
 from ..services.geo_session import GeoSessionService
 from ..services.pipeline import PipelineService
+from ..services.model_gateway import StreetClipGateway
 
 router = APIRouter(prefix="/geo", tags=["geo"])
 
 UPLOAD_CHUNK_BYTES = 1024 * 1024
+
+
+def _check_response_serializable(response: BaseModel) -> None:
+    """Fail before committing if the response cannot be rendered as strict JSON."""
+    json.dumps(response.model_dump(mode="json"), ensure_ascii=False, allow_nan=False)
 
 
 def _guess_extension(filename: str | None, content_type: str | None) -> str | None:
@@ -109,23 +115,28 @@ def upload_image(
         except Exception as exc:
             raise HTTPException(status_code=500, detail=f"AI analysis failed: {exc}") from exc
 
-        geo_session = geo.create(str(destination), filename, user_id=None)
-        geo.set_clues(geo_session.id, clues)
-        result = chat.initial_analysis(geo_session.id)
-    except Exception:
+        evidence = StreetClipGateway(settings).rank_image(destination)
+        chat.prepare_initial(clues, evidence)
+        with geo.transaction():
+            geo_session = geo.create(str(destination), filename, user_id=None)
+            geo.set_clues(geo_session.id, clues)
+            geo.set_model_evidence(geo_session.id, evidence)
+            result = chat.initial_analysis(geo_session.id)
+            response = UploadResponse(
+                session_id=geo_session.id,
+                image_url=f"{settings.media_url_prefix}/{filename}",
+                image_filename=filename,
+                clues=clues,
+                scores=result.get("scores") or [],
+                action=result.get("action"),
+                messages=geo.list_messages(geo_session.id),
+            )
+            _check_response_serializable(response)
+    except BaseException:
         destination.unlink(missing_ok=True)
         raise
 
-    messages = geo.list_messages(geo_session.id)
-    return UploadResponse(
-        session_id=geo_session.id,
-        image_url=f"{settings.media_url_prefix}/{filename}",
-        image_filename=filename,
-        clues=clues,
-        scores=result.get("scores") or [],
-        action=result.get("action"),
-        messages=messages,
-    )
+    return response
 
 
 @router.post("/{session_id}/feedback", response_model=FeedbackResponse)
@@ -139,20 +150,25 @@ def submit_feedback(
     if geo_session is None:
         raise HTTPException(status_code=404, detail="session not found")
 
-    result = chat.handle_feedback(session_id, payload.model_dump(exclude_none=True))
-    if result.get("error") == "session not found":  # defensive, should not happen
-        raise HTTPException(status_code=404, detail="session not found")
+    feedback = payload.model_dump(exclude_none=True)
+    chat.prepare_update(session_id, feedback=feedback)
+    with geo.transaction():
+        result = chat.handle_feedback(session_id, feedback)
+        if result.get("error") == "session not found":  # defensive, should not happen
+            raise HTTPException(status_code=404, detail="session not found")
 
-    session = geo.get(session_id)
-    return FeedbackResponse(
-        scores=result.get("scores") or [],
-        action=result.get("action"),
-        messages=geo.list_messages(session_id),
-        clues=session.clues if session else [],
-        exclusions=session.exclusions if session else [],
-        done=result.get("done"),
-        iso=result.get("iso"),
-    )
+        session = geo.get(session_id)
+        response = FeedbackResponse(
+            scores=result.get("scores") or [],
+            action=result.get("action"),
+            messages=geo.list_messages(session_id),
+            clues=session.clues if session else [],
+            exclusions=session.exclusions if session else [],
+            done=result.get("done"),
+            iso=result.get("iso"),
+        )
+        _check_response_serializable(response)
+    return response
 
 
 @router.get("/{session_id}/messages", response_model=MessagesResponse)
@@ -219,20 +235,25 @@ def analyze_point(
         clue["evidence"] = (clue.get("evidence") or "") + (
             f"（点击区域 {x_ratio * 100:.0f}%,{y_ratio * 100:.0f}%）"
         )
-        geo.add_clue(session_id, clue)
+    chat.prepare_update(session_id, new_clues=new_clues, click_pos=(x_ratio, y_ratio))
+    with geo.transaction():
+        for clue in new_clues:
+            geo.add_clue(session_id, clue)
 
-    result = chat.reason_only(session_id, new_clues=new_clues, click_pos=(x_ratio, y_ratio))
+        result = chat.reason_only(session_id, new_clues=new_clues, click_pos=(x_ratio, y_ratio))
 
-    session = geo.get(session_id)
-    return AnalyzePointResponse(
-        new_clues=new_clues,
-        scores=result.get("scores") or [],
-        action=result.get("action"),
-        messages=geo.list_messages(session_id),
-        clues=session.clues if session else [],
-        exclusions=session.exclusions if session else [],
-        crop_info={"x": x_ratio, "y": y_ratio, "size": crop_size},
-    )
+        session = geo.get(session_id)
+        response = AnalyzePointResponse(
+            new_clues=new_clues,
+            scores=result.get("scores") or [],
+            action=result.get("action"),
+            messages=geo.list_messages(session_id),
+            clues=session.clues if session else [],
+            exclusions=session.exclusions if session else [],
+            crop_info={"x": x_ratio, "y": y_ratio, "size": crop_size},
+        )
+        _check_response_serializable(response)
+    return response
 
 
 __all__ = ["router"]

@@ -47,6 +47,9 @@ class CountryScore:
     lat: float = 0.0
     lng: float = 0.0
 
+    raw_cosine: float | None = None
+    score_type: str = "rule_weight"
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "iso": self.iso,
@@ -56,6 +59,8 @@ class CountryScore:
             "matched_clues": self.matched_clues,
             "lat": self.lat,
             "lng": self.lng,
+            "raw_cosine": self.raw_cosine,
+            "score_type": self.score_type,
         }
 
 

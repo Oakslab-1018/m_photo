@@ -23,13 +23,14 @@ COPY --from=uv /uv /uvx /bin/
 WORKDIR /app
 
 # 先复制锁文件与 pyproject 引用的 readme，最大化依赖层缓存；
-# --no-dev 只安装运行依赖，pytest/httpx 等开发依赖不进入镜像。
+# --no-dev 只安装运行依赖，pytest 等开发依赖不进入镜像。
 COPY pyproject.toml uv.lock ./
 COPY backend/README.md ./backend/README.md
 RUN uv sync --frozen --no-dev --no-install-project
 
 # 新 FastAPI 后端及其根目录依赖模块；旧 Flask 代码不进入镜像。
 # .dockerignore 已排除 backend/.venv、backend/tests、storage/uploads、数据库等非运行文件。
+# 包含 Alembic 配置/迁移脚本；由应用 lifespan 在运行时升级挂载的数据库。
 COPY backend/ ./backend/
 COPY services/ ./services/
 COPY config.py ./

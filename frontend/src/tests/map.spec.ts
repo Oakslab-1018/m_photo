@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { latLngToPercent, markerSize, scorePercent } from '@/utils/map'
+import { latLngToPercent, markerSize, scorePercent, scoreLabel } from '@/utils/map'
 
 describe('map coordinate projection', () => {
   it('maps the exact -180..180 / -60..80 bounds to 0..100', () => {
@@ -18,5 +18,13 @@ describe('map coordinate projection', () => {
     expect(scorePercent(2)).toBe('100.0%')
     expect(markerSize(1)).toBe(26)
     expect(markerSize(Number.NaN)).toBe(16)
+  })
+})
+
+describe('non-probabilistic evidence display', () => {
+  const base = { iso: 'JP', name: 'Japan', name_zh: '日本', score: 1, lat: 0, lng: 0 }
+  it('shows raw cosine, not an artificial 100 percent', () => {
+    expect(scoreLabel({ ...base, raw_cosine: 0.27432 })).toBe('余弦相似度 0.274')
+    expect(scoreLabel(base)).toBe('规则权重 1.000')
   })
 })

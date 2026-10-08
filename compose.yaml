@@ -11,8 +11,17 @@ services:
     environment:
       # 所有可写数据（SQLite + 上传图片）都落在具名卷内。
       M_PHOTO_DATA_DIR: /data
-      # 第一阶段固定 mock：镜像不安装 easyocr，也不下载模型权重。
+      # OCR remains mock; StreetCLIP is controlled independently below.
       GEO_AI_MODE: mock
+      # GPU inference runs in a separate host process, not this image.
+      STREETCLIP_ENABLED: ${STREETCLIP_ENABLED:-false}
+      STREETCLIP_URL: ${STREETCLIP_URL:-http://host.docker.internal:8001}
+      STREETCLIP_API_KEY: ${STREETCLIP_API_KEY:-}
+      STREETCLIP_TIMEOUT_SECONDS: ${STREETCLIP_TIMEOUT_SECONDS:-45}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-flash}
+      DEEPSEEK_TIMEOUT_SECONDS: ${DEEPSEEK_TIMEOUT_SECONDS:-15}
     volumes:
       - backend-data:/data
     expose:

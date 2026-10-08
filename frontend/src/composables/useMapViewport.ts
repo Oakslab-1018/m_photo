@@ -1,6 +1,6 @@
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import type { CountryScore } from '@/types'
-import { latLngToPercent, markerColor, markerSize, scorePercent } from '@/utils/map'
+import { latLngToPercent, markerColor, markerSize, scoreLabel } from '@/utils/map'
 
 const MIN_SCALE = 1
 const MAX_SCALE = 4
@@ -139,8 +139,8 @@ export function toMapMarkers(
       top: `${position.y}%`,
       size: `${markerSize(score.score)}px`,
       color: confirmed ? '#ef4444' : markerColor(rank),
-      scoreText: scorePercent(score.score),
-      title: `${score.name_zh}（匹配度 ${scorePercent(score.score)}）${confirmed ? '，已确认拍摄地' : '，双击确认'}`,
+      scoreText: scoreLabel(score),
+      title: `${score.name_zh}（${scoreLabel(score)}）${confirmed ? '，已确认拍摄地' : '，双击确认'}`,
     }
   })
 }

@@ -1,7 +1,7 @@
 """Alembic environment.
 
 The database URL comes from :func:`backend.app.config.get_settings`, so
-migrations target exactly the same SQLite file as the running application
+CLI migrations target exactly the same SQLite file as the running application
 (``M_PHOTO_DATA_DIR`` / ``M_PHOTO_DB_PATH`` / ``M_PHOTO_DB_URL``).
 """
 from __future__ import annotations
@@ -11,7 +11,7 @@ from logging.config import fileConfig
 from pathlib import Path
 
 from alembic import context
-from sqlalchemy import engine_from_config, pool
+from sqlalchemy.engine import Connection
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -19,11 +19,11 @@ if str(REPO_ROOT) not in sys.path:
 
 import backend.app.database  # noqa: E402,F401  (registers the ORM models)
 from backend.app.config import get_settings  # noqa: E402
-from backend.app.database import Base  # noqa: E402
+from backend.app.database import Base, create_db_engine  # noqa: E402
 
 config = context.config
 
-if config.config_file_name is not None:
+if config.config_file_name is not None and config.attributes.get("configure_logger", True):
     fileConfig(config.config_file_name)
 
 target_metadata = Base.metadata
@@ -45,23 +45,32 @@ def run_migrations_offline() -> None:
         context.run_migrations()
 
 
-def run_migrations_online() -> None:
-    configuration = config.get_section(config.config_ini_section, {})
-    configuration["sqlalchemy.url"] = _database_url()
-    connectable = engine_from_config(
-        configuration,
-        prefix="sqlalchemy.",
-        poolclass=pool.NullPool,
-        future=True,
+def _run_on_connection(connection: Connection) -> None:
+    context.configure(
+        connection=connection,
+        target_metadata=target_metadata,
+        render_as_batch=True,
     )
-    with connectable.connect() as connection:
-        context.configure(
-            connection=connection,
-            target_metadata=target_metadata,
-            render_as_batch=True,
-        )
-        with context.begin_transaction():
-            context.run_migrations()
+    with context.begin_transaction():
+        context.run_migrations()
+
+
+def run_migrations_online() -> None:
+    # Programmatic startup uses the runtime engine, not environment defaults.
+    connection = config.attributes.get("connection")
+    if connection is not None:
+        _run_on_connection(connection)
+        return
+
+    # The CLI uses the same engine settings and SQLite PRAGMAs as the app.
+    connectable = create_db_engine(get_settings())
+    try:
+        with connectable.begin() as connection:
+            if connection.dialect.name == "sqlite":
+                connection.exec_driver_sql("BEGIN IMMEDIATE")
+            _run_on_connection(connection)
+    finally:
+        connectable.dispose()
 
 
 if context.is_offline_mode():

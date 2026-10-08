@@ -48,8 +48,11 @@ def get_geo_service(session: Session = Depends(get_db_session)) -> GeoSessionSer
     return GeoSessionService(session)
 
 
-def get_chat_service(geo: GeoSessionService = Depends(get_geo_service)) -> ChatService:
-    return ChatService(geo)
+def get_chat_service(
+    geo: GeoSessionService = Depends(get_geo_service),
+    settings: Settings = Depends(get_settings),
+) -> ChatService:
+    return ChatService(geo, settings=settings)
 
 
 __all__ = [

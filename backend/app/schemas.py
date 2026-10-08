@@ -15,6 +15,9 @@ class HealthResponse(BaseModel):
     ai_mode: str
     data_dir: str
     version: str
+    streetclip_enabled: bool = False
+    deepseek_configured: bool = False
+    deepseek_model: str = "deepseek-flash"
 
 
 class CountryModel(BaseModel):
@@ -58,6 +61,8 @@ class MatchedClueModel(BaseModel):
 
 
 class CountryScoreModel(BaseModel):
+    raw_cosine: float | None = Field(default=None, ge=-1.0, le=1.0, allow_inf_nan=False)
+    score_type: str = "rule_weight"
     iso: str
     name: str
     name_zh: str

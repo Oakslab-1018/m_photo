@@ -71,3 +71,5 @@ uploads/
 **/uploads/
 static/images/
 **/static/images/
+# Windows shell redirection artifact (not project source).
+/nul

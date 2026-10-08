@@ -48,3 +48,12 @@ export function sortScores(scores: readonly CountryScore[]): CountryScore[] {
 function safeScore(score: CountryScore): number {
   return Number.isFinite(score.score) ? score.score : 0
 }
+
+/** Ordering evidence, never a calibrated geolocation probability. */
+export function scoreLabel(score: CountryScore): string {
+  if (score.raw_cosine != null && Number.isFinite(score.raw_cosine)) {
+    return `余弦相似度 ${score.raw_cosine.toFixed(3)}`
+  }
+  const value = Number.isFinite(score.score) ? score.score : 0
+  return `规则权重 ${value.toFixed(3)}`
+}
