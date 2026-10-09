@@ -25,6 +25,8 @@ from ..deps import (
 from ..schemas import (
     AnalyzePointRequest,
     AnalyzePointResponse,
+    CitiesRequest,
+    CitiesResponse,
     FeedbackRequest,
     FeedbackResponse,
     MessagesResponse,
@@ -180,6 +182,48 @@ def list_messages(
     if geo.get(session_id) is None:
         raise HTTPException(status_code=404, detail="session not found")
     return MessagesResponse(messages=geo.list_messages(session_id))
+
+
+@router.post("/{session_id}/cities", response_model=CitiesResponse)
+def list_cities(
+    session_id: int,
+    payload: CitiesRequest,
+    settings: Settings = Depends(get_settings),
+    geo: GeoSessionService = Depends(get_geo_service),
+) -> CitiesResponse:
+    """Rank the requested country's cities for this session's own image.
+
+    Read-only and stateless: it neither writes messages nor changes the country
+    ranking, so browsing another country's cities can never alter the analysis
+    or the confirmed country. Cities come from the GeoNames catalog the backend
+    validates against, and their coordinates are representative points, not the
+    photo's location.
+    """
+    geo_session = geo.get(session_id)
+    if geo_session is None:
+        raise HTTPException(status_code=404, detail="session not found")
+
+    image_path = Path(geo_session.image_path)
+    if not image_path.exists():
+        raise HTTPException(status_code=404, detail="image not found")
+
+    gateway = StreetClipGateway(settings)
+    if payload.iso not in gateway.country_isos():
+        raise HTTPException(status_code=422, detail="unknown country")
+
+    result = gateway.rank_cities(image_path, payload.iso)
+    if result is None:
+        return CitiesResponse(city_scores=[], country_iso=payload.iso,
+                              scope=None, status="unavailable")
+
+    response = CitiesResponse(
+        city_scores=result["city_scores"],
+        country_iso=result["country_iso"],
+        scope=result["scope"],
+        status=result["status"],
+    )
+    _check_response_serializable(response)
+    return response
 
 
 def _crop_bounds(x_ratio: float, y_ratio: float, width: int, height: int):

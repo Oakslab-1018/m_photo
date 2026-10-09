@@ -14,6 +14,21 @@ CLUE_BOOST_CAP = 0.15
 _RELIABLE_SOURCES = {"ocr", "text_language"}
 
 
+def _reference_by_iso(reference: dict) -> tuple[dict[str, list], dict[str, list]]:
+    """Group a validated reference sidecar into ``(matches, regions)`` per ISO.
+
+    Diagnostics are attached to the candidate row of their own country, so a
+    country that is not among the returned candidates contributes nothing.
+    """
+    matches: dict[str, list] = {}
+    regions: dict[str, list] = {}
+    for key, bucket in (("matches", matches), ("regions", regions)):
+        for row in reference.get(key) or []:
+            if isinstance(row, dict) and isinstance(row.get("iso"), str):
+                bucket.setdefault(row["iso"], []).append(row)
+    return matches, regions
+
+
 class ModelAwareEngine(ReasoningEngine):
     """Rank countries from the full prior, unique crop means and trusted clues."""
 
@@ -78,11 +93,29 @@ class ModelAwareEngine(ReasoningEngine):
         crop_means = self._crop_means(prior)
         trusted = self._trusted_clues(clues)
         crops = self.evidence.get("crops") or []
+        reference = self.evidence.get("reference")
+        reference_matches, reference_regions = (
+            _reference_by_iso(reference) if isinstance(reference, dict) else ({}, {})
+        )
         scores = []
         for country in self.countries:
             iso = country["iso"]
             if iso in (exclusions or []) or iso not in prior:
                 continue
+            # Retrieval-only diagnostics: never a term in the ranking below.
+            diagnostics: dict = {}
+            if isinstance(reference, dict):
+                iso_regions = reference_regions.get(iso, [])
+                iso_matches = reference_matches.get(iso, [])
+                diagnostics = {
+                    "reference_matches": iso_matches,
+                    "reference_regions": iso_regions,
+                    # Region prototypes are the aggregate view; fall back to the
+                    # individual matches only when no region row covers this ISO.
+                    "reference_cosine": max(
+                        (row["raw_cosine"] for row in (iso_regions or iso_matches)), default=None
+                    ),
+                }
             full_cosine = float(prior[iso])
             crop_mean = crop_means.get(iso)
             if crop_mean is None:
@@ -122,6 +155,7 @@ class ModelAwareEngine(ReasoningEngine):
                 matched_clues=matched_clues,
                 lat=country.get("lat", 0), lng=country.get("lng", 0),
                 fusion=fusion,
+                **diagnostics,
             ))
         return sorted(scores, key=lambda item: (-item.score, item.iso))[:top_n]
 

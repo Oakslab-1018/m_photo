@@ -20,10 +20,26 @@ from backend.app.services.deepseek import DeepSeekClient
 from backend.tests.support import make_settings, make_test_image_bytes
 
 
+HEAD_ROWS = 100  # rows that keep the historical 0.01 step (0.40 down to -0.59)
+
+
 def evidence(settings):
-    countries = json.loads(settings.countries_path.read_text(encoding="utf-8"))
-    rows = [{"iso": c["iso"], "raw_cosine": round(0.40 - i * 0.01, 6)}
-            for i, c in enumerate(sorted(countries, key=lambda c: c["iso"]))]
+    """Deterministic full-catalog ranking: 0.40 top row, margin 0.01.
+
+    The top rows keep the historical shape so ``margin`` stays 0.01 and the
+    uncertainty flag stays True. A fixed 0.01 step would drive the tail below
+    the validator's -1 cosine bound once the dynamic catalog passes ~140
+    entries, so the remainder steps down by a fraction sized to land just
+    above -1 (see ``test_fusion.full_evidence`` for the same problem).
+    """
+    countries = sorted(json.loads(settings.countries_path.read_text(encoding="utf-8")),
+                       key=lambda c: c["iso"])
+    head = min(len(countries), HEAD_ROWS)
+    tail = len(countries) - head
+    tail_step = min(0.01, 0.40 / tail) if tail else 0.01
+    rows = [{"iso": c["iso"],
+             "raw_cosine": round(0.40 - i * 0.01 if i < head else -0.59 - (i - head + 1) * tail_step, 6)}
+            for i, c in enumerate(countries)]
     return {"model": MODEL_ID, "model_revision": MODEL_REVISION,
             "catalog_revision": catalog_revision(countries), "rankings": rows,
             "margin": 0.01, "uncertain": True}
@@ -45,7 +61,7 @@ def test_gateway_uploads_bytes_and_full_validated_ranking(settings, tmp_path):
         calls.append(request)
         return httpx.Response(200, json=evidence(settings))
     result = StreetClipGateway(settings, transport=httpx.MockTransport(handler)).rank_image(image)
-    assert len(result["rankings"]) == 20
+    assert len(result["rankings"]) == len(evidence(settings)["rankings"])
     assert result["provider_status"] == "ok"
     assert len(result["image_sha256"]) == 64
     assert len(calls) == 1

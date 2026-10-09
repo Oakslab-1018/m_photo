@@ -55,10 +55,10 @@ revision, catalog revision, preprocessing version, vector dimension,
 finiteness, L2-normalization, prototype/support layout and the full
 content hash; any mismatch or tampering raises instead of loading.
 
-## Wiring (later stage, not this stage)
+## Wiring
 
-Only after the index loads cleanly should the service attach the optional
-`reference` sidecar (key absent otherwise). Contract consumed by the backend:
+The backend now consumes this sidecar. Only after the index loads cleanly does
+the service attach it (key absent otherwise) to the `/predict` response:
 
 ```json
 "reference": {
@@ -80,6 +80,28 @@ Only after the index loads cleanly should the service attach the optional
 - `lat`/`lng` are labeled **reference** coordinates, never a claim about the
   photo's GPS. No filesystem paths or embedding values are ever exposed.
 - Ordering is deterministic: score descending, then id/iso/region/city.
+
+### Backend-side handling
+
+`StreetClipGateway.validate` re-checks the sidecar before anything is stored or
+returned: `model_revision` must equal the backend's pinned `MODEL_REVISION`,
+`catalog_revision` must equal the SHA-256 of the backend's own
+`data/countries.json`, `aggregation` must be a known value, `index_revision` a
+SHA-256, and every `iso` in `matches`/`regions` must appear in `coverage`. Order
+and bounds are re-imposed rather than trusted. A sidecar that fails any of this
+is dropped with a warning while the country ranking is kept: the ranking is
+validated independently and this sidecar is retrieval-only diagnostics, so a
+malformed diagnostic must not cost the model prior. Crops never carry a copy of
+the sidecar — it describes the whole image.
+
+Matched rows are attached to the candidate row of their own country as
+`reference_matches` / `reference_regions`, plus a single `reference_cosine`
+(the best *region* prototype cosine, falling back to individual matches when no
+region row covers that country). **These fields never influence ordering**: no
+reference term appears in the ranking, so a near-perfect reference match cannot
+promote its country. When no index is configured the three keys are absent
+entirely — not `null`/`[]` — so the UI can distinguish "no library" from
+"library configured, nothing matched".
 
 ## Tests
 

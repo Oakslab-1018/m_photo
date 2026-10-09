@@ -72,6 +72,12 @@ class CountryScoreModel(BaseModel):
     lng: float = 0.0
     # Optional non-probabilistic fusion breakdown (full cosine + crop mean + clue boost).
     fusion: dict[str, Any] | None = None
+    # ``reference_matches`` / ``reference_regions`` / ``reference_cosine`` are
+    # deliberately *not* declared: they must stay absent from the JSON unless a
+    # labeled reference index is configured, and ``extra="allow"`` passes them
+    # through only when the engine attached them. Declaring them would emit
+    # ``null``/``[]`` for every deployment and make "no library configured"
+    # indistinguishable from "configured, nothing matched".
 
     model_config = {"extra": "allow"}
 
@@ -153,6 +159,57 @@ class MessagesResponse(BaseModel):
     messages: list[ChatMessageModel] = Field(default_factory=list)
 
 
+class CitiesRequest(BaseModel):
+    """Country whose city candidates are requested for one session's image."""
+
+    iso: str = Field(min_length=2, max_length=2)
+
+    @field_validator("iso")
+    @classmethod
+    def _normalise_iso(cls, value: str) -> str:
+        normalised = value.strip().upper()
+        if len(normalised) != 2 or not normalised.isalpha():
+            raise ValueError("iso must be a two-letter country code")
+        return normalised
+
+
+class CityScoreModel(BaseModel):
+    """One catalog city candidate; representative point, never photo GPS."""
+
+    # Serialised as a decimal string: the UI keys map markers and list rows on it.
+    city_id: str
+    iso: str
+    name: str
+    region: str = ""
+    lat: float
+    lng: float
+    raw_cosine: float = Field(ge=-1.0, le=1.0, allow_inf_nan=False)
+    score: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
+    score_type: str = "city_text_cosine"
+    reference_cosine: float | None = Field(default=None, ge=-1.0, le=1.0, allow_inf_nan=False)
+
+
+class CityScopeModel(BaseModel):
+    """Coverage counters for one city query; absent when the model is unreachable."""
+
+    city_limit_per_country: int | None = Field(default=None, gt=0)
+    city_catalog_revision: str | None = None
+    cities_considered: int | None = Field(default=None, ge=0)
+
+
+class CitiesResponse(BaseModel):
+    """City candidates for one country, or an explicit degraded status.
+
+    ``unavailable`` means the model service is off or unreachable; ``no_cities``
+    means the catalog holds no city for that country. Neither is an error.
+    """
+
+    city_scores: list[CityScoreModel] = Field(default_factory=list)
+    country_iso: str
+    scope: CityScopeModel | None = None
+    status: Literal["ok", "no_cities", "unavailable"]
+
+
 class AnalyzePointRequest(BaseModel):
     # allow_inf_nan=False keeps NaN/inf out: they would otherwise slip through
     # the ge/le comparisons on some platforms.
@@ -186,6 +243,10 @@ __all__ = [
     "AnalyzePointRequest",
     "AnalyzePointResponse",
     "ChatMessageModel",
+    "CitiesRequest",
+    "CitiesResponse",
+    "CityScopeModel",
+    "CityScoreModel",
     "ClueModel",
     "CountriesResponse",
     "CountryModel",

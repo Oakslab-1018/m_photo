@@ -225,14 +225,16 @@ async function requestCities(iso: string): Promise<void> {
     const response = await api.cities(id, target)
     if (epoch !== sessionEpoch.value || requestNonce !== cityRequestNonce) return
     session.applyCities(response)
-    if (response.status === 'unavailable' || response.status === 'no_cities' || !response.city_scores.length) {
+    if (response.status === 'unavailable') {
+      cityNotice.value = '模型服务当前不可用，暂时无法检索城市候选；可稍后重试。'
+    } else if (response.status === 'no_cities' || !response.city_scores.length) {
       cityNotice.value = '该国家暂无城市候选；可切换其他国家重试。'
     }
   } catch {
     if (epoch !== sessionEpoch.value || requestNonce !== cityRequestNonce) return
-    // Older backends 404/405 here: inline notice only, never a global error banner.
+    // Degrade inline: a failed city lookup must never raise a global error banner.
     session.clearCities()
-    cityNotice.value = '城市候选服务不可用（后端暂未提供该接口），可稍后重试。'
+    cityNotice.value = '城市候选服务不可用，可稍后重试。'
   } finally {
     if (epoch === sessionEpoch.value && requestNonce === cityRequestNonce) cityBusy.value = false
   }

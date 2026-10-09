@@ -39,7 +39,7 @@ CANONICAL_COUNTRY_POINTS = {
 }
 
 # ISO + English-name catalog identity, unaffected by coordinate corrections.
-EXPECTED_CATALOG_REVISION = "d0e88b0d4ba7fe5261278aa79a2546511fdb4de3a9032758f6dc987551a8d43d"
+EXPECTED_CATALOG_REVISION = "27075e5af9070b2be635a85c51d27ead63f6670404ba284e4da3bfc0161d48bc"
 
 
 class HealthApiTest(unittest.TestCase, ApiTestCase):
@@ -81,10 +81,16 @@ class CountriesApiTest(unittest.TestCase, ApiTestCase):
         self.assertEqual(japan["name_zh"], "日本")
         self.assertIn("features", japan)
 
-    def test_all_20_countries_match_offline_canonical_coordinates(self):
+    def test_curated_countries_keep_offline_canonical_coordinates(self):
+        """The catalog is dynamic, but the curated points must survive edits.
+
+        The country directory grows with the pinned public dataset; these 20
+        representative points are project-curated and are never overwritten by
+        a catalog regeneration.
+        """
         countries = self.client.get("/api/geo/countries").json()["countries"]
         by_iso = {country["iso"]: country for country in countries}
-        self.assertEqual(set(by_iso), set(CANONICAL_COUNTRY_POINTS))
+        self.assertLessEqual(set(CANONICAL_COUNTRY_POINTS), set(by_iso))
         for iso, (lat, lng) in CANONICAL_COUNTRY_POINTS.items():
             with self.subTest(iso=iso):
                 self.assertAlmostEqual(by_iso[iso]["lat"], lat, delta=1e-4)

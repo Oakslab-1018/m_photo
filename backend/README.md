@@ -27,10 +27,12 @@ backend/
     schemas.py           # Pydantic v2 request/response models
     routers/health.py    # GET  /api/health          (real SELECT 1 -> 503 on failure)
     routers/countries.py # GET  /api/geo/countries
-    routers/geo.py       # upload / feedback / messages / analyze-point
+    routers/geo.py       # upload / feedback / messages / cities / analyze-point
     domain/geolocation/  # clue / engine / hypotheses / knowledge_graph
       analysis/          # AnalysisPipeline + concrete analyzers
     services/            # thin adapters over domain packages
+      model_gateway.py   # StreetCLIP HTTP adapter + evidence contract validation
+      city_catalog.py    # read-only data/cities.json (city identity & coordinates)
   alembic/               # baseline migration (0001_initial) + env.py
   alembic.ini
   tests/                 # pytest *and* `python -m unittest` compatible
@@ -122,6 +124,7 @@ migrations run against the mounted volume at runtime, never during image build.
 | POST   | `/api/geo/upload`                     | multipart field `image`; 201 on success |
 | POST   | `/api/geo/{session_id}/feedback`      | JSON `{type: confirm\|reject\|answer\|free_text, ...}` |
 | GET    | `/api/geo/{session_id}/messages`      | chat history ordered by id |
+| POST   | `/api/geo/{session_id}/cities`        | JSON `{iso}`; ranks that country's catalog cities for this session's image |
 | POST   | `/api/geo/{session_id}/analyze-point` | JSON `{x, y}` normalized to `[0, 1]` |
 
 Errors are `{"error": ..., "detail": ...}`. Unknown sessions → **404**;
@@ -129,6 +132,18 @@ invalid/missing feedback fields and non-finite or out-of-range `x`/`y` → **422
 (the validation payload drops `input` and stringifies `ctx`, so it always
 serializes as JSON). Uploaded images live in
 `M_PHOTO_DATA_DIR/uploads` and are served at `/media/<filename>`.
+
+`cities` is read-only and stateless: it never writes a message, never changes the
+country ranking and never changes a confirmed country, so browsing one country's
+cities cannot alter the analysis. It answers with a `status` rather than an error
+— `ok`, `no_cities` (catalog holds none for that ISO), or `unavailable` (the
+model service is off or unreachable). A malformed `{iso}` → **422**; a session
+whose stored image has disappeared → **404**. City rows are validated against the
+backend's own `data/cities.json`: the service's `scope.city_catalog_revision`
+must match that file's SHA-256, and every returned `city_id`, name and coordinate
+must exist in it, so the catalog — not the model — owns city identity. `city_id`
+is serialized as a **decimal string** (the UI keys markers and rows on it) and
+coordinates are the catalog's representative points, not the photo's location.
 
 ## Configuration (env)
 
@@ -140,11 +155,18 @@ serializes as JSON). Uploaded images live in
 | `M_PHOTO_DB_URL` | derived | full SQLAlchemy URL (wins over path) |
 | `M_PHOTO_CORS_ORIGINS` | dev origins | comma-separated allowed origins |
 | `GEO_AI_MODE` | `mock` | passed to the reused AI pipeline; unknown values pass through unchanged |
+| `STREETCLIP_ENABLED` | `false` | call the local StreetCLIP service at all |
+| `STREETCLIP_URL` | `http://127.0.0.1:8001` | inference service root |
+| `STREETCLIP_API_KEY` | unset | bearer token; unset means no `Authorization` header |
+| `STREETCLIP_TIMEOUT_SECONDS` | `45` | per-request HTTP timeout |
 
 The default data root deliberately avoids the repo-level `data/` directory,
-which holds the read-only `data/countries.json`. Legacy aliases accepted:
-`DATA_DIR`, `APP_DATA_DIR`, `UPLOAD_ROOT`, `M_PHOTO_DATA`, `UPLOAD_FOLDER`,
-`DATABASE_PATH`, `DATABASE_URL`, `AI_MODE`, `CORS_ORIGINS`.
+which holds the read-only catalogs `data/countries.json` (country directory and
+ranking targets) and `data/cities.json` (GeoNames settlements used to resolve
+city identity). Both are read straight from the repo/image, never written.
+Legacy aliases accepted: `DATA_DIR`, `APP_DATA_DIR`, `UPLOAD_ROOT`,
+`M_PHOTO_DATA`, `UPLOAD_FOLDER`, `DATABASE_PATH`, `DATABASE_URL`, `AI_MODE`,
+`CORS_ORIGINS`.
 
 ## Tests
 
@@ -156,12 +178,17 @@ uv run --frozen python -m unittest discover -s backend/tests -t . -q # unittest
 Covered: health (incl. forced DB failure → 503), countries, upload
 (happy path / invalid payload / no file), feedback (confirm, reject, answer,
 free_text, missing fields, unknown session), messages, analyze-point
-(404 / 422 / NaN / Infinity / 1×1 crop / temp-crop cleanup), JSON-safe 422
-payloads, config env aliases and **storage persistence across app restart**.
-Also covered: single-commit transactions, injected analysis/message/commit/
-response failures, safe migration adoption, incompatible schema rejection,
-future-revision upgrades, migration DDL rollback, repeated startup, injected
-settings, logging preservation, and CLI execution outside the repo.
+(404 / 422 / NaN / Infinity / 1×1 crop / temp-crop cleanup), cities
+(ok / no_cities / unavailable / 404 / 422, read-only, catalog-resolved identity,
+per-row tamper rejection), JSON-safe 422 payloads, config env aliases and
+**storage persistence across app restart**. Also covered: single-commit
+transactions, injected analysis/message/commit/response failures, model-evidence
+contract validation (corrupt evidence and crops fall back to rules; a corrupt
+reference sidecar costs only the diagnostics), reference diagnostics riding along
+without reordering countries, crops never duplicating the full-image sidecar,
+safe migration adoption, incompatible schema rejection, future-revision upgrades,
+migration DDL rollback, repeated startup, injected settings, logging
+preservation, and CLI execution outside the repo.
 
 > Deprecation warnings from the migrated analysis code (Pillow `getdata`,
 > `datetime.utcnow`) are known and intentionally not addressed in this stage.
@@ -178,4 +205,14 @@ settings, logging preservation, and CLI execution outside the repo.
 默认 DeepSeek 模型名 `deepseek-flash`，可配置；只发送有限文字上下文，不发送图片。
 
 详细启动、缓存、认证、数据迁移、故障兜底和验收说明见 `docs/streetclip-deployment-plan.md`。
-当前仅为 20 国候选排序；原始余弦不是概率，地图上的点是国家代表位置，不是照片 GPS。
+
+候选范围跟随 `data/countries.json`（当前 250 个国家/地区）；原始余弦不是概率，地图上的点是国家代表位置，不是照片 GPS。
+选定国家后，`POST /api/geo/{session_id}/cities` 再从 `data/cities.json`（GeoNames，34156 个城市 / 244 个国家/地区）
+按该会话原图检索城市候选，同样是代表点。城市行必须能在这份目录里逐条对上（id、名称、经纬度），
+否则整份响应作废，因此城市身份由数据目录而不是模型说了算。
+
+带标注的参考街景索引是可选的：推理服务加载后会在 `/predict` 响应里附带 `reference` sidecar，
+后端校验其 `model_revision` / `catalog_revision` 与本次部署一致后，把命中结果作为**只读诊断信息**
+挂在对应国家的候选上（`reference_matches` / `reference_regions` / `reference_cosine`）。
+参考余弦只用于检索展示，**不参与排序**，也不会改变候选顺序；sidecar 损坏时只丢诊断，国家排名照常返回。
+未配置索引时这三个字段整个不出现，前端据此区分"没有库"和"有库但没命中"。

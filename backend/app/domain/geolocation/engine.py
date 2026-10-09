@@ -51,6 +51,12 @@ class CountryScore:
     score_type: str = "rule_weight"
     # Optional, non-probabilistic component breakdown for hybrid rankings.
     fusion: Dict[str, Any] = field(default_factory=dict)
+    # Optional labeled-reference diagnostics for this country. ``None`` means no
+    # reference index is configured and the keys are omitted entirely, so
+    # consumers can tell that apart from "configured, nothing matched here".
+    reference_matches: Optional[List[Dict[str, Any]]] = None
+    reference_regions: Optional[List[Dict[str, Any]]] = None
+    reference_cosine: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
         result = {
@@ -66,6 +72,10 @@ class CountryScore:
         }
         if self.fusion:
             result["fusion"] = self.fusion
+        if self.reference_matches is not None or self.reference_regions is not None:
+            result["reference_matches"] = self.reference_matches or []
+            result["reference_regions"] = self.reference_regions or []
+            result["reference_cosine"] = self.reference_cosine
         return result
 
 

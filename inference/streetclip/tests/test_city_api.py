@@ -334,7 +334,10 @@ def test_predict_cities_empty_and_missing_catalog_report_no_cities(tmp_path):
         assert payload["status"] == "no_cities"
         assert payload["city_scores"] == []
         assert payload["scope"]["cities_considered"] == 0
-        assert payload["scope"]["city_catalog_revision"] is None
+        # The catalog *did* load, so its revision is reported even though it
+        # holds nothing for this country. That identity is what lets a client
+        # verify the empty answer came from the catalog it also has.
+        assert payload["scope"]["city_catalog_revision"] == _file_hash(empty_path)
 
     missing_settings = _settings(tmp_path, None)
     with TestClient(create_app(missing_settings, predictor=StubPredictor())) as client:
@@ -347,7 +350,13 @@ def test_predict_cities_empty_and_missing_catalog_report_no_cities(tmp_path):
             data={"country_iso": "JP"},
         )
         assert response.status_code == 200
-        assert response.json()["status"] == "no_cities"
+        missing_payload = response.json()
+        assert missing_payload["status"] == "no_cities"
+        assert missing_payload["city_scores"] == []
+        # Nothing loaded, so there is no catalog identity to report: this is how
+        # a client tells "catalog configured but empty for this country" from
+        # "no catalog at all".
+        assert missing_payload["scope"]["city_catalog_revision"] is None
 
 
 def test_city_image_validation_limits_and_exif_gps(tmp_path):

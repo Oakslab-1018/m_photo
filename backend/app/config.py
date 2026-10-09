@@ -3,7 +3,7 @@
 All writable state (uploaded images + SQLite database) lives under a single
 configurable root directory. The default is ``<repo>/backend/storage`` — the
 repo-level ``data/`` directory is deliberately avoided because it holds the
-read-only country knowledge base (``data/countries.json``).
+read-only catalogs (``data/countries.json``, ``data/cities.json``).
 
 ======================  ==============================  ======================
 Primary env var         Accepted aliases                Purpose
@@ -94,6 +94,17 @@ class Settings:
     def countries_path(self) -> Path:
         """Location of the read-only country knowledge base."""
         return REPO_ROOT / "data" / "countries.json"
+
+    @property
+    def cities_path(self) -> Path:
+        """Location of the read-only GeoNames city catalog.
+
+        The backend keeps its own copy of the catalog so city rows returned by
+        the inference service can be checked against the authoritative
+        identity/coordinates before they reach a user (see
+        :mod:`backend.app.services.city_catalog`).
+        """
+        return REPO_ROOT / "data" / "cities.json"
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "Settings":

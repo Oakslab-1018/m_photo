@@ -10,7 +10,7 @@ Vue / Nginx :8080 -> FastAPI（Docker，内部 :8000）
 
 StreetCLIP 环境在 `inference/streetclip/.venv`，与业务环境隔离，但共用本机显卡。
 业务镜像没有 Torch/Transformers；这里只安装 HTTP 客户端。
-推理服务只启动一个模型实例、单次一张图，预计算并复用 20 国文本 embedding。
+推理服务只启动一个模型实例、单次一张图，预计算并复用全目录文本 embedding。
 
 ## 已选依赖与权重
 
@@ -45,6 +45,8 @@ STREETCLIP_URL=http://host.docker.internal:8001
 STREETCLIP_API_KEY=<本机推理服务与后端使用同一个随机 token>
 STREETCLIP_TIMEOUT_SECONDS=45
 STREETCLIP_DEVICE=cuda
+STREETCLIP_CITY_LIMIT_PER_COUNTRY=100
+STREETCLIP_REFERENCE_INDEX=
 DEEPSEEK_API_KEY=
 DEEPSEEK_BASE_URL=https://api.deepseek.com
 DEEPSEEK_MODEL=deepseek-flash
@@ -80,7 +82,7 @@ DeepSeek 只接收经过白名单和长度限制的结构化线索、候选与�
 
 ## 排名、证据与事务
 
-`POST /predict` 接收 multipart 字段 `file` 和 bearer token，返回全部 20 国的 `raw_cosine`、
+`POST /predict` 接收 multipart 字段 `file` 和 bearer token，返回全部目录国家（当前 250 个）的 `raw_cosine`、
 模型 revision、候选/模板 hash、Top1-Top2 margin 和 `uncertain`。
 每个文本模板先 L2 归一化，模板平均后再 L2；图像 embedding 单独归一化后做余弦匹配。
 上传进入模型前会处理 EXIF 方向、转 RGB、重编码并去掉元数据。
@@ -93,18 +95,45 @@ Alembic `0002_model_evidence` 增加可空 `model_evidence_json`，原会话和�
 确认操作保持确定性，不调用对话模型。
 
 前端显示名次、余弦相似度或规则权重，不再把这些分数标成百分比。
-这只有固定 20 国候选；目录外照片仍会得到目录内 Top1。
+候选范围是完整国家目录；目录外照片仍会得到目录内 Top1。
 低 margin 只是排序不确定，不是可靠的目录外检测。地图坐标是国家代表点，不是照片定位坐标。
 两个客户端都没有自动重试；HTTP socket timeout 不承诺严格的总墙钟时间。
 模型服务故障时回落到原规则；对话模型故障时回落到模板。
 
+### 城市检索与参考街景
+
+选中国家后前端调用 `POST /api/geo/{session_id}/cities`，后端用该会话原图调用
+`POST /predict-cities`（multipart `file` + 表单 `country_iso`），返回该国目录内的城市候选。
+城市由 `data/cities.json` 定义，不由模型定义：后端逐行核对 id、名称与经纬度，
+并校验 `scope.city_catalog_revision` 等于该文件的 SHA-256，对不上就整份丢弃。
+`city_id` 在 API 层序列化为十进制字符串（前端以它为 key）。
+城市候选同样是代表点，不是照片定位；`region` 是 GeoNames admin1 **代码**（例如东京为 `40`），不是地区名。
+该接口只读且无状态：不写消息、不改国家排序、不影响已确认国家，切换国家查看城市不会污染分析结果。
+
+带标注的参考街景索引（`STREETCLIP_REFERENCE_INDEX`）是可选的。加载成功后 `/predict` 会附带
+`reference` sidecar；后端校验 revision 后，把命中结果作为**只读诊断**挂在对应国家候选上。
+参考余弦不进入排序公式，因此不会改变候选顺序；sidecar 损坏只丢诊断，国家排名照常返回。
+未配置索引时这三个字段整个不出现，前端据此区分"没有库"和"有库但没命中"。
+
 ## 本机验证记录
 
-- RTX 5060 Laptop GPU；CUDA 可用，实际服务 `/health` 为 `ready=true, device=cuda, countries=20`。
-- 仓库公开 `nagasaki.jpg` 示例：日本排第一，原始余弦约 0.225；两次完整 HTTP 请求约 0.993/0.559 秒。
+- RTX 5060 Laptop GPU；CUDA 可用，实际服务 `/health` 为
+  `ready=true, device=cuda, countries=250, city_capability=true, cities_loaded=34156,
+  reference_configured=false`，其 `city_catalog_revision` 与后端 `data/cities.json` 的 SHA-256 一致。
+- 仓库公开 `nagasaki.jpg` 示例：日本排第一，原始余弦约 0.225（`hybrid_rank`，含 OCR 线索加成后 0.2631）；
+  首次请求约 9.65 秒（含模型预热），随后完整请求约 1.0 秒。
   这只是单张示例实测，不是准确率或普遍延迟承诺。
+- 城市链路实测（同一会话）：`POST /api/geo/{id}/cities` 对 JP 返回 `status=ok`、
+  `cities_considered=100`、10 行候选，约 1.05 秒；`city_id` 为十进制字符串，坐标与名称逐行对上目录。
+  TK 返回 `no_cities`（目录里没有该国的城市），`ZZ` 返回 422，未知会话返回 404，小写 `jp` 正常归一化。
+  连续 5 次城市调用后会话消息数不变，确认该接口不写库。
+- 局部点击实测：新增 4 条线索、裁剪区域 281px，存储的 evidence 多出 `crops` 而全图 250 国先验保持不变，
+  且 `crops` 条目里没有 `reference` 键（sidecar 只描述全图）。
+- 参考街景 sidecar 由推理服务与后端两侧的测试覆盖；仓库内没有真实标注语料
+  （`data/reference-manifest.example.json` 是空的），因此未做真实语料端到端验收。
 - 独立 Compose 数据卷验收：上传 -> 排除 JP 后 KR 首位 -> 局部点击 -> 重启保留完整先验和图片 -> 确认成功。
-- 自动化基线：后端 107 tests + 55 subtests；推理服务 16 tests；前端 14 tests、类型检查和构建通过。
+- 自动化基线：后端 199 tests + 75 subtests；推理服务 46 tests（另 1 skipped）；
+  前端 42 tests、类型检查和构建通过。
 
 来源：StreetCLIP 官方 Hugging Face 模型卡；PyTorch 官方 previous-versions；
 DeepSeek 官方 pricing / Chat Completions 文档。运行结果详见忽略目录下的验收 JSON。

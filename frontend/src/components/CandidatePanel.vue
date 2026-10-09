@@ -55,10 +55,6 @@ const referenceCount = computed(() => {
 
 const cityCount = computed(() => props.cityScores?.length ?? 0)
 
-function openCityTab(): void {
-  activeTab.value = 'city'
-}
-
 function requestCities(): void {
   if (!cityPickerIso.value) return
   emit('request-cities', cityPickerIso.value)
@@ -158,7 +154,7 @@ function cityScoreLabel(city: CityScore): string {
           {{ cityBusy ? '查询中…' : '查询城市候选' }}
         </button>
       </div>
-      <div v-if="isForeignCitySelection" class="inline-note">
+      <div v-if="isForeignCitySelection()" class="inline-note">
         正在查看「{{ cityPickerIso }}」的城市候选，此前结果可能属于其他国家。
       </div>
 

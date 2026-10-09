@@ -17,7 +17,7 @@ from backend.app.services.geo_session import GeoSessionService
 from backend.app.services.model_gateway import MAX_CROPS, StreetClipGateway
 from backend.app.services.pipeline import PipelineService
 from backend.tests.support import make_settings, make_test_image_bytes
-from backend.tests.test_fusion import biased_evidence, full_evidence
+from backend.tests.test_fusion import biased_evidence, countries_of, full_evidence
 
 FAKE_POINT_CLUES = [
     {
@@ -360,4 +360,5 @@ def test_crops_are_capped_through_the_api(settings, monkeypatch):
         with app.state.session_factory() as db:
             evidence = json.loads(db.get(GeoSession, session_id).model_evidence_json)
             assert len(evidence["crops"]) == MAX_CROPS
-            assert len(evidence["rankings"]) == 20  # full prior untouched
+            # Full prior untouched: still exactly the whole loaded catalog.
+            assert len(evidence["rankings"]) == len(countries_of(settings))
