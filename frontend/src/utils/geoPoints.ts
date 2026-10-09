@@ -84,25 +84,34 @@ export interface LngLatBoundsLike {
  * Bounding box over points, dateline-aware: longitudes are unwrapped into a
  * continuous range (e.g. 175 and -175 -> 175..185) instead of spanning the
  * whole globe. Returns null when no usable point exists.
+ *
+ * The window is the complement of the *widest* gap between adjacent longitudes:
+ * every other gap lies inside the window, so no point falls outside it. Picking
+ * the narrowest gap instead would frame a pair of neighbours and silently drop
+ * the rest — e.g. [2.2, 8.5, 12.5] would fit 8.5..12.5 and cut off the
+ * top-ranked candidate at 2.2.
  */
-export function boundsForPoints(points: readonly GeoPoint[]): LngLatBoundsLike | null {
+export function boundsForPoints(
+  points: readonly { lat: number; lng: number }[],
+): LngLatBoundsLike | null {
   if (!points.length) return null
   const lats = points.map((point) => point.lat)
   const lngs = points.map((point) => point.lng).sort((a, b) => a - b)
   const south = Math.min(...lats)
   const north = Math.max(...lats)
 
-  let widest = Number.POSITIVE_INFINITY
+  let widest = -1
   let west = lngs[0]
   let east = lngs[lngs.length - 1]
   for (let index = 0; index < lngs.length; index += 1) {
     const start = lngs[index]
-    const end = index === lngs.length - 1 ? lngs[0] + 360 : lngs[index + 1]
-    const span = end - start
-    if (span < widest) {
-      widest = span
-      west = start
-      east = end
+    const wrapped = index === lngs.length - 1
+    const end = wrapped ? lngs[0] + 360 : lngs[index + 1]
+    if (end - start > widest) {
+      widest = end - start
+      // Fitting on the far side of the widest gap keeps every point inside.
+      west = wrapped ? lngs[0] : lngs[index + 1]
+      east = wrapped ? lngs[lngs.length - 1] : lngs[index] + 360
     }
   }
   return { west, south, east, north }

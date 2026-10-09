@@ -115,8 +115,8 @@ describe('boundsForPoints', () => {
 
   it('wraps around the dateline instead of spanning the globe', () => {
     const bounds = boundsForPoints([
-      { key: 'a', kind: 'city', iso: 'FJ', name: 'A', lat: -18, lng: 175, cosine: null, confirmed: false },
-      { key: 'b', kind: 'city', iso: 'NZ', name: 'B', lat: -41, lng: -175, cosine: null, confirmed: false },
+      { lat: -18, lng: 175 },
+      { lat: -41, lng: -175 },
     ])
     expect(bounds).not.toBeNull()
     expect(bounds!.west).toBe(175)
@@ -130,5 +130,29 @@ describe('boundsForPoints', () => {
     expect(bounds!.east).toBe(138.25)
     expect(bounds!.south).toBe(36.2)
     expect(bounds!.north).toBe(46.2)
+  })
+
+  it('keeps a lone outlier inside the window instead of framing the closest pair', () => {
+    // 2.2 / 8.5 / 12.5: the tightest gap is 8.5..12.5, which would drop the
+    // westernmost candidate off the map entirely.
+    const bounds = boundsForPoints([
+      { lat: 46.2, lng: 2.2 },
+      { lat: 46.8, lng: 8.5 },
+      { lat: 47.3, lng: 12.5 },
+    ])
+    expect(bounds!.west).toBe(2.2)
+    expect(bounds!.east).toBe(12.5)
+  })
+
+  it('spans every point across a widely spread candidate set', () => {
+    const bounds = boundsForPoints([
+      { lat: 36.2, lng: 138.25 },
+      { lat: 23.7, lng: 121 },
+      { lat: 36.5, lng: 127.5 },
+      { lat: 7.5, lng: 134.5 },
+      { lat: -21.1, lng: 55.5 },
+    ])
+    expect(bounds!.west).toBe(55.5)
+    expect(bounds!.east).toBe(138.25)
   })
 })

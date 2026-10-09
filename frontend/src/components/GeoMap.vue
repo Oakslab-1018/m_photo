@@ -1,11 +1,22 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import * as maplibregl from 'maplibre-gl'
+// Vector tiles are parsed in a Web Worker. MapLibre derives that worker's URL from
+// import.meta.url, which after bundling points at this app's own chunk — a path where
+// no worker file exists. Every tile parse then fails and the basemap collapses to the
+// style's background color, while the map raises no fatal error and markers still
+// draw, so it reads as "the tile server is down". Let Vite emit the worker instead
+// (?worker&url keeps a .js extension, which Nginx serves as JavaScript) and point
+// MapLibre at the hashed asset.
+import maplibreWorkerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url'
 import 'maplibre-gl/dist/maplibre-gl.css'
 import type { CityScore, CountryScore } from '@/types'
 import { cityPoints, countryPoints } from '@/utils/geoPoints'
 import { resolveMapStyle } from '@/utils/mapConfig'
 import { createMapLifecycle, type MapLifecycle, type MapPoint } from '@/composables/useMapLibre'
+
+// Idempotent, and the Map itself is only built in onMounted, so ordering is safe.
+maplibregl.setWorkerUrl(maplibreWorkerUrl)
 
 const props = defineProps<{
   scores: CountryScore[]
@@ -69,6 +80,12 @@ function markerElement(point: MapPoint): HTMLElement {
   return el
 }
 
+function renderMarkers(): void {
+  if (!lifecycle) return
+  lifecycle.renderMarkers([...countries.value, ...cities.value])
+}
+
+/** New candidates/cities: re-place the markers and reframe the camera on them. */
 function refresh(): void {
   if (!lifecycle) return
   const points = [...countries.value, ...cities.value]
@@ -107,11 +124,11 @@ onMounted(() => {
   }
 })
 
-watch(
-  () => [props.scores, props.cityScores, props.confirmedIso, props.selectedIso],
-  refresh,
-  { deep: false },
-)
+watch(() => [props.scores, props.cityScores], refresh, { deep: false })
+// Selecting or confirming only changes highlighting, not the data: redraw the markers
+// and leave the camera alone. Refitting here would yank a user who had just zoomed
+// into an area straight back out to the full extent every time they pick a candidate.
+watch(() => [props.confirmedIso, props.selectedIso], renderMarkers, { deep: false })
 
 onBeforeUnmount(() => {
   lifecycle?.dispose()

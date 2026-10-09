@@ -1,4 +1,4 @@
-import type { LngLatBoundsLike } from '@/utils/geoPoints'
+import { boundsForPoints, type LngLatBoundsLike } from '@/utils/geoPoints'
 
 /**
  * Minimal structural types for the MapLibre API surface this app uses. Keeping
@@ -92,7 +92,7 @@ export function createMapLifecycle(
 
   function fitToPoints(points: readonly MapPoint[]): void {
     if (disposed) return
-    const bounds: LngLatBoundsLike | null = boundsFor(points)
+    const bounds: LngLatBoundsLike | null = boundsForPoints(points)
     if (!bounds) return
     if (bounds.west === bounds.east && bounds.south === bounds.north) {
       map.easeTo({ center: [bounds.west, bounds.south], zoom: 3, duration: 0 })
@@ -122,24 +122,3 @@ export function createMapLifecycle(
   }
 }
 
-function boundsFor(points: readonly MapPoint[]): LngLatBoundsLike | null {
-  if (!points.length) return null
-  const lats = points.map((point) => point.lat)
-  const lngs = points.map((point) => point.lng).sort((a, b) => a - b)
-  const south = Math.min(...lats)
-  const north = Math.max(...lats)
-  let widest = Number.POSITIVE_INFINITY
-  let west = lngs[0]
-  let east = lngs[lngs.length - 1]
-  for (let index = 0; index < lngs.length; index += 1) {
-    const start = lngs[index]
-    const end = index === lngs.length - 1 ? lngs[0] + 360 : lngs[index + 1]
-    const span = end - start
-    if (span < widest) {
-      widest = span
-      west = start
-      east = end
-    }
-  }
-  return { west, south, east, north }
-}
