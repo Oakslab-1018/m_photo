@@ -4,19 +4,37 @@ The interface is torch-free. The real implementation loads the pinned
 ``geolocal/StreetCLIP`` revision exactly once and precomputes one normalized
 text embedding per country (three normalized templates averaged and
 renormalized). Tests inject a stub predictor instead of loading weights.
+
+``encode_image`` is the single shared, thread-safe image encoder used by the
+country ranking, the city text-prototype ranking and the optional labeled
+reference builder. It always returns a CPU ``float32`` L2-normalized
+``numpy.ndarray`` so downstream pure-NumPy code never needs torch.
+
+City text features are computed on demand for the selected country only, then
+kept in a small bounded LRU (never embeddings for the ~30k global cities at
+once). Concurrent requests for different countries do not serialize text
+prototype computation beyond the single GPU inference lock.
 """
 
 from __future__ import annotations
 
 import logging
 import threading
-from contextlib import nullcontext
+from collections import OrderedDict
 from pathlib import Path
-from types import TracebackType
 from typing import Any, Protocol, runtime_checkable
 
+import numpy as np
+
 from .catalog import Country, compute_catalog_revision, render_prompts
-from .config import MODEL_ID, MODEL_REVISION, PROMPT_TEMPLATE_VERSION
+from .cities import City, city_prompt_count, render_city_prompts
+from .config import (
+    CITY_TEXT_FEATURE_CACHE_COUNTRIES,
+    DEFAULT_CITY_PROMPT_CHUNK,
+    MODEL_ID,
+    MODEL_REVISION,
+    PROMPT_TEMPLATE_VERSION,
+)
 from .schema import build_prediction
 
 logger = logging.getLogger(__name__)
@@ -46,6 +64,12 @@ class Predictor(Protocol):
         ...
 
 
+def _l2_normalize_numpy(matrix: np.ndarray) -> np.ndarray:
+    norms = np.linalg.norm(matrix, axis=-1, keepdims=True)
+    norms = np.where(norms <= 1e-12, 1.0, norms)
+    return np.ascontiguousarray(matrix / norms, dtype=np.float32)
+
+
 class StreetClipPredictor:
     """Real CUDA predictor; model and country text embeddings load once.
 
@@ -70,6 +94,10 @@ class StreetClipPredictor:
         self._text_embeddings: Any = None
         self._torch: Any = None
         self._inference_lock = threading.Lock()
+        self._city_cache_lock = threading.Lock()
+        self._city_cache: "OrderedDict[str, tuple[tuple[int, ...], np.ndarray]]" = OrderedDict()
+        self._city_locks: dict[str, threading.Lock] = {}
+        self._city_cache_limit = max(1, int(CITY_TEXT_FEATURE_CACHE_COUNTRIES))
 
     @property
     def ready(self) -> bool:
@@ -82,6 +110,17 @@ class StreetClipPredictor:
     @property
     def catalog_revision(self) -> str:
         return self._catalog_revision
+
+    @property
+    def dimension(self) -> int | None:
+        """Embedding dimension once loaded, else ``None``."""
+        embeddings = self._text_embeddings
+        if embeddings is None:
+            return None
+        try:
+            return int(embeddings.shape[-1])
+        except Exception:  # pragma: no cover - defensive
+            return None
 
     def _torch_device(self) -> Any:
         import torch  # noqa: PLC0415 - intentionally lazy
@@ -168,24 +207,160 @@ class StreetClipPredictor:
         self._torch = torch
         return torch
 
-    def predict(self, payload: bytes) -> dict[str, Any]:
-        """Return the strict public ranking contract for one image."""
+    def encode_image(self, image: Any) -> np.ndarray:
+        """Thread-safe shared encoder: PIL image -> CPU normalized float32 vector.
+
+        This is the exact hook used by the country ranking, the city ranking and
+        the offline reference index builder. It performs one model forward pass
+        per image under the single inference lock and always detaches to a
+        contiguous CPU array before returning.
+        """
         if not self._ready or self._model is None:
             raise PredictorUnavailableError("model is not loaded")
-        try:
-            from .schema import decode_image_bytes
-        except Exception as exc:  # pragma: no cover - defensive
-            raise PredictorUnavailableError("image decoder is unavailable") from exc
-
-        image = decode_image_bytes(payload)
         torch = self._torch_module()
         try:
-            inputs = self._processor(images=image, return_tensors="pt")
-            inputs = {key: value.to(self._device) for key, value in inputs.items()}
             with self._inference_lock, torch.inference_mode():
+                inputs = self._processor(images=image, return_tensors="pt")
+                inputs = {key: value.to(self._device) for key, value in inputs.items()}
                 output = self._model.get_image_features(**inputs)
                 normalized = torch.nn.functional.normalize(output, p=2, dim=-1)
-                similarities = (normalized @ self._text_embeddings.T).squeeze(0)
+                vector = (
+                    normalized.squeeze(0)
+                    .detach()
+                    .to("cpu")
+                    .to(torch.float32)
+                    .numpy()
+                )
+        except PredictorUnavailableError:
+            raise
+        except Exception as exc:  # pragma: no cover - requires real weights
+            raise PredictorUnavailableError(f"StreetCLIP image encoding failed: {exc}") from exc
+        array = np.ascontiguousarray(vector, dtype=np.float32)
+        if array.ndim != 1 or array.size == 0:
+            raise PredictorUnavailableError("StreetCLIP returned an invalid image embedding")
+        return array
+
+    def _encode_text_prompts(self, prompts: list[str]) -> np.ndarray:
+        """Encode text prompts in bounded chunks; CPU normalized float32 rows."""
+        if not self._ready or self._model is None:
+            raise PredictorUnavailableError("model is not loaded")
+        torch = self._torch_module()
+        chunk_size = max(1, int(getattr(self.settings, "city_prompt_chunk", DEFAULT_CITY_PROMPT_CHUNK)))
+        blocks: list[np.ndarray] = []
+        try:
+            for start in range(0, len(prompts), chunk_size):
+                chunk = prompts[start : start + chunk_size]
+                with self._inference_lock, torch.inference_mode():
+                    inputs = self._processor(
+                        text=chunk, return_tensors="pt", padding=True, truncation=True
+                    )
+                    inputs = {key: value.to(self._device) for key, value in inputs.items()}
+                    output = self._model.get_text_features(**inputs)
+                    normalized = torch.nn.functional.normalize(output, p=2, dim=-1)
+                    blocks.append(
+                        normalized.detach().to("cpu").to(torch.float32).numpy().astype(
+                            np.float32, copy=True
+                        )
+                    )
+        except PredictorUnavailableError:
+            raise
+        except Exception as exc:  # pragma: no cover - requires real weights
+            raise PredictorUnavailableError(f"StreetCLIP text encoding failed: {exc}") from exc
+        if not blocks:
+            raise PredictorUnavailableError("no text prompts were rendered")
+        return np.concatenate(blocks, axis=0)
+
+    def _city_text_features(
+        self,
+        country_iso: str,
+        cities: tuple[City, ...],
+        country_name: str,
+    ) -> np.ndarray:
+        """Return normalized per-city prototypes, cached per country (bounded)."""
+        iso = country_iso.strip().upper()
+        city_ids = tuple(city.city_id for city in cities)
+        with self._city_cache_lock:
+            cached = self._city_cache.get(iso)
+            if cached is not None and cached[0] == city_ids:
+                self._city_cache.move_to_end(iso)
+                return cached[1]
+            lock = self._city_locks.setdefault(iso, threading.Lock())
+        with lock:
+            with self._city_cache_lock:
+                cached = self._city_cache.get(iso)
+                if cached is not None and cached[0] == city_ids:
+                    self._city_cache.move_to_end(iso)
+                    return cached[1]
+            prompts: list[str] = []
+            for city in cities:
+                prompts.extend(render_city_prompts(city, country_name))
+            flat = self._encode_text_prompts(prompts)
+            per_city = flat.reshape(len(cities), city_prompt_count(), -1)
+            averaged = per_city.mean(axis=1)
+            prototypes = _l2_normalize_numpy(averaged)
+            with self._city_cache_lock:
+                self._city_cache[iso] = (city_ids, prototypes)
+                self._city_cache.move_to_end(iso)
+                while len(self._city_cache) > self._city_cache_limit:
+                    self._city_cache.popitem(last=False)
+            return prototypes
+
+    def city_text_scores(
+        self,
+        image_vector: np.ndarray,
+        country_iso: str,
+        cities: tuple[City, ...],
+        country_name: str,
+    ) -> list[tuple[int, float]]:
+        """Cosine similarity for each selected city's text prototype.
+
+        Returns ``(city_id, raw_cosine)`` in the same order as ``cities``. The
+        image vector must be the shared :meth:`encode_image` output.
+        """
+        if not cities:
+            return []
+        query = np.asarray(image_vector, dtype=np.float32)
+        if query.ndim != 1:
+            raise PredictorUnavailableError("city scoring requires a 1-D image vector")
+        norm = float(np.linalg.norm(query.astype(np.float64)))
+        if norm <= 1e-12:
+            raise PredictorUnavailableError("city scoring requires a non-zero image vector")
+        query = query / np.float32(norm)
+        prototypes = self._city_text_features(country_iso, cities, country_name)
+        if prototypes.shape[0] != len(cities):
+            raise PredictorUnavailableError("city text feature count mismatch")
+        if prototypes.shape[1] != query.shape[0]:
+            raise PredictorUnavailableError(
+                "city text feature dimension does not match the image encoder"
+            )
+        scores = prototypes @ query
+        return [
+            (city.city_id, float(np.clip(scores[index], -1.0, 1.0)))
+            for index, city in enumerate(cities)
+        ]
+
+    def predict_from_vector(self, image_vector: np.ndarray) -> dict[str, Any]:
+        """Country ranking from a shared :meth:`encode_image` vector.
+
+        Used by the service so one image forward pass can serve both the
+        country ranking and the optional reference-index search.
+        """
+        if not self._ready or self._model is None:
+            raise PredictorUnavailableError("model is not loaded")
+        if self._text_embeddings is None:
+            raise PredictorUnavailableError("country text embeddings are not loaded")
+        vector = np.asarray(image_vector, dtype=np.float32)
+        if vector.ndim != 1 or vector.size == 0:
+            raise PredictorUnavailableError("country scoring requires a 1-D image vector")
+        norm = float(np.linalg.norm(vector.astype(np.float64)))
+        if norm <= 1e-12:
+            raise PredictorUnavailableError("country scoring requires a non-zero image vector")
+        vector = vector / np.float32(norm)
+        torch = self._torch_module()
+        try:
+            with torch.inference_mode():
+                query = torch.from_numpy(vector).to(self._device)
+                similarities = (query @ self._text_embeddings.T).squeeze(0)
             values = similarities.detach().to("cpu").tolist()
             rankings = [(country.iso, float(value)) for country, value in zip(self.countries, values)]
             prediction = build_prediction(
@@ -198,12 +373,25 @@ class StreetClipPredictor:
         except Exception as exc:
             raise PredictorUnavailableError(f"StreetCLIP inference failed: {exc}") from exc
 
+    def predict(self, payload: bytes) -> dict[str, Any]:
+        """Return the strict public ranking contract for one image."""
+        if not self._ready or self._model is None:
+            raise PredictorUnavailableError("model is not loaded")
+        from .schema import decode_image_bytes
+
+        image = decode_image_bytes(payload)
+        vector = self.encode_image(image)
+        return self.predict_from_vector(vector)
+
     def close(self) -> None:
         self._ready = False
         self._model = None
         self._processor = None
         self._text_embeddings = None
         self._device = "unloaded"
+        with self._city_cache_lock:
+            self._city_cache.clear()
+            self._city_locks.clear()
         torch = self._torch
         self._torch = None
         if torch is not None and torch.cuda.is_available():
@@ -215,3 +403,4 @@ __all__ = [
     "PredictorUnavailableError",
     "StreetClipPredictor",
 ]
+

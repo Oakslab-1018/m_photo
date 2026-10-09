@@ -3,11 +3,16 @@
 The stub predictor proves the application cannot silently score random/fake
 images: when no real predictor is injected, ``/predict`` returns 503, while an
 injected stub returns the contract and reports ready/device through ``/health``.
+
+The country catalog is dynamic (~250 rows in data/countries.json), so these
+tests derive the candidate list from the JSON file instead of hardcoding 20.
 """
 
 from __future__ import annotations
 
 import io
+import json
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -15,6 +20,13 @@ from PIL import Image
 
 from inference.streetclip.app import create_app
 from inference.streetclip.config import Settings
+
+COUNTRIES_PATH = Path("data/countries.json")
+
+
+def _catalog_isos() -> list[str]:
+    payload = json.loads(COUNTRIES_PATH.read_text(encoding="utf-8"))
+    return sorted({str(item["iso"]).upper() for item in payload})
 
 
 def _png_bytes() -> bytes:
@@ -38,6 +50,10 @@ class StubPredictor:
     def device(self) -> str:
         return self._device
 
+    @property
+    def catalog_revision(self) -> str:
+        return "f" * 64
+
     def load(self) -> None:
         self._ready = True
 
@@ -46,11 +62,8 @@ class StubPredictor:
 
         self.calls += 1
         rankings = [
-            (iso, 0.5 - (index * 0.01))
-            for index, iso in enumerate(
-                ["JP", "FR", "US", "CN", "DE", "IT", "GB", "ES", "GR", "RU",
-                 "CA", "BR", "AU", "IN", "TH", "EG", "MX", "NL", "SE", "KR"]
-            )
+            (iso, 0.5 - (index * 0.0005))
+            for index, iso in enumerate(_catalog_isos())
         ]
         if not payload:
             raise ValueError("empty")
@@ -70,7 +83,11 @@ def test_health_reports_required_fields_for_injected_predictor():
         assert payload["model"] == "geolocal/StreetCLIP"
         assert payload["model_revision"] == "e3561ba2ad9bf14c9efd6b0092607b8497efbfea"
         assert payload["device"] == "cpu"
-        assert payload["countries"] == 20
+        assert payload["countries"] == len(_catalog_isos())
+        assert payload["city_capability"] in {True, False}
+        assert isinstance(payload["cities_loaded"], int)
+        assert payload["reference_configured"] is False
+        assert payload["reference_loaded"] is False
 
 
 def test_predict_requires_file_field():
@@ -79,7 +96,8 @@ def test_predict_requires_file_field():
         assert response.status_code == 422
 
 
-def test_predict_returns_exact_contract_with_20_sorted_rankings():
+def test_predict_returns_exact_contract_with_sorted_dynamic_rankings():
+    expected = len(_catalog_isos())
     with TestClient(create_app(_settings(), predictor=StubPredictor())) as client:
         response = client.post(
             "/predict",
@@ -90,7 +108,7 @@ def test_predict_returns_exact_contract_with_20_sorted_rankings():
         assert set(payload.keys()) == {
             "model", "model_revision", "catalog_revision", "rankings", "margin", "uncertain",
         }
-        assert len(payload["rankings"]) == 20
+        assert len(payload["rankings"]) == expected
         cosines = [item["raw_cosine"] for item in payload["rankings"]]
         assert cosines == sorted(cosines, reverse=True)
         assert payload["margin"] == pytest.approx(cosines[0] - cosines[1])

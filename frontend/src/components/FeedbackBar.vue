@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { nextTick, ref } from 'vue'
+import { computed, nextTick, ref } from 'vue'
 import type { FeedbackPayload, HypothesisAction } from '@/types'
 
 const props = defineProps<{
@@ -14,17 +14,28 @@ const emit = defineEmits<{
 
 const inputRef = ref<HTMLInputElement | null>(null)
 const text = ref('')
+const composing = ref(false)
 
 async function focusInput(): Promise<void> {
   await nextTick()
   inputRef.value?.focus()
 }
 
+const canSend = computed(() => text.value.trim().length > 0 && !props.busy && !props.disabled)
+
 function submit(): void {
+  if (composing.value) return
   const value = text.value.trim()
-  if (!value || props.busy || props.disabled) return
+  if (!canSend.value) return
   emit('feedback', { type: 'free_text', text: value })
   text.value = ''
+}
+
+function onEnter(event: KeyboardEvent): void {
+  // Chinese IME composition: Enter confirms the composition, never sends.
+  if (event.isComposing || composing.value) return
+  event.preventDefault()
+  submit()
 }
 
 function confirmIso(action: HypothesisAction): void {
@@ -50,7 +61,7 @@ defineExpose({ focusInput })
         :disabled="busy"
         @click="confirmIso(action)"
       >
-        ✅ 确认是这里
+        ✅ 确认这个国家
       </button>
       <button
         v-if="action.kind === 'confirm' && action.payload?.iso"
@@ -79,9 +90,11 @@ defineExpose({ focusInput })
         type="text"
         :placeholder="action?.kind === 'ask' || action?.kind === 'request_clue' ? '输入补充线索或直接描述场景…' : '输入反馈，或直接描述线索…'"
         :disabled="disabled || busy"
-        @keydown.enter.prevent="submit"
+        @compositionstart="composing = true"
+        @compositionend="composing = false"
+        @keydown.enter="onEnter"
       >
-      <button type="button" class="primary-btn send-btn" :disabled="disabled || busy" @click="submit">
+      <button type="button" class="primary-btn send-btn" :disabled="!canSend" @click="submit">
         {{ busy ? '处理中…' : '发送' }}
       </button>
     </div>

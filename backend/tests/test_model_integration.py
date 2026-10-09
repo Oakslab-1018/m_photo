@@ -124,12 +124,20 @@ def test_full_model_prior_survives_rejections_restart_and_points(settings):
             assert response.json()["scores"][0]["iso"] == data["rankings"][7]["iso"]
             assert client.post(f"/api/geo/{sid}/analyze-point", json={"x": 0.5, "y": 0.5}).status_code == 200
             with app.state.session_factory() as db:
-                assert db.get(GeoSession, sid).model_evidence == data
+                stored = db.get(GeoSession, sid).model_evidence
+                # The full-image prior stays immutable; the point click only
+                # appends unique crop evidence (see test_fusion for details).
+                assert {k: v for k, v in stored.items() if k != "crops"} == data
+                assert stored["rankings"] == data["rankings"]
+                assert len(stored["crops"]) == 1
+                assert stored["crops"][0]["region"] == {"x": 0.5, "y": 0.5, "size": 22}
         with TestClient(create_app(settings)) as restarted:
             response = restarted.post(f"/api/geo/{sid}/feedback", json={"type": "free_text", "text": "继续分析"})
             assert response.status_code == 200
             assert response.json()["scores"][0]["iso"] == data["rankings"][7]["iso"]
-        assert rank.call_count == 1
+        # Upload ranks the full image once; the point click ranks exactly one
+        # crop. Restart/feedback never re-contacts the model.
+        assert rank.call_count == 2
 
 
 def test_external_calls_precede_write_transaction_and_confirmation_skips_llm(settings):

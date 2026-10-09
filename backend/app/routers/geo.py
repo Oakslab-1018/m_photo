@@ -6,6 +6,7 @@ session obtained from :mod:`backend.app.deps`.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 from pathlib import Path
@@ -181,6 +182,20 @@ def list_messages(
     return MessagesResponse(messages=geo.list_messages(session_id))
 
 
+def _crop_bounds(x_ratio: float, y_ratio: float, width: int, height: int):
+    crop_size = max(1, int(min(width, height) * 0.35))  # 1x1 images must still crop
+    cx, cy = int(x_ratio * width), int(y_ratio * height)
+    left = max(0, cx - crop_size // 2)
+    top = max(0, cy - crop_size // 2)
+    right = min(width, left + crop_size)
+    bottom = min(height, top + crop_size)
+    if right - left < crop_size:
+        left = max(0, right - crop_size)
+    if bottom - top < crop_size:
+        top = max(0, bottom - crop_size)
+    return left, top, right, bottom, crop_size
+
+
 @router.post("/{session_id}/analyze-point", response_model=AnalyzePointResponse)
 def analyze_point(
     session_id: int,
@@ -201,44 +216,72 @@ def analyze_point(
 
     x_ratio, y_ratio = payload.x, payload.y
     crop_path: Path | None = None
+    new_clues = []
+    crop_evidence = None
+    crop_size = 0
     try:
         try:
             with Image.open(image_path) as image:
                 width, height = image.size
-                crop_size = max(1, int(min(width, height) * 0.35))  # 1x1 images must still crop
-                cx, cy = int(x_ratio * width), int(y_ratio * height)
-                left = max(0, cx - crop_size // 2)
-                top = max(0, cy - crop_size // 2)
-                right = min(width, left + crop_size)
-                bottom = min(height, top + crop_size)
-                if right - left < crop_size:
-                    left = max(0, right - crop_size)
-                if bottom - top < crop_size:
-                    top = max(0, bottom - crop_size)
+                left, top, right, bottom, crop_size = _crop_bounds(x_ratio, y_ratio, width, height)
                 crop = image.crop((left, top, right, bottom))
         except (UnidentifiedImageError, OSError) as exc:
             raise HTTPException(status_code=500, detail=f"crop failed: {exc}") from exc
 
         crop_path = settings.upload_dir / f"crop_{uuid.uuid4().hex}.png"
         crop.save(crop_path)
+        crop_digest = hashlib.sha256(crop_path.read_bytes()).hexdigest()
 
         try:
             new_clues = pipeline.analyze(str(crop_path))
         except Exception as exc:
             raise HTTPException(status_code=500, detail=f"AI analysis failed: {exc}") from exc
+
+        gateway = StreetClipGateway(settings)
+        if settings.streetclip_enabled:
+            # Rank the crop BEFORE the temp file is removed; a model failure
+            # keeps the full-image prior while OCR/rules keep working.
+            raw_crop = gateway.rank_image(crop_path)
+            if raw_crop is not None:
+                crop_evidence = gateway.validate_crop(
+                    {**raw_crop, "image_sha256": crop_digest},
+                    {"x": x_ratio, "y": y_ratio, "size": crop_size},
+                )
     finally:
         if crop_path is not None:
             crop_path.unlink(missing_ok=True)
 
     for clue in new_clues:
+        origin = clue.get("source") or "point_click"
         clue["source"] = "point_click"
         clue["evidence"] = (clue.get("evidence") or "") + (
             f"（点击区域 {x_ratio * 100:.0f}%,{y_ratio * 100:.0f}%）"
         )
-    chat.prepare_update(session_id, new_clues=new_clues, click_pos=(x_ratio, y_ratio))
+        extra = dict(clue.get("extra") or {})
+        extra["origin_source"] = origin
+        clue["extra"] = extra
+
+    gateway = StreetClipGateway(settings)
+    existing_evidence = (geo.get(session_id) or geo_session).model_evidence
+    updated_evidence = None
+    if crop_evidence is not None and existing_evidence is not None:
+        # Duplicate regions / repeated imagery are ignored; the immutable
+        # full-image prior is never replaced, only extended with crop evidence.
+        updated_evidence = gateway.with_crop(existing_evidence, crop_evidence)
+    applied_evidence = updated_evidence if updated_evidence is not None else existing_evidence
+
+    # External inference is complete before the write transaction opens; the
+    # preview and the transactional reasoning both use the exact same evidence.
+    chat.prepare_update(
+        session_id, new_clues=new_clues, click_pos=(x_ratio, y_ratio),
+        model_evidence=applied_evidence,
+    )
     with geo.transaction():
         for clue in new_clues:
             geo.add_clue(session_id, clue)
+
+        if updated_evidence is not None:
+            geo.set_model_evidence(session_id, updated_evidence)
 
         result = chat.reason_only(session_id, new_clues=new_clues, click_pos=(x_ratio, y_ratio))
 

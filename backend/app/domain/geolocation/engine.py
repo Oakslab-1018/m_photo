@@ -49,9 +49,11 @@ class CountryScore:
 
     raw_cosine: float | None = None
     score_type: str = "rule_weight"
+    # Optional, non-probabilistic component breakdown for hybrid rankings.
+    fusion: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        result = {
             "iso": self.iso,
             "name": self.name,
             "name_zh": self.name_zh,
@@ -62,6 +64,9 @@ class CountryScore:
             "raw_cosine": self.raw_cosine,
             "score_type": self.score_type,
         }
+        if self.fusion:
+            result["fusion"] = self.fusion
+        return result
 
 
 class ReasoningEngine:

@@ -9,7 +9,7 @@ real predictor only after the model is loaded.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field, field
+from dataclasses import dataclass, field
 from pathlib import Path
 
 MODEL_ID = "geolocal/StreetCLIP"
@@ -22,10 +22,24 @@ PROMPT_TEMPLATES = (
 )
 UNCERTAIN_MARGIN_THRESHOLD = 0.015
 MAX_UPLOAD_BYTES = 16 * 1024 * 1024
+DEFAULT_CITY_LIMIT_PER_COUNTRY = 100
+DEFAULT_CITY_PROMPT_CHUNK = 128
+CITY_REFERENCE_FUSION_WEIGHT = 0.6
+CITY_TEXT_FUSION_WEIGHT = 0.4
+CITY_PROMPT_TEMPLATE_VERSION = "streetclip-city-prompts-v1"
+CITY_TEXT_FEATURE_CACHE_COUNTRIES = 8
+
+CITY_PROMPT_TEMPLATES = (
+    "a photo taken in {city}, {region}, {country}",
+    "a street-level photograph of {city}, {region}, {country}",
+    "a photograph of a street scene in {city}, in the {region} region of {country}",
+    "a cityscape photo of {city}, {country}",
+)
 
 _SERVICE_ROOT = Path(__file__).resolve().parent
 REPO_ROOT = _SERVICE_ROOT.parents[1]
 DEFAULT_COUNTRIES_PATH = REPO_ROOT / "data" / "countries.json"
+DEFAULT_CITIES_PATH = REPO_ROOT / "data" / "cities.json"
 DEFAULT_STORAGE_DIR = _SERVICE_ROOT / "storage"
 
 
@@ -36,6 +50,18 @@ def _env_value(env: dict[str, str], *names: str) -> str | None:
         if value is not None and value.strip():
             return value.strip()
     return None
+
+
+def _positive_int(raw: str | None, name: str, default: int) -> int:
+    if raw is None:
+        return default
+    try:
+        parsed = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+    if parsed <= 0:
+        raise ValueError(f"{name} must be positive")
+    return parsed
 
 
 def load_root_dotenv(repo_root: Path | None = None) -> Path | None:
@@ -62,6 +88,7 @@ class Settings:
     """Immutable process settings resolved from environment variables."""
 
     countries_path: Path = DEFAULT_COUNTRIES_PATH
+    cities_path: Path = DEFAULT_CITIES_PATH
     storage_dir: Path = DEFAULT_STORAGE_DIR
     api_key: str | None = field(default=None, repr=False)
     device: str = "cuda"
@@ -69,6 +96,9 @@ class Settings:
     max_upload_bytes: int = MAX_UPLOAD_BYTES
     cache_embeddings: bool = True
     inference_semaphore_enabled: bool = True
+    city_limit_per_country: int = DEFAULT_CITY_LIMIT_PER_COUNTRY
+    city_prompt_chunk: int = DEFAULT_CITY_PROMPT_CHUNK
+    reference_index_path: Path | None = None
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "Settings":
@@ -84,11 +114,23 @@ class Settings:
             else DEFAULT_COUNTRIES_PATH
         )
 
+        cities_value = get("STREETCLIP_CITIES_PATH", "STREETCLIP_CITY_CATALOG_PATH")
+        cities_path = (
+            Path(cities_value).expanduser().resolve()
+            if cities_value
+            else DEFAULT_CITIES_PATH
+        )
+
         storage_value = get("STREETCLIP_STORAGE_DIR")
         storage_dir = (
             Path(storage_value).expanduser().resolve()
             if storage_value
             else DEFAULT_STORAGE_DIR
+        )
+
+        reference_value = get("STREETCLIP_REFERENCE_INDEX")
+        reference_index_path = (
+            Path(reference_value).expanduser().resolve() if reference_value else None
         )
 
         api_key = get("STREETCLIP_API_KEY")
@@ -110,6 +152,7 @@ class Settings:
 
         return cls(
             countries_path=countries_path,
+            cities_path=cities_path,
             storage_dir=storage_dir,
             api_key=api_key,
             device=device,
@@ -117,6 +160,12 @@ class Settings:
             max_upload_bytes=max_upload_bytes,
             cache_embeddings=cache_embeddings,
             inference_semaphore_enabled=True,
+            city_limit_per_country=_positive_int(
+                get("STREETCLIP_CITY_LIMIT_PER_COUNTRY"),
+                "STREETCLIP_CITY_LIMIT_PER_COUNTRY",
+                DEFAULT_CITY_LIMIT_PER_COUNTRY,
+            ),
+            reference_index_path=reference_index_path,
         )
 
 
@@ -128,6 +177,14 @@ def load_settings(env: dict[str, str] | None = None, *, load_dotenv: bool = True
 
 
 __all__ = [
+    "CITY_PROMPT_TEMPLATES",
+    "CITY_PROMPT_TEMPLATE_VERSION",
+    "CITY_REFERENCE_FUSION_WEIGHT",
+    "CITY_TEXT_FEATURE_CACHE_COUNTRIES",
+    "CITY_TEXT_FUSION_WEIGHT",
+    "DEFAULT_CITIES_PATH",
+    "DEFAULT_CITY_LIMIT_PER_COUNTRY",
+    "DEFAULT_CITY_PROMPT_CHUNK",
     "DEFAULT_COUNTRIES_PATH",
     "DEFAULT_STORAGE_DIR",
     "MAX_UPLOAD_BYTES",

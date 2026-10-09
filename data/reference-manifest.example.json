@@ -1,0 +1,5 @@
+{
+  "schema_version": 1,
+  "_comment": "EMPTY example only. No corpus ships with this repository. Replace references with your own explicitly licensed entries; do not paste uploads, backups or cached images. lat/lng are the labeled reference locations from your manifest, never EXIF/GPS read from the photo. image_path must be a relative path that stays inside this manifest directory.",
+  "references": []
+}

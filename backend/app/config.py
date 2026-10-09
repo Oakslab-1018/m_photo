@@ -16,11 +16,20 @@ M_PHOTO_DB_URL          DATABASE_URL                    full SQLAlchemy URL
                                                         (wins over db path)
 M_PHOTO_CORS_ORIGINS    CORS_ORIGINS                    comma separated origins
 GEO_AI_MODE             AI_MODE                         "mock" (default) / "real"
+OCR_PROVIDER            GEO_OCR_PROVIDER                "mock" (default) / "rapidocr"
+M_PHOTO_OCR_MODEL_DIR   OCR_MODEL_DIR                   local ONNX cache dir
+OCR_DET_MODEL_PATH      -                               explicit det .onnx path
+OCR_REC_MODEL_PATH      -                               explicit rec .onnx path
+OCR_CLS_MODEL_PATH      -                               explicit cls .onnx path
+OCR_MIN_TEXT_SCORE      -                               line score floor (0.5)
+OCR_LANGUAGE_MIN_CONFIDENCE -                           language clue floor (0.7)
 ======================  ==============================  ======================
 
-``GEO_AI_MODE`` deliberately defaults to ``mock`` so the service starts (and
-stays importable) without ``easyocr`` or any downloaded model weights. Other
-values pass through unchanged; only ``mock`` is exercised in this stage.
+``GEO_AI_MODE`` picks the general analyzer mode and ``OCR_PROVIDER`` the OCR
+provider independently. Both default to ``mock`` so the service starts (and is
+fully covered by tests) without RapidOCR or downloaded model weights.
+``rapidocr`` runs PP-OCRv5 mobile det/cls/rec on ONNX Runtime (CPU); models are
+cached under ``data_dir/ocr-models`` unless explicit ``.onnx`` paths are given.
 """
 from __future__ import annotations
 
@@ -31,6 +40,9 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 DEFAULT_AI_MODE = "mock"
+DEFAULT_OCR_PROVIDER = "mock"
+DEFAULT_OCR_MIN_TEXT_SCORE = 0.5
+DEFAULT_OCR_LANGUAGE_MIN_CONFIDENCE = 0.7
 DEFAULT_DATA_DIRNAME = "storage"  # resolved as <repo>/backend/storage
 ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "webp"}
 ALLOWED_CONTENT_TYPES = {
@@ -62,6 +74,13 @@ class Settings:
     media_url_prefix: str
     cors_origins: tuple[str, ...]
     geo_ai_mode: str
+    ocr_provider: str = DEFAULT_OCR_PROVIDER
+    ocr_model_dir: Path | None = None
+    ocr_det_model_path: Path | None = None
+    ocr_rec_model_path: Path | None = None
+    ocr_cls_model_path: Path | None = None
+    ocr_min_text_score: float = DEFAULT_OCR_MIN_TEXT_SCORE
+    ocr_language_min_confidence: float = DEFAULT_OCR_LANGUAGE_MIN_CONFIDENCE
     streetclip_enabled: bool = False
     streetclip_url: str = "http://127.0.0.1:8001"
     streetclip_api_key: str = field(default="", repr=False)
@@ -129,6 +148,41 @@ class Settings:
         ai_mode = (get("GEO_AI_MODE", "AI_MODE") or DEFAULT_AI_MODE).strip().lower()
         media_prefix = get("M_PHOTO_MEDIA_URL") or "/media"
 
+        def normalize_provider(value: str) -> str:
+            candidate = value.strip().lower()
+            if candidate in {"real", "true", "1"}:
+                return "rapidocr"
+            return candidate
+
+        ocr_provider_raw = get("OCR_PROVIDER", "GEO_OCR_PROVIDER")
+        ocr_provider = normalize_provider(
+            ocr_provider_raw if ocr_provider_raw else ai_mode
+        ) or DEFAULT_OCR_PROVIDER
+
+        ocr_model_raw = get("M_PHOTO_OCR_MODEL_DIR", "OCR_MODEL_DIR")
+        ocr_model_dir = (
+            _resolve(ocr_model_raw, data_dir) if ocr_model_raw else (data_dir / "ocr-models")
+        )
+
+        def optional_model_path(name: str) -> Path | None:
+            raw = get(name)
+            return _resolve(raw, ocr_model_dir) if raw else None
+
+        def bounded_float(name: str, default: float) -> float:
+            raw = get(name)
+            if not raw:
+                return default
+            try:
+                value = float(raw)
+            except ValueError:
+                return default
+            return min(1.0, max(0.0, value))
+
+        ocr_min_text_score = bounded_float("OCR_MIN_TEXT_SCORE", DEFAULT_OCR_MIN_TEXT_SCORE)
+        ocr_language_min_confidence = bounded_float(
+            "OCR_LANGUAGE_MIN_CONFIDENCE", DEFAULT_OCR_LANGUAGE_MIN_CONFIDENCE
+        )
+
         return cls(
             data_dir=data_dir,
             upload_dir=upload_dir,
@@ -137,6 +191,13 @@ class Settings:
             media_url_prefix=media_prefix.rstrip("/") or "/media",
             cors_origins=cors_origins,
             geo_ai_mode=ai_mode,
+            ocr_provider=ocr_provider,
+            ocr_model_dir=ocr_model_dir,
+            ocr_det_model_path=optional_model_path("OCR_DET_MODEL_PATH"),
+            ocr_rec_model_path=optional_model_path("OCR_REC_MODEL_PATH"),
+            ocr_cls_model_path=optional_model_path("OCR_CLS_MODEL_PATH"),
+            ocr_min_text_score=ocr_min_text_score,
+            ocr_language_min_confidence=ocr_language_min_confidence,
             streetclip_enabled=(get("STREETCLIP_ENABLED") or "false").lower() in {"1", "true", "yes", "on"},
             streetclip_url=(get("STREETCLIP_URL") or "http://127.0.0.1:8001").rstrip("/"),
             streetclip_api_key=(get("STREETCLIP_API_KEY") or "").strip(),
@@ -157,6 +218,9 @@ __all__ = [
     "ALLOWED_CONTENT_TYPES",
     "ALLOWED_EXTENSIONS",
     "DEFAULT_AI_MODE",
+    "DEFAULT_OCR_LANGUAGE_MIN_CONFIDENCE",
+    "DEFAULT_OCR_MIN_TEXT_SCORE",
+    "DEFAULT_OCR_PROVIDER",
     "DEFAULT_DATA_DIRNAME",
     "MAX_UPLOAD_BYTES",
     "REPO_ROOT",

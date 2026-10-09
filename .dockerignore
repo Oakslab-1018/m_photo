@@ -104,3 +104,6 @@ static/images/
 # Host-only GPU environment and downloaded checkpoints never enter app images.
 inference/
 nul
+
+# Downloaded metadata caches are local build inputs, not source.
+/.cache/

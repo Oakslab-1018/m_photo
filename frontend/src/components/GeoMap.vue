@@ -1,111 +1,148 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
-import type { CountryScore } from '@/types'
-import { useMapViewport, toMapMarkers } from '@/composables/useMapViewport'
-import { scoreLabel } from '@/utils/map'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import * as maplibregl from 'maplibre-gl'
+import 'maplibre-gl/dist/maplibre-gl.css'
+import type { CityScore, CountryScore } from '@/types'
+import { cityPoints, countryPoints } from '@/utils/geoPoints'
+import { resolveMapStyle } from '@/utils/mapConfig'
+import { createMapLifecycle, type MapLifecycle, type MapPoint } from '@/composables/useMapLibre'
 
 const props = defineProps<{
   scores: CountryScore[]
   confirmedIso: string | null
-  exclusions: string[]
-  busy: boolean
+  cityScores?: CityScore[]
+  cityCountryIso?: string | null
+  selectedIso?: string | null
 }>()
 
 const emit = defineEmits<{
   confirm: [score: CountryScore]
-  reject: [score: CountryScore]
+  'select-country': [iso: string]
 }>()
 
-const viewport = useMapViewport()
-const mapRef = ref<HTMLElement | null>(null)
-const imageRef = ref<HTMLImageElement | null>(null)
-const markers = computed(() => toMapMarkers(props.scores, props.confirmedIso))
+const container = ref<HTMLElement | null>(null)
+const mapError = ref<string | null>(null)
+let lifecycle: MapLifecycle | null = null
 
-function recenter(): void {
-  viewport.center(mapRef.value?.clientHeight ?? 0, imageRef.value?.offsetHeight ?? 0)
+const styleConfig = resolveMapStyle(import.meta.env as unknown as { VITE_MAP_STYLE_URL?: string; VITE_MAPTILER_API_KEY?: string })
+
+const countries = computed<MapPoint[]>(() => countryPoints(props.scores, props.confirmedIso))
+const cities = computed<MapPoint[]>(() => cityPoints(props.cityScores))
+const candidateByIso = computed(() => {
+  const lookup = new Map<string, CountryScore>()
+  for (const score of props.scores) lookup.set(score.iso, score)
+  return lookup
+})
+
+function markerElement(point: MapPoint): HTMLElement {
+  const el = document.createElement('button')
+  el.type = 'button'
+  el.className = point.kind === 'city' ? 'maplibre-marker maplibre-marker-city' : 'maplibre-marker'
+  if (point.confirmed) el.classList.add('confirmed')
+  if (point.kind === 'country' && point.iso === props.selectedIso) el.classList.add('selected')
+  const cosine = point.cosine != null ? ` · 余弦 ${point.cosine.toFixed(3)}（非概率）` : ''
+  el.setAttribute(
+    'aria-label',
+    point.kind === 'city'
+      ? `城市候选 ${point.name}（代表点，不是照片位置）`
+      : `候选国家 ${point.name}，单击选中，双击确认国家`,
+  )
+  el.title =
+    point.kind === 'city'
+      ? `${point.name} · 城市代表点，不是照片位置${cosine}`
+      : `${point.name}${point.confirmed ? ' · 用户已确认的国家（非照片 GPS）' : '，单击选中，双击确认国家'}`
+  if (point.kind === 'country') {
+    el.addEventListener('click', (event) => {
+      event.preventDefault()
+      event.stopPropagation()
+      emit('select-country', point.iso)
+    })
+    if (!point.confirmed) {
+      el.addEventListener('dblclick', (event) => {
+        event.preventDefault()
+        event.stopPropagation()
+        const candidate = candidateByIso.value.get(point.iso)
+        if (candidate) emit('confirm', candidate)
+      })
+    }
+  }
+  return el
+}
+
+function refresh(): void {
+  if (!lifecycle) return
+  const points = [...countries.value, ...cities.value]
+  lifecycle.renderMarkers(points)
+  lifecycle.fitToPoints(points)
+}
+
+function focusCountries(): void {
+  lifecycle?.fitToPoints(countries.value)
+}
+
+function focusCities(): void {
+  lifecycle?.fitToPoints(cities.value)
 }
 
 onMounted(() => {
-  window.addEventListener('resize', recenter)
+  if (!container.value) return
+  try {
+    lifecycle = createMapLifecycle(maplibregl, {
+      container: container.value,
+      styleUrl: styleConfig.styleUrl,
+      createMarkerElement: markerElement,
+      onLoad: () => {
+        mapError.value = null
+      },
+      onError: (event) => {
+        mapError.value = '底图加载失败，请检查网络或地图样式配置'
+        const error = (event as { error?: { message?: string } })?.error
+        console.warn('MapLibre error', error?.message ?? error)
+      },
+    })
+    refresh()
+  } catch (error) {
+    mapError.value = '地图初始化失败，请检查浏览器 WebGL 支持'
+    console.warn('MapLibre init failed', error)
+  }
 })
 
+watch(
+  () => [props.scores, props.cityScores, props.confirmedIso, props.selectedIso],
+  refresh,
+  { deep: false },
+)
+
 onBeforeUnmount(() => {
-  window.removeEventListener('resize', recenter)
+  lifecycle?.dispose()
+  lifecycle = null
 })
 </script>
 
 <template>
   <div class="map-panel-inner">
-    <div
-      ref="mapRef"
-      class="map"
-      :class="{ grabbing: viewport.dragging.value }"
-      @mousedown="viewport.onMouseDown"
-      @touchstart="viewport.onTouchStart"
-      @touchmove="viewport.onTouchMove"
-      @touchend="viewport.onTouchEnd"
-      @wheel="viewport.onWheel"
-    >
-      <div
-        class="map-canvas"
-        :style="{
-          transform: viewport.viewportTransform.value,
-          '--map-scale': viewport.scale.value,
-        }"
-      >
-        <img
-          ref="imageRef"
-          src="/world_map.png"
-          class="world-map-img"
-          alt="世界地图，范围为经度负180到正180、纬度负60到正80"
-          draggable="false"
-          @load="recenter"
-        >
-        <div class="map-markers">
-          <button
-            v-for="marker in markers"
-            :key="marker.score.iso"
-            type="button"
-            class="map-marker"
-            :class="{ top: marker.rank === 0, confirmed: confirmedIso === marker.score.iso }"
-            :style="{
-              left: marker.left,
-              top: marker.top,
-              width: marker.size,
-              height: marker.size,
-              background: marker.color,
-            }"
-            :title="marker.title"
-            @dblclick="emit('confirm', marker.score)"
-          >
-            <span class="rank-num">{{ marker.rank + 1 }}</span>
-            <span class="marker-label">{{ marker.score.name_zh }} {{ marker.scoreText }}</span>
-          </button>
-        </div>
+    <div class="map-wrap">
+      <div ref="container" class="maplibre-map" role="application" aria-label="候选国家与城市代表点交互地图" />
+      <div v-if="styleConfig.demoOnly" class="map-badge demo">
+        Demo 底图 · 仅开发预览，不可用于生产
       </div>
-      <div v-if="!scores.length" class="map-empty">上传图片后，候选国家会在这里高亮显示</div>
-      <div class="map-tip">拖拽平移 · 滚轮缩放 · 双击标记确认</div>
+      <div v-if="!countries.length && !cities.length" class="map-empty-overlay">
+        上传图片后，候选国家与城市代表点会显示在这里
+      </div>
+      <div v-if="mapError" class="map-error-overlay" role="status">{{ mapError }}</div>
     </div>
 
-    <div class="candidate-panel">
-      <div class="candidate-title">候选国家</div>
-      <div v-if="!scores.length" class="empty-hint">暂无候选</div>
-      <div v-else class="candidate-list">
-        <article v-for="(candidate, index) in scores" :key="candidate.iso" class="candidate-card">
-          <div class="candidate-main">
-            <span class="candidate-rank">{{ index + 1 }}</span>
-            <div>
-              <div class="candidate-name">{{ candidate.name_zh }}</div>
-              <div class="candidate-score">{{ scoreLabel(candidate) }}</div>
-            </div>
-          </div>
-          <div class="candidate-actions">
-            <button type="button" class="mini-btn confirm" :disabled="busy" @click="emit('confirm', candidate)">确认</button>
-            <button type="button" class="mini-btn reject" :disabled="busy" @click="emit('reject', candidate)">排除</button>
-          </div>
-        </article>
+    <div class="map-footer">
+      <div class="map-legend">
+        <span><i class="legend-dot" />候选国家</span>
+        <span><i class="legend-dot city" />城市候选</span>
+        <span><i class="legend-dot confirmed" />用户已确认国家</span>
       </div>
-      <div v-if="exclusions.length" class="exclusion-note">已排除 ISO：{{ exclusions.join('、') }}</div>
+      <span>单击选中国家 · 双击确认国家 · 标记均为代表点，不是照片 GPS</span>
+      <div class="focus-group">
+        <button type="button" class="ghost-btn" :disabled="!countries.length" @click="focusCountries">聚焦国家</button>
+        <button type="button" class="ghost-btn" :disabled="!cities.length" @click="focusCities">聚焦城市</button>
+      </div>
     </div>
   </div>
 </template>

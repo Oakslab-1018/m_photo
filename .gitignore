@@ -73,3 +73,6 @@ static/images/
 **/static/images/
 # Windows shell redirection artifact (not project source).
 /nul
+
+# Downloaded metadata caches are local build inputs, not source.
+/.cache/

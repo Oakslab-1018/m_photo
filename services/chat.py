@@ -69,7 +69,8 @@ class ChatService:
                 self.session_service.add_message(session_id, "user", f"确认：{cname}")
                 self.session_service.add_message(
                     session_id, "ai",
-                    f"已锁定拍摄地为「{cname}」。推理完成！",
+                    f"已记录你确认的国家为「{cname}」。"
+                    "这是固定的 20 国候选目录内的国家确认，不是照片 GPS 坐标。",
                     meta={"action": {"kind": "done", "iso": iso}},
                 )
                 return {"done": True, "iso": iso,

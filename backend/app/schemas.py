@@ -70,6 +70,8 @@ class CountryScoreModel(BaseModel):
     matched_clues: list[MatchedClueModel] = Field(default_factory=list)
     lat: float = 0.0
     lng: float = 0.0
+    # Optional non-probabilistic fusion breakdown (full cosine + crop mean + clue boost).
+    fusion: dict[str, Any] | None = None
 
     model_config = {"extra": "allow"}
 

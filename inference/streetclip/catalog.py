@@ -1,48 +1,30 @@
 """Country catalog loading and prompt templating.
 
-The catalog is a fixed allowlist: ``data/countries.json`` must contain exactly
-the 20 expected ISO-3166 alpha-2 codes, in any order, with no duplicates. Extra
-or missing entries are startup errors rather than silent drops, so a later
-catalog edit cannot silently remove a candidate.
+``data/countries.json`` is the dynamic source of truth for the country
+directory. The catalog is intentionally not a fixed allowlist: any non-empty
+set of at least two unique two-letter ISO-style codes is accepted. This lets a
+later catalog edit add or remove candidates without changing inference code.
 
-``catalog_revision`` is a SHA-256 over the canonical catalog payload
-(``iso`` + English ``name``, sorted by ISO) plus the prompt template version
-and the three prompt templates. It is stable across restarts and changes when
-any candidate name, the model prompt set or the template version changes.
+A loaded catalog is normalized to uppercase ISO codes and sorted by ISO. The
+``catalog_revision`` is a SHA-256 over the canonical catalog payload (``iso`` +
+English ``name``, sorted by ISO) plus the prompt template version and the
+three prompt templates. It is stable across restarts, independent of input
+record order and non-identity metadata, and changes when any candidate name,
+the model prompt set, or the template version changes.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
 from .config import PROMPT_TEMPLATE_VERSION, PROMPT_TEMPLATES
 
-EXPECTED_ISOS = (
-    "AU",
-    "BR",
-    "CA",
-    "CN",
-    "DE",
-    "EG",
-    "ES",
-    "FR",
-    "GB",
-    "GR",
-    "IN",
-    "IT",
-    "JP",
-    "KR",
-    "MX",
-    "NL",
-    "RU",
-    "SE",
-    "TH",
-    "US",
-)
+_ISO2_RE = re.compile(r"^[A-Z]{2}$")
 
 
 class CatalogError(ValueError):
@@ -56,6 +38,7 @@ class Country:
 
 
 def _read_catalog(path: Path) -> list[Country]:
+    path = Path(path)
     if not path.is_file():
         raise CatalogError(f"country catalog not found: {path}")
     try:
@@ -79,25 +62,17 @@ def _read_catalog(path: Path) -> list[Country]:
         if not isinstance(name, str) or not name.strip():
             raise CatalogError(f"country catalog item {iso} has no English name")
         iso = iso.strip().upper()
-        name = name.strip()
+        if not _ISO2_RE.fullmatch(iso):
+            raise CatalogError(
+                f"country catalog item {index} has an invalid ISO code: {iso!r}"
+            )
         if iso in seen:
             raise CatalogError(f"duplicate ISO code in country catalog: {iso}")
         seen.add(iso)
-        countries.append(Country(iso=iso, name=name))
+        countries.append(Country(iso=iso, name=name.strip()))
 
-    found = {country.iso for country in countries}
-    expected = set(EXPECTED_ISOS)
-    missing = sorted(expected - found)
-    unexpected = sorted(found - expected)
-    if missing or unexpected:
-        details: list[str] = []
-        if missing:
-            details.append("missing=" + ",".join(missing))
-        if unexpected:
-            details.append("unexpected=" + ",".join(unexpected))
-        raise CatalogError("country catalog is not the fixed 20-country set (" + "; ".join(details) + ")")
-    if len(countries) != len(EXPECTED_ISOS):
-        raise CatalogError("country catalog must contain exactly 20 unique countries")
+    if len(countries) < 2:
+        raise CatalogError("country catalog must contain at least two countries")
     return sorted(countries, key=lambda country: country.iso)
 
 
@@ -125,7 +100,6 @@ def compute_catalog_revision(countries: Iterable[Country]) -> str:
 __all__ = [
     "CatalogError",
     "Country",
-    "EXPECTED_ISOS",
     "compute_catalog_revision",
     "render_prompts",
 ]

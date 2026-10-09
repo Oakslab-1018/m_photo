@@ -51,9 +51,19 @@ function safeScore(score: CountryScore): number {
 
 /** Ordering evidence, never a calibrated geolocation probability. */
 export function scoreLabel(score: CountryScore): string {
-  if (score.raw_cosine != null && Number.isFinite(score.raw_cosine)) {
-    return `余弦相似度 ${score.raw_cosine.toFixed(3)}`
+  const rawCosine =
+    score.raw_cosine != null && Number.isFinite(score.raw_cosine) ? score.raw_cosine : null
+  const composite = Number.isFinite(score.score) ? score.score : 0
+
+  if (score.score_type === 'hybrid_rank') {
+    // Composite fusion score must never be presented as a lone cosine/probability.
+    return rawCosine != null
+      ? `融合排序 ${composite.toFixed(3)} · 全图余弦 ${rawCosine.toFixed(3)}（非概率）`
+      : `融合排序 ${composite.toFixed(3)}（非概率）`
   }
-  const value = Number.isFinite(score.score) ? score.score : 0
-  return `规则权重 ${value.toFixed(3)}`
+
+  if (rawCosine != null) {
+    return `余弦相似度 ${rawCosine.toFixed(3)}`
+  }
+  return `规则权重 ${composite.toFixed(3)}`
 }

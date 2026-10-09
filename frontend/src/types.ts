@@ -27,6 +27,58 @@ export interface ChatMessage {
   meta?: Record<string, unknown> | null
 }
 
+export interface ReferenceMatch {
+  reference_id: string
+  iso: string
+  region: string
+  place: string
+  viewpoint?: string
+  city?: string
+  city_id?: string
+  lat?: number
+  lng?: number
+  raw_cosine: number
+}
+
+export interface ReferenceRegion {
+  iso: string
+  region: string
+  raw_cosine: number
+  prototype_count: number
+  support: number
+}
+
+export type CityScoreType = 'city_text_cosine' | 'city_reference_hybrid' | string
+
+export interface CityScore {
+  city_id: string
+  iso: string
+  name: string
+  region: string
+  lat: number
+  lng: number
+  raw_cosine: number
+  score: number
+  score_type: CityScoreType
+  reference_cosine?: number | null
+}
+
+/** Scope counters; every field optional because an unavailable response may send {} */
+export interface CityScope {
+  city_limit_per_country?: number
+  city_catalog_revision?: string
+  cities_considered?: number
+}
+
+export type CitiesStatus = 'ok' | 'unavailable' | 'no_cities'
+
+export interface CitiesResponse {
+  city_scores: CityScore[]
+  country_iso: string
+  scope?: CityScope | null
+  status: CitiesStatus
+}
+
 export interface CountryScore {
   iso: string
   name: string
@@ -34,6 +86,12 @@ export interface CountryScore {
   score: number
   raw_cosine?: number | null
   score_type?: string
+  /** Optional opaque fusion diagnostics; shape owned by the backend contract. */
+  fusion?: Record<string, unknown>
+  /** Metadata-only labeled-reference diagnostics; never photo GPS. */
+  reference_matches?: ReferenceMatch[]
+  reference_regions?: ReferenceRegion[]
+  reference_cosine?: number | null
   matched_clues?: Array<Record<string, unknown>>
   lat: number
   lng: number
@@ -68,6 +126,7 @@ export interface UploadResponse {
   scores: CountryScore[]
   action: HypothesisAction | null
   messages: ChatMessage[]
+  city_scores?: CityScore[]
 }
 
 export interface FeedbackResponse {

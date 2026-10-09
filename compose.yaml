@@ -11,8 +11,13 @@ services:
     environment:
       # 所有可写数据（SQLite + 上传图片）都落在具名卷内。
       M_PHOTO_DATA_DIR: /data
-      # OCR remains mock; StreetCLIP is controlled independently below.
+      # OCR runs in-process (PP-OCRv5 + ONNX Runtime, CPU); mock by default.
       GEO_AI_MODE: mock
+      OCR_PROVIDER: ${OCR_PROVIDER:-mock}
+      # Model weights are cached on the named volume so restarts need no download.
+      M_PHOTO_OCR_MODEL_DIR: /data/ocr-models
+      OCR_MIN_TEXT_SCORE: ${OCR_MIN_TEXT_SCORE:-0.5}
+      OCR_LANGUAGE_MIN_CONFIDENCE: ${OCR_LANGUAGE_MIN_CONFIDENCE:-0.7}
       # GPU inference runs in a separate host process, not this image.
       STREETCLIP_ENABLED: ${STREETCLIP_ENABLED:-false}
       STREETCLIP_URL: ${STREETCLIP_URL:-http://host.docker.internal:8001}

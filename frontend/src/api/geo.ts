@@ -1,6 +1,7 @@
 import {
   type AnalyzePointResponse,
   type ChatMessage,
+  type CitiesResponse,
   type CountriesResponse,
   type Country,
   type FeedbackPayload,
@@ -124,6 +125,25 @@ export class GeoApi {
     const body = await this.request<MessagesResponse | JsonRecord>(`/api/geo/${sessionId}/messages`)
     const record = body as JsonRecord
     return asArray(record.messages).map(asMessage).filter((item): item is ChatMessage => item !== null)
+  }
+
+  /**
+   * Fetch representative city candidates for one country. City points are
+   * ranking diagnostics, never photo GPS; an unavailable backend (404/older
+   * deployment) surfaces as a normalized ApiError for the caller to fall back on.
+   */
+  async cities(sessionId: number, iso: string): Promise<CitiesResponse> {
+    const raw = await this.request<JsonRecord>(`/api/geo/${sessionId}/cities`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ iso }),
+    })
+    return {
+      city_scores: asArray<CitiesResponse['city_scores'][number]>(raw.city_scores),
+      country_iso: typeof raw.country_iso === 'string' ? raw.country_iso : iso,
+      scope: isRecord(raw.scope) ? (raw.scope as unknown as CitiesResponse['scope']) : null,
+      status: typeof raw.status === 'string' ? (raw.status as CitiesResponse['status']) : 'ok',
+    }
   }
 
   async analyzePoint(sessionId: number, point: Point): Promise<AnalyzePointResponse> {

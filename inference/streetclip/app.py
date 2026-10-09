@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
-import logging
 import hmac
+import logging
 from contextlib import asynccontextmanager
 from typing import Any
 
-from starlette.concurrency import run_in_threadpool
-
-from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
 
 from .catalog import CatalogError, Country, compute_catalog_revision
 from .config import MODEL_ID, MODEL_REVISION, Settings, load_settings
@@ -21,6 +20,7 @@ from .schema import (
     ExifGpsPresentError,
     ImageTooLargeError,
     ImageValidationError,
+    InvalidCountryError,
 )
 from .service import StreetClipService
 
@@ -120,8 +120,8 @@ def create_app(
 
     @application.get("/health")
     def health() -> JSONResponse:
-        service: StreetClipService = application.state.service
-        payload = service.health()
+        service_impl: StreetClipService = application.state.service
+        payload = service_impl.health()
         status_code = 200 if payload.get("ready") else 503
         return JSONResponse(status_code=status_code, content=payload)
 
@@ -152,6 +152,41 @@ def create_app(
             raise HTTPException(status_code=503, detail="model unavailable") from exc
         except Exception:  # pragma: no cover - defensive sanitization
             logger.exception("unhandled prediction failure")
+            raise HTTPException(status_code=500, detail="internal inference error") from None
+        return JSONResponse(status_code=200, content=result)
+
+    @application.post("/predict-cities")
+    async def predict_cities(
+        _auth: None = Depends(api_key_dependency),
+        file: UploadFile = File(..., description="single street-level image"),
+        country_iso: str = Form(..., description="ISO-3166 alpha-2 country code"),
+    ) -> JSONResponse:
+        service_impl: StreetClipService = application.state.service
+        try:
+            payload = await file.read(resolved.max_upload_bytes + 1)
+        except Exception as exc:  # pragma: no cover - Starlette read errors
+            raise HTTPException(status_code=400, detail="unable to read upload") from exc
+        finally:
+            await file.close()
+
+        try:
+            result = await run_in_threadpool(
+                service_impl.predict_cities, country_iso, payload
+            )
+        except InvalidCountryError as exc:
+            raise HTTPException(status_code=400, detail=_sanitize_error_detail(str(exc))) from exc
+        except ImageTooLargeError as exc:
+            raise HTTPException(status_code=413, detail=_sanitize_error_detail(str(exc))) from exc
+        except EmptyImageError as exc:
+            raise HTTPException(status_code=400, detail=_sanitize_error_detail(str(exc))) from exc
+        except ExifGpsPresentError as exc:
+            raise HTTPException(status_code=422, detail=_sanitize_error_detail(str(exc))) from exc
+        except (DecodeError, ImageValidationError) as exc:
+            raise HTTPException(status_code=400, detail=_sanitize_error_detail(str(exc))) from exc
+        except PredictorUnavailableError as exc:
+            raise HTTPException(status_code=503, detail="model unavailable") from exc
+        except Exception:  # pragma: no cover - defensive sanitization
+            logger.exception("unhandled city prediction failure")
             raise HTTPException(status_code=500, detail="internal inference error") from None
         return JSONResponse(status_code=200, content=result)
 

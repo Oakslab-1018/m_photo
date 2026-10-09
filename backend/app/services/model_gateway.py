@@ -1,11 +1,20 @@
-"""HTTP-only adapter; no Torch/CUDA dependencies belong in the business backend."""
+"""HTTP-only adapter; no Torch/CUDA dependencies belong in the business backend.
+
+The persisted ``model_evidence`` JSON keeps the immutable full-image ranking
+under ``rankings`` and may carry a bounded, optional list of unique local-crop
+rankings under ``crops``. No database migration is required: the contract is
+validated whenever it is read back, and older payloads without ``crops`` stay
+valid.
+"""
 from __future__ import annotations
 
+import copy
 import hashlib
 import io
 import json
 import logging
 import math
+import re
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -19,6 +28,10 @@ MODEL_REVISION = "e3561ba2ad9bf14c9efd6b0092607b8497efbfea"
 PROMPT_VERSION = "streetclip-country-prompts-v1"
 PROMPTS = ["a photo from {country}", "a street-level photo taken in {country}",
            "a photograph of a street scene in {country}"]
+
+MAX_CROPS = 8
+MAX_CROP_REGION_SIDE = 100_000
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 logger = logging.getLogger(__name__)
 
 
@@ -38,6 +51,10 @@ def clean_image(path: str | Path) -> bytes:
         output = io.BytesIO()
         rgb.save(output, format="JPEG", quality=90)
         return output.getvalue()
+
+
+def _region_key(region: dict) -> tuple[float, float, int]:
+    return (round(float(region["x"]), 6), round(float(region["y"]), 6), int(region["size"]))
 
 
 class StreetClipGateway:
@@ -72,7 +89,8 @@ class StreetClipGateway:
             logger.warning("StreetCLIP unavailable; using rules (%s)", type(exc).__name__)
             return None
 
-    def validate(self, data: object) -> dict:
+    # ---- contract validation -------------------------------------------------
+    def _validate_rankings(self, data: object) -> dict:
         countries = json.loads(self.settings.countries_path.read_text(encoding="utf-8"))
         allowed = {c["iso"] for c in countries}
         if not isinstance(data, dict) or data.get("model") != MODEL_ID or data.get("model_revision") != MODEL_REVISION:
@@ -80,7 +98,7 @@ class StreetClipGateway:
         if data.get("catalog_revision") != catalog_revision(countries):
             raise ValueError("catalog mismatch")
         rows = data.get("rankings")
-        if not isinstance(rows, list) or len(rows) != len(allowed):
+        if not isinstance(rows, list) or not rows:
             raise ValueError("incomplete ranking")
         seen, rankings = set(), []
         for row in rows:
@@ -91,9 +109,15 @@ class StreetClipGateway:
                 raise ValueError("invalid cosine")
             rankings.append({"iso": row["iso"], "raw_cosine": float(value)})
             seen.add(row["iso"])
+        # The provider must return exactly the configured directory once, and
+        # the directory size is dynamic (new countries may be added later).
+        if seen != allowed:
+            raise ValueError("incomplete ranking")
         ordered = sorted(rankings, key=lambda row: (-row["raw_cosine"], row["iso"]))
         if rankings != ordered:
             raise ValueError("unsorted ranking")
+        if len(ordered) < 2:
+            raise ValueError("incomplete ranking")
         margin = ordered[0]["raw_cosine"] - ordered[1]["raw_cosine"]
         reported = data.get("margin")
         if isinstance(reported, bool) or not isinstance(reported, (int, float)) or not math.isfinite(reported) or abs(reported - margin) > 1e-6:
@@ -103,3 +127,95 @@ class StreetClipGateway:
         return {"model": MODEL_ID, "model_revision": MODEL_REVISION,
                 "catalog_revision": data["catalog_revision"], "rankings": rankings,
                 "margin": margin, "uncertain": data["uncertain"]}
+
+    @staticmethod
+    def _validate_region(region: object) -> dict:
+        if not isinstance(region, dict):
+            raise ValueError("invalid crop region")
+        x, y, size = region.get("x"), region.get("y"), region.get("size")
+        if any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+               for value in (x, y)):
+            raise ValueError("invalid crop region")
+        if not 0.0 <= float(x) <= 1.0 or not 0.0 <= float(y) <= 1.0:
+            raise ValueError("invalid crop region")
+        if isinstance(size, bool) or not isinstance(size, int) or not 1 <= size <= MAX_CROP_REGION_SIDE:
+            raise ValueError("invalid crop region")
+        return {"x": float(x), "y": float(y), "size": int(size)}
+
+    @staticmethod
+    def _validate_sha256(value: object) -> str:
+        if not isinstance(value, str) or not _SHA256_RE.match(value):
+            raise ValueError("invalid image hash")
+        return value
+
+    def validate(self, data: object) -> dict:
+        """Validate and normalise a persisted/provided evidence payload.
+
+        Backwards compatible: ``crops`` is optional. When present it must be a
+        bounded list of unique, fully valid crop rankings; corrupted or
+        oversized crop evidence invalidates the payload (callers fall back to
+        rules rather than trusting partial model output).
+        """
+        base = self._validate_rankings(data)
+        raw_crops = data.get("crops") if isinstance(data, dict) else None
+        if raw_crops is None:
+            return base
+        if not isinstance(raw_crops, list) or len(raw_crops) > MAX_CROPS:
+            raise ValueError("invalid crop evidence")
+        crops, regions, digests = [], set(), set()
+        for raw in raw_crops:
+            if not isinstance(raw, dict):
+                raise ValueError("invalid crop entry")
+            crop = self._validate_rankings(raw)
+            crop["region"] = self._validate_region(raw.get("region"))
+            digest = raw.get("image_sha256")
+            if digest is not None:
+                crop["image_sha256"] = self._validate_sha256(digest)
+            key = _region_key(crop["region"])
+            if key in regions or (crop.get("image_sha256") and crop["image_sha256"] in digests):
+                raise ValueError("duplicate crop evidence")
+            regions.add(key)
+            if crop.get("image_sha256"):
+                digests.add(crop["image_sha256"])
+            crops.append(crop)
+        base["crops"] = crops
+        return base
+
+    def validate_crop(self, data: object, region: dict) -> dict:
+        """Build a validated crop record (ranking + click region) for storage."""
+        validated = self.validate(data)
+        if validated.get("crops"):
+            raise ValueError("crop evidence must not nest crops")
+        record = {**validated, "region": self._validate_region(region)}
+        digest = data.get("image_sha256") if isinstance(data, dict) else None
+        if digest is not None:
+            record["image_sha256"] = self._validate_sha256(digest)
+        return record
+
+    def with_crop(self, evidence: dict, crop: dict) -> dict | None:
+        """Return a new evidence payload with ``crop`` appended.
+
+        Duplicate clicks (same region) and repeated imagery (same cleaned-image
+        hash) are ignored, and the crop list is bounded by :data:`MAX_CROPS`.
+        Returns ``None`` when the crop adds no new evidence. The input payload
+        (including the immutable full-image ``rankings``) is never mutated.
+        """
+        if not isinstance(evidence, dict) or not isinstance(crop, dict):
+            return None
+        crops = list(evidence.get("crops") or [])
+        if len(crops) >= MAX_CROPS:
+            return None
+        if not isinstance(crop.get("region"), dict):
+            return None
+        key = _region_key(crop["region"])
+        digest = crop.get("image_sha256")
+        for existing in crops:
+            if not isinstance(existing, dict) or "region" not in existing:
+                return None
+            if _region_key(existing["region"]) == key:
+                return None
+            if digest and digest == existing.get("image_sha256"):
+                return None
+        updated = copy.deepcopy(evidence)
+        updated["crops"] = crops + [copy.deepcopy(crop)]
+        return updated

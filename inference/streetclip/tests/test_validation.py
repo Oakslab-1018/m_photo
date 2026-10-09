@@ -1,18 +1,22 @@
 """Tests for request validation and ranking schema.
 
 These tests must pass in a torch-free interpreter: the app and schema modules
-are imported normally, while the real predictor is never loaded.
+are imported normally, while the real predictor is never loaded. Catalog
+assertions derive the expected set from ``data/countries.json`` because the
+geodata worker owns the dynamic global catalog.
 """
 
 from __future__ import annotations
 
 import io
+import json
 import math
+from pathlib import Path
 
 import pytest
 from PIL import Image
 
-from inference.streetclip.catalog import compute_catalog_revision
+from inference.streetclip.catalog import Country, compute_catalog_revision
 from inference.streetclip.schema import (
     DecodeError,
     EmptyImageError,
@@ -22,6 +26,8 @@ from inference.streetclip.schema import (
     decode_image_bytes,
     validate_image_bytes,
 )
+
+COUNTRIES_PATH = Path("data/countries.json")
 
 
 def _image_bytes(size=(36, 24), fmt="PNG", exif=None) -> bytes:
@@ -34,19 +40,19 @@ def _image_bytes(size=(36, 24), fmt="PNG", exif=None) -> bytes:
     return buffer.getvalue()
 
 
-def test_catalog_revision_is_deterministic_and_20_candidates():
-    from inference.streetclip.catalog import _read_catalog
-
-    countries = _read_catalog(__import__("pathlib").Path("data/countries.json"))
-    assert len(countries) == 20
+def test_catalog_revision_is_deterministic_for_dynamic_global_catalog():
+    payload = json.loads(COUNTRIES_PATH.read_text(encoding="utf-8"))
+    countries = [
+        Country(iso=str(item["iso"]).strip().upper(), name=str(item["name"]).strip())
+        for item in payload
+    ]
+    assert len(countries) == len(payload)
+    assert len(countries) >= 20
+    assert len({item.iso for item in countries}) == len(countries)
     first = compute_catalog_revision(countries)
     second = compute_catalog_revision(list(reversed(countries)))
     assert first == second
     assert len(first) == 64
-    assert set(item.iso for item in countries) == {
-        "AU", "BR", "CA", "CN", "DE", "EG", "ES", "FR", "GB", "GR",
-        "IN", "IT", "JP", "KR", "MX", "NL", "RU", "SE", "TH", "US",
-    }
 
 
 def test_empty_upload_rejected():

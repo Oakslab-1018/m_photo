@@ -87,6 +87,41 @@ describe('useGeoSession', () => {
     expect(session.confirmedIso.value).toBeNull()
   })
 
+  it('applies city candidates and clears them on reset', () => {
+    const session = useGeoSession()
+    session.applyUpload(upload())
+    expect(session.cityScores.value).toEqual([])
+    expect(session.citiesStatus.value).toBeNull()
+
+    session.applyCities({
+      country_iso: 'JP',
+      status: 'ok',
+      city_scores: [
+        {
+          city_id: 'jp-tokyo', iso: 'JP', name: '东京', region: '关东',
+          lat: 35.68, lng: 139.69, raw_cosine: 0.7, score: 0.7, score_type: 'city_text_cosine',
+        },
+      ],
+    })
+    expect(session.cityScores.value.map((city) => city.city_id)).toEqual(['jp-tokyo'])
+    expect(session.cityCountryIso.value).toBe('JP')
+    expect(session.citiesStatus.value).toBe('ok')
+
+    session.clearCities()
+    expect(session.cityScores.value).toEqual([])
+
+    session.applyCities({
+      country_iso: 'JP', status: 'unavailable', city_scores: [],
+      scope: { city_limit_per_country: 5, city_catalog_revision: 'r1', cities_considered: 0 },
+    })
+    expect(session.citiesStatus.value).toBe('unavailable')
+
+    session.reset()
+    expect(session.cityScores.value).toEqual([])
+    expect(session.cityCountryIso.value).toBeNull()
+    expect(session.citiesStatus.value).toBeNull()
+  })
+
   it('reset clears every piece of session state', () => {
     const session = useGeoSession()
     session.applyUpload(upload())

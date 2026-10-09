@@ -2,6 +2,8 @@ import { computed, ref } from 'vue'
 import type {
   AnalyzePointResponse,
   ChatMessage,
+  CitiesResponse,
+  CityScore,
   Clue,
   CountryScore,
   FeedbackResponse,
@@ -21,6 +23,9 @@ export function useGeoSession() {
   const exclusions = ref<string[]>([])
   const confirmedIso = ref<string | null>(null)
   const done = ref(false)
+  const cityScores = ref<CityScore[]>([])
+  const cityCountryIso = ref<string | null>(null)
+  const citiesStatus = ref<CitiesResponse['status'] | null>(null)
 
   const topCandidate = computed<CountryScore | null>(() => scores.value[0] ?? null)
   const isConfirmed = computed(() => confirmedIso.value !== null)
@@ -39,6 +44,10 @@ export function useGeoSession() {
     exclusions.value = []
     confirmedIso.value = null
     done.value = false
+    // Optional upload payload may already carry city candidates; absent stays empty.
+    cityScores.value = [...(response.city_scores ?? [])]
+    cityCountryIso.value = null
+    citiesStatus.value = response.city_scores ? 'ok' : null
   }
 
   function applyFeedback(response: FeedbackResponse): void {
@@ -60,6 +69,19 @@ export function useGeoSession() {
     if (response.action) action.value = response.action
   }
 
+  /** Apply a cities response; empty results clear any previous city candidates. */
+  function applyCities(response: CitiesResponse): void {
+    cityScores.value = [...(response.city_scores ?? [])]
+    cityCountryIso.value = response.country_iso ?? null
+    citiesStatus.value = response.status ?? null
+  }
+
+  function clearCities(): void {
+    cityScores.value = []
+    cityCountryIso.value = null
+    citiesStatus.value = null
+  }
+
   function applyPointAnalysis(response: AnalyzePointResponse): void {
     if (response.clues) clues.value = [...response.clues]
     if (response.scores) scores.value = sortScores(response.scores)
@@ -78,6 +100,9 @@ export function useGeoSession() {
     exclusions.value = []
     confirmedIso.value = null
     done.value = false
+    cityScores.value = []
+    cityCountryIso.value = null
+    citiesStatus.value = null
   }
 
   return {
@@ -90,11 +115,16 @@ export function useGeoSession() {
     exclusions,
     confirmedIso,
     done,
+    cityScores,
+    cityCountryIso,
+    citiesStatus,
     topCandidate,
     isConfirmed,
     acceptedCountry,
     applyUpload,
     applyFeedback,
+    applyCities,
+    clearCities,
     applyPointAnalysis,
     reset,
   }

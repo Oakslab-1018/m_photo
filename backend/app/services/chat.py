@@ -60,12 +60,14 @@ class ChatService(LegacyChatService):
         self.provider = DeepSeekClient(settings) if settings is not None else None
         self._prepared = None
 
+    def _settings(self) -> Settings:
+        return self.provider.settings if self.provider else Settings.from_env({})
+
     def _validated_prior(self, evidence):
         if evidence is None:
             return None
         try:
-            settings = self.provider.settings if self.provider else Settings.from_env({})
-            return StreetClipGateway(settings).validate(evidence)
+            return StreetClipGateway(self._settings()).validate(evidence)
         except Exception as exc:
             logger.warning("Stored StreetCLIP evidence invalid; using rules (%s)", type(exc).__name__)
             return None
@@ -122,12 +124,15 @@ class ChatService(LegacyChatService):
                                    confirmed_iso=None, status="active")
         self._prepare(snapshot, [], "initial")
 
-    def prepare_update(self, session_id, *, feedback=None, new_clues=None, click_pos=None):
+    def prepare_update(self, session_id, *, feedback=None, new_clues=None, click_pos=None, model_evidence=None):
         row = self.session_service.get(session_id)
         if row is None:
             return
+        # ``model_evidence`` lets the point endpoint preview against the exact
+        # crop-extended payload it will persist in the same request.
+        raw_evidence = row.model_evidence if model_evidence is None else model_evidence
         snapshot = SimpleNamespace(clues=deepcopy(row.clues), exclusions=list(row.exclusions),
-                                   model_evidence=self._validated_prior(row.model_evidence),
+                                   model_evidence=self._validated_prior(raw_evidence),
                                    confirmed_iso=row.confirmed_iso, status=row.status)
         history = self.session_service.list_messages(session_id)
         # End the read transaction before the optional external API request.
@@ -137,6 +142,3 @@ class ChatService(LegacyChatService):
             return
         self._prepare(snapshot, history, "feedback" if feedback is not None else "point",
                       feedback=feedback, new_clues=new_clues, click_pos=click_pos)
-
-
-__all__ = ["ChatService"]

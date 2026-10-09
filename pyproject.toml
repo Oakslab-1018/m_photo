@@ -13,6 +13,11 @@ dependencies = [
     "python-multipart>=0.0.9",
     "alembic>=1.13,<2.0",
     "httpx>=0.27,<1.0",
+    # Real OCR runs fully on CPU via ONNX Runtime (no torch, no easyocr).
+    # Exact pin: this is the version whose PP-OCRv5 model routes/sha256 were
+    # verified against the ONNX files listed in docs/ocr.md.
+    "rapidocr==3.10.0",
+    "onnxruntime>=1.19,<2.0",
 ]
 
 [dependency-groups]

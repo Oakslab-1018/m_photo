@@ -140,7 +140,10 @@ export function toMapMarkers(
       size: `${markerSize(score.score)}px`,
       color: confirmed ? '#ef4444' : markerColor(rank),
       scoreText: scoreLabel(score),
-      title: `${score.name_zh}（${scoreLabel(score)}）${confirmed ? '，已确认拍摄地' : '，双击确认'}`,
+      title: `${score.name_zh}（${scoreLabel(score)}）` +
+        (confirmed
+          ? '，用户已确认的国家（非照片 GPS）'
+          : '，候选国家，双击可确认（非照片 GPS）'),
     }
   })
 }
