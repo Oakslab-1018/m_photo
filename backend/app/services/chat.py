@@ -34,6 +34,17 @@ class _PreviewSessions:
         if iso not in self.row.exclusions:
             self.row.exclusions.append(iso)
 
+    def remove_exclusion(self, session_id, iso):
+        self.row.exclusions = [item for item in self.row.exclusions if item != iso]
+
+    def remove_user_clues(self, session_id, *, dimension=None, value=None):
+        self.row.clues = [
+            clue for clue in self.row.clues
+            if not (isinstance(clue, dict) and clue.get("source") == "user"
+                    and (dimension is None or clue.get("dimension") == dimension)
+                    and (value is None or clue.get("value") == value))
+        ]
+
     def set_confirmed(self, session_id, iso):
         self.row.confirmed_iso = iso
         self.row.status = "done"
@@ -82,6 +93,7 @@ class ChatService(LegacyChatService):
             result["action"] = {**result["action"], "message": message}
             self.session_service.replace_last_ai_message(session_id, message, result["action"])
         self._prepared = None
+        self._free_text_plan = None
         return result
 
     def initial_analysis(self, session_id):
@@ -105,6 +117,10 @@ class ChatService(LegacyChatService):
         preview.engine = ModelAwareEngine()
         preview.engine.evidence = snapshot.model_evidence
         preview.hypothesis = ModelAwareHypotheses(preview.engine)
+        # The deterministic (plus validated remote) parse plan is computed once
+        # in prepare_update; the preview and the transactional run must use the
+        # exact same plan or their signatures would diverge.
+        preview._free_text_plan = self._free_text_plan
         if method == "initial":
             result = preview.initial_analysis(0)
         elif method == "feedback":
@@ -137,8 +153,49 @@ class ChatService(LegacyChatService):
         history = self.session_service.list_messages(session_id)
         # End the read transaction before the optional external API request.
         self.session_service.rollback()
+        self._free_text_plan = None
+        if feedback and feedback.get("type") == "free_text":
+            text = feedback.get("text") or ""
+            pending = self.parser.pending_from_history(history)
+            plan = self.parser.parse(text, pending=pending)
+            if plan.confirm_iso:
+                # The user explicitly answered yes to a confirm question: this
+                # is a deterministic confirmation, never an LLM confirmation.
+                self._free_text_plan = (text, plan)
+                self._prepared = None
+                return
+            remote = self._extract_remote_plan(text, history, pending)
+            if remote is not None:
+                plan = plan.merged(remote)
+            self._free_text_plan = (text, plan)
         if feedback and feedback.get("type") == "confirm":
             self._prepared = None
             return
         self._prepare(snapshot, history, "feedback" if feedback is not None else "point",
                       feedback=feedback, new_clues=new_clues, click_pos=click_pos)
+
+    def _extract_remote_plan(self, text, history, pending):
+        """Optional strict-JSON extraction; invalid payloads degrade to rules.
+
+        Runs before the write transaction, never mutates the session, and the
+        validated result is only ever merged as extra clues/rejections (never a
+        confirmation) by ``ChineseFreeTextParser.validate_remote``.
+        """
+        if self.provider is None:
+            return None
+        if not (self.provider.settings.deepseek_api_key or "").strip():
+            return None
+        try:
+            payload = self.provider.extract({
+                "text": text,
+                "history": history,
+                "pending": pending.to_dict() if pending is not None else None,
+                "catalog": self.parser.remote_catalog(),
+            })
+        except Exception as exc:  # defensive: provider errors never break dialogue
+            logger.warning("DeepSeek extraction unavailable; using rules (%s)", type(exc).__name__)
+            return None
+        if not isinstance(payload, dict):
+            return None
+        validated = self.parser.validate_remote(payload, text, pending)
+        return validated if (validated.clues or validated.reject_isos) else None

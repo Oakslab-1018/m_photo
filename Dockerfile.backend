@@ -35,6 +35,7 @@ COPY backend/ ./backend/
 COPY services/ ./services/
 COPY config.py ./
 COPY data/ ./data/
+COPY scripts/ocr_download_models.py ./scripts/ocr_download_models.py
 
 # 使用数值 UID 的非 root 运行身份，避免依赖 passwd 工具或额外 apt 安装。
 RUN mkdir -p /data /tmp/uv-cache \

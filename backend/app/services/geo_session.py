@@ -114,6 +114,37 @@ class GeoSessionService:
             geo_session.exclusions = exclusions
             self.session.flush()
 
+    def remove_exclusion(self, session_id: int, iso: str) -> None:
+        """Drop one exclusion (used when the user corrects an earlier rejection)."""
+        geo_session = self.get(session_id)
+        if geo_session is not None and iso in geo_session.exclusions:
+            geo_session.exclusions = [item for item in geo_session.exclusions if item != iso]
+            self.session.flush()
+
+    def remove_user_clues(self, session_id: int, *, dimension: str | None = None,
+                          value: str | None = None) -> None:
+        """Drop user-sourced clues for a bounded correction.
+
+        OCR/heuristic evidence is never removed; ``dimension`` alone replaces
+        every previous user clue of that dimension, ``value`` narrows it to one
+        explicitly negated value.
+        """
+        geo_session = self.get(session_id)
+        if geo_session is None:
+            return
+        remaining = []
+        removed = False
+        for clue in geo_session.clues:
+            if (isinstance(clue, dict) and clue.get("source") == "user"
+                    and (dimension is None or clue.get("dimension") == dimension)
+                    and (value is None or clue.get("value") == value)):
+                removed = True
+                continue
+            remaining.append(clue)
+        if removed:
+            geo_session.clues = remaining
+            self.session.flush()
+
     def set_confirmed(self, session_id: int, iso: str) -> None:
         geo_session = self.get(session_id)
         if geo_session is not None:

@@ -1,11 +1,17 @@
 export type ClueDimension =
   | 'language'
   | 'signage'
+  | 'place_name'
+  | 'road'
+  | 'driving_side'
+  | 'terrain'
+  | 'waterbody'
   | 'vegetation'
   | 'building'
   | 'vehicle'
   | 'climate'
   | 'culture'
+  | 'infrastructure'
   | 'other'
 
 export interface Clue {
@@ -48,7 +54,7 @@ export interface ReferenceRegion {
   support: number
 }
 
-export type CityScoreType = 'city_text_cosine' | 'city_reference_hybrid' | string
+export type CityScoreType = 'city_text_cosine' | 'city_reference_hybrid' | 'city_clue_fusion' | string
 
 export interface CityScore {
   city_id: string
@@ -61,6 +67,9 @@ export interface CityScore {
   score: number
   score_type: CityScoreType
   reference_cosine?: number | null
+  /** Optional clue-fusion diagnostics for city_clue_fusion rows; shape owned by the backend contract. */
+  matched_clues?: Array<Record<string, unknown>>
+  fusion?: Record<string, unknown>
 }
 
 /** Scope counters; every field optional because an unavailable response may send {} */
@@ -77,6 +86,8 @@ export interface CitiesResponse {
   country_iso: string
   scope?: CityScope | null
   status: CitiesStatus
+  clue_dimensions?: string[] | null
+  clue_note?: string | null
 }
 
 export interface CountryScore {
@@ -106,6 +117,13 @@ export interface Country extends CountryScore {
 
 export type ActionKind = 'confirm' | 'ask' | 'request_clue' | 'done' | string
 
+/** Structured answer choice attached to a pending dialogue action. */
+export interface ClueAnswerOption {
+  dimension: string
+  value: string
+  label?: string
+}
+
 export interface HypothesisAction {
   kind: ActionKind
   message?: string
@@ -115,6 +133,8 @@ export interface HypothesisAction {
     score?: number
     dimensions?: string[]
     candidates?: string[]
+    /** Answer choices for the pending question; the AI may question or reason. */
+    options?: ClueAnswerOption[]
     [key: string]: unknown
   }
 }

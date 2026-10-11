@@ -17,6 +17,7 @@ M_PHOTO_DB_URL          DATABASE_URL                    full SQLAlchemy URL
 M_PHOTO_CORS_ORIGINS    CORS_ORIGINS                    comma separated origins
 GEO_AI_MODE             AI_MODE                         "mock" (default) / "real"
 OCR_PROVIDER            GEO_OCR_PROVIDER                "mock" (default) / "rapidocr"
+OCR_MODEL_TYPE          GEO_OCR_MODEL_TYPE              "server" (default) / "mobile"
 M_PHOTO_OCR_MODEL_DIR   OCR_MODEL_DIR                   local ONNX cache dir
 OCR_DET_MODEL_PATH      -                               explicit det .onnx path
 OCR_REC_MODEL_PATH      -                               explicit rec .onnx path
@@ -28,8 +29,10 @@ OCR_LANGUAGE_MIN_CONFIDENCE -                           language clue floor (0.7
 ``GEO_AI_MODE`` picks the general analyzer mode and ``OCR_PROVIDER`` the OCR
 provider independently. Both default to ``mock`` so the service starts (and is
 fully covered by tests) without RapidOCR or downloaded model weights.
-``rapidocr`` runs PP-OCRv5 mobile det/cls/rec on ONNX Runtime (CPU); models are
-cached under ``data_dir/ocr-models`` unless explicit ``.onnx`` paths are given.
+``rapidocr`` runs the configurable PP-OCRv5 det/cls/rec ONNX Runtime (CPU)
+profile; the default profile is ``server`` for accuracy. ``mobile`` remains
+available for lower-latency deployments. Models are cached under
+``data_dir/ocr-models`` unless explicit ``.onnx`` paths are given.
 """
 from __future__ import annotations
 
@@ -41,10 +44,27 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 DEFAULT_AI_MODE = "mock"
 DEFAULT_OCR_PROVIDER = "mock"
+DEFAULT_OCR_MODEL_TYPE = "server"
+VALID_OCR_MODEL_TYPES = ("server", "mobile")
 DEFAULT_OCR_MIN_TEXT_SCORE = 0.5
 DEFAULT_OCR_LANGUAGE_MIN_CONFIDENCE = 0.7
 DEFAULT_DATA_DIRNAME = "storage"  # resolved as <repo>/backend/storage
 ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "webp"}
+
+
+def normalize_ocr_model_type(value: str | None) -> str:
+    """Return a validated PP-OCRv5 model profile name.
+
+    ``server`` is the accuracy-oriented default; ``mobile`` is retained as a
+    supported lower-latency profile. Unknown values fail fast so a deployment
+    never silently runs a profile it did not request.
+    """
+    candidate = str(value or DEFAULT_OCR_MODEL_TYPE).strip().lower()
+    if candidate not in VALID_OCR_MODEL_TYPES:
+        raise ValueError(
+            f"OCR_MODEL_TYPE must be one of {VALID_OCR_MODEL_TYPES!r}; got {candidate!r}"
+        )
+    return candidate
 ALLOWED_CONTENT_TYPES = {
     "image/png",
     "image/jpeg",
@@ -75,6 +95,7 @@ class Settings:
     cors_origins: tuple[str, ...]
     geo_ai_mode: str
     ocr_provider: str = DEFAULT_OCR_PROVIDER
+    ocr_model_type: str = DEFAULT_OCR_MODEL_TYPE
     ocr_model_dir: Path | None = None
     ocr_det_model_path: Path | None = None
     ocr_rec_model_path: Path | None = None
@@ -169,6 +190,9 @@ class Settings:
         ocr_provider = normalize_provider(
             ocr_provider_raw if ocr_provider_raw else ai_mode
         ) or DEFAULT_OCR_PROVIDER
+        ocr_model_type = normalize_ocr_model_type(
+            get("OCR_MODEL_TYPE", "GEO_OCR_MODEL_TYPE")
+        )
 
         ocr_model_raw = get("M_PHOTO_OCR_MODEL_DIR", "OCR_MODEL_DIR")
         ocr_model_dir = (
@@ -203,6 +227,7 @@ class Settings:
             cors_origins=cors_origins,
             geo_ai_mode=ai_mode,
             ocr_provider=ocr_provider,
+            ocr_model_type=ocr_model_type,
             ocr_model_dir=ocr_model_dir,
             ocr_det_model_path=optional_model_path("OCR_DET_MODEL_PATH"),
             ocr_rec_model_path=optional_model_path("OCR_REC_MODEL_PATH"),
@@ -231,7 +256,10 @@ __all__ = [
     "DEFAULT_AI_MODE",
     "DEFAULT_OCR_LANGUAGE_MIN_CONFIDENCE",
     "DEFAULT_OCR_MIN_TEXT_SCORE",
+    "DEFAULT_OCR_MODEL_TYPE",
     "DEFAULT_OCR_PROVIDER",
+    "VALID_OCR_MODEL_TYPES",
+    "normalize_ocr_model_type",
     "DEFAULT_DATA_DIRNAME",
     "MAX_UPLOAD_BYTES",
     "REPO_ROOT",

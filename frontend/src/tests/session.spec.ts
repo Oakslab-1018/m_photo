@@ -138,4 +138,49 @@ describe('useGeoSession', () => {
     expect(session.confirmedIso.value).toBeNull()
     expect(session.done.value).toBe(false)
   })
+
+  it('clears a stale action when a feedback response omits one', () => {
+    const session = useGeoSession()
+    session.applyUpload(upload())
+    expect(session.action.value?.kind).toBe('confirm')
+
+    session.applyFeedback({
+      scores: [score('CN')],
+      messages: [message('排除后重新推理')],
+    })
+
+    expect(session.action.value).toBeNull()
+  })
+
+  it('keeps structured answer options from a question action', () => {
+    const session = useGeoSession()
+    session.applyUpload(upload())
+
+    session.applyFeedback({
+      action: {
+        kind: 'ask',
+        payload: {
+          dimensions: ['climate'],
+          options: [{ dimension: 'climate', value: 'arid', label: '干旱气候' }],
+        },
+      },
+      messages: [message('请问气候更符合哪一种？')],
+    })
+
+    expect(session.action.value?.payload?.options).toEqual([
+      { dimension: 'climate', value: 'arid', label: '干旱气候' },
+    ])
+  })
+
+  it('clears a stale action when point analysis omits one', () => {
+    const session = useGeoSession()
+    session.applyUpload(upload())
+
+    session.applyPointAnalysis({
+      scores: [score('CN')],
+      messages: [message('局部区域分析完成')],
+    })
+
+    expect(session.action.value).toBeNull()
+  })
 })

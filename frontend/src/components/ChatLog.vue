@@ -1,14 +1,35 @@
 <script setup lang="ts">
+import { nextTick, onMounted, ref, watch } from 'vue'
 import type { ChatMessage } from '@/types'
 
-defineProps<{
+const props = defineProps<{
   messages: ChatMessage[]
   loading?: boolean
 }>()
+
+const logRef = ref<HTMLElement | null>(null)
+
+function scrollToBottom(): void {
+  const element = logRef.value
+  if (!element) return
+  element.scrollTop = element.scrollHeight
+}
+
+// Keep the newest prompt visible: new messages, replaced content and the
+// typing indicator all pin the log to the bottom.
+watch(
+  () => [props.messages.length, props.messages.at(-1)?.content ?? '', props.loading] as const,
+  async () => {
+    await nextTick()
+    scrollToBottom()
+  },
+)
+
+onMounted(scrollToBottom)
 </script>
 
 <template>
-  <div class="chat-log" aria-live="polite">
+  <div ref="logRef" class="chat-log" aria-live="polite">
     <div class="msg ai">
       <div class="bubble">你好！请上传一张街景或风景图，我会提取线索并与你一起推理拍摄地。</div>
     </div>

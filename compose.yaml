@@ -11,9 +11,10 @@ services:
     environment:
       # 所有可写数据（SQLite + 上传图片）都落在具名卷内。
       M_PHOTO_DATA_DIR: /data
-      # OCR runs in-process (PP-OCRv5 + ONNX Runtime, CPU); mock by default.
+      # OCR runs in-process (PP-OCRv5 server det/cls/rec + ONNX Runtime CPU).
       GEO_AI_MODE: mock
-      OCR_PROVIDER: ${OCR_PROVIDER:-mock}
+      OCR_PROVIDER: ${OCR_PROVIDER:-rapidocr}
+      OCR_MODEL_TYPE: ${OCR_MODEL_TYPE:-server}
       # Model weights are cached on the named volume so restarts need no download.
       M_PHOTO_OCR_MODEL_DIR: /data/ocr-models
       OCR_MIN_TEXT_SCORE: ${OCR_MIN_TEXT_SCORE:-0.5}

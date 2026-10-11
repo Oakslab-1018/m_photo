@@ -5,8 +5,11 @@ now lives under `backend/app/domain/geolocation/`: the former `reasoning/`
 modules (clue, engine, hypotheses, knowledge graph) are directly in that
 package, and the former `ai/` modules are in its `analysis/` subpackage.
 Repository-level `services/chat.py` remains the chat adapter dependency — no
-algorithms were copied, and `easyocr` is **not** required (`GEO_AI_MODE`
-defaults to `mock`; no real-OCR support is claimed in this stage).
+algorithms were copied, and `easyocr` is **not** required. OCR defaults to
+`mock` in code for offline tests; real OCR uses pinned PP-OCRv5 server
+det/cls/rec via RapidOCR + ONNX Runtime and is enabled with
+`OCR_PROVIDER=rapidocr`, `OCR_MODEL_TYPE=server`. Mobile remains supported.
+See [OCR documentation](../docs/ocr.md).
 
 Container/startup contract (owned by the deployment worker):
 
@@ -155,6 +158,9 @@ coordinates are the catalog's representative points, not the photo's location.
 | `M_PHOTO_DB_URL` | derived | full SQLAlchemy URL (wins over path) |
 | `M_PHOTO_CORS_ORIGINS` | dev origins | comma-separated allowed origins |
 | `GEO_AI_MODE` | `mock` | passed to the reused AI pipeline; unknown values pass through unchanged |
+| `OCR_PROVIDER` | `mock` (code); `rapidocr` in example/Compose | `mock` or real RapidOCR |
+| `OCR_MODEL_TYPE` | `server` | validated `server` or `mobile` PP-OCRv5 profile |
+| `M_PHOTO_OCR_MODEL_DIR` | `<data_dir>/ocr-models` | ONNX cache; Docker uses `/data/ocr-models` |
 | `STREETCLIP_ENABLED` | `false` | call the local StreetCLIP service at all |
 | `STREETCLIP_URL` | `http://127.0.0.1:8001` | inference service root |
 | `STREETCLIP_API_KEY` | unset | bearer token; unset means no `Authorization` header |

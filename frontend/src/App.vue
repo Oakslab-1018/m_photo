@@ -1,9 +1,11 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { api } from '@/api'
 import { normalizeApiError } from '@/api/errors'
 import type { Country, FeedbackPayload } from '@/types'
 import { useGeoSession } from '@/composables/useGeoSession'
+import { countGroupedClues } from '@/utils/clues'
+import { isQuestionAction } from '@/utils/dialogue'
 import UploadPanel from '@/components/UploadPanel.vue'
 import ClueList from '@/components/ClueList.vue'
 import ChatLog from '@/components/ChatLog.vue'
@@ -44,6 +46,14 @@ let cityRequestNonce = 0
 const busy = computed(() => uploading.value || feedbackBusy.value || pointBusy.value || cityBusy.value)
 const hasSession = computed(() => session.sessionId.value !== null)
 const previewUrl = computed(() => localPreviewUrl.value ?? session.imageUrl.value)
+/** Card count after grouping/dedupe, matching what the clue panel actually renders. */
+const clueCount = computed(() => countGroupedClues(session.clues.value))
+const questionPending = computed(() => isQuestionAction(session.action.value))
+
+// A new question must not stay hidden behind the collapsed chat panel.
+watch(session.action, (current) => {
+  if (isQuestionAction(current)) chatOpen.value = true
+})
 
 const sessionStatus = computed(() => {
   if (uploading.value) return '正在分析图像…'
@@ -225,6 +235,7 @@ async function requestCities(iso: string): Promise<void> {
     const response = await api.cities(id, target)
     if (epoch !== sessionEpoch.value || requestNonce !== cityRequestNonce) return
     session.applyCities(response)
+    cityNotice.value = response.clue_note || null
     if (response.status === 'unavailable') {
       cityNotice.value = '模型服务当前不可用，暂时无法检索城市候选；可稍后重试。'
     } else if (response.status === 'no_cities' || !response.city_scores.length) {
@@ -320,7 +331,7 @@ function doConfirm(): void {
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
               <path d="M4 6h16M4 12h16M4 18h10" />
             </svg>
-            线索卡 <span class="count">{{ session.clues.value.length }}</span>
+            线索卡 <span class="count">{{ clueCount }}</span>
           </div>
           <ClueList :clues="session.clues.value" :loading="uploading" />
         </section>
@@ -346,12 +357,18 @@ function doConfirm(): void {
         </section>
 
         <section class="panel chat-panel">
-          <button type="button" class="chat-toggle" @click="chatOpen = !chatOpen">
+          <button
+            type="button"
+            class="chat-toggle"
+            :class="{ 'has-question': questionPending && !chatOpen }"
+            @click="chatOpen = !chatOpen"
+          >
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
               <path d="M21 12a8 8 0 0 1-8 8H4l2-3a8 8 0 1 1 15-5z" />
             </svg>
             人机协同对话
             <span class="panel-count">{{ session.messages.value.length }} 条</span>
+            <span v-if="questionPending && !chatOpen" class="chat-alert">有新提问</span>
             <span class="chev" :class="{ open: chatOpen }">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
                 <path d="m6 9 6 6 6-6" />

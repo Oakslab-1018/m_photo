@@ -36,6 +36,9 @@ from ..services.chat import ChatService
 from ..services.geo_session import GeoSessionService
 from ..services.pipeline import PipelineService
 from ..services.model_gateway import StreetClipGateway
+from ..domain.geolocation.clue import dicts_to_clues
+from ..services.city_catalog import CityCatalogError, load_city_index
+from ..services.city_reasoning import CityClueReasoner
 
 router = APIRouter(prefix="/geo", tags=["geo"])
 
@@ -216,11 +219,36 @@ def list_cities(
         return CitiesResponse(city_scores=[], country_iso=payload.iso,
                               scope=None, status="unavailable")
 
+    city_scores = result["city_scores"]
+    clue_dimensions = None
+    clue_note = None
+    if city_scores:
+        # Optional clue rerank over already-validated rows: read-only, never
+        # adds rows, and degrades to the untouched gateway payload.
+        try:
+            catalog = load_city_index(settings.cities_path)
+        except CityCatalogError:
+            catalog = None
+        if catalog is not None:
+            try:
+                session_clues = dicts_to_clues(geo_session.clues)
+                reranked = CityClueReasoner(catalog).rerank(
+                    city_scores, session_clues, iso=payload.iso
+                )
+            except (KeyError, TypeError, ValueError):
+                reranked = None
+            if reranked is not None:
+                city_scores = reranked.city_scores
+                clue_dimensions = list(reranked.clue_dimensions) or None
+                clue_note = reranked.coverage_note
+
     response = CitiesResponse(
-        city_scores=result["city_scores"],
+        city_scores=city_scores,
         country_iso=result["country_iso"],
         scope=result["scope"],
         status=result["status"],
+        clue_dimensions=clue_dimensions,
+        clue_note=clue_note,
     )
     _check_response_serializable(response)
     return response

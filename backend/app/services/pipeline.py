@@ -6,7 +6,8 @@ paths) so the backend never copies or forks the pipeline.
 
 ``OCR_PROVIDER`` defaults to ``mock``; ``rapidocr`` is imported lazily by
 ``analysis.ocr`` only when requested, so the backend imports and runs with
-neither RapidOCR nor model weights installed.
+neither RapidOCR nor model weights installed. The default real profile is
+PP-OCRv5 server det/cls/rec; ``OCR_MODEL_TYPE=mobile`` remains supported.
 """
 from __future__ import annotations
 
@@ -37,6 +38,11 @@ class PipelineService:
         value = getattr(self._settings, "ocr_provider", "mock")
         return value if isinstance(value, str) and value.strip() else "mock"
 
+    @property
+    def ocr_model_type(self) -> str:
+        value = getattr(self._settings, "ocr_model_type", "server")
+        return value if isinstance(value, str) and value.strip() else "server"
+
     def _get_pipeline(self):
         if self._pipeline is None:
             with self._lock:
@@ -48,6 +54,7 @@ class PipelineService:
                     self._pipeline = AnalysisPipeline(
                         mode=self._settings.geo_ai_mode,
                         ocr_provider=self.ocr_provider,
+                        ocr_model_type=self.ocr_model_type,
                         ocr_model_dir=self._path("ocr_model_dir"),
                         ocr_det_model_path=self._path("ocr_det_model_path"),
                         ocr_rec_model_path=self._path("ocr_rec_model_path"),

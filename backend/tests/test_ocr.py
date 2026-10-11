@@ -22,8 +22,11 @@ from backend.app.config import (  # noqa: E402
 from backend.app.domain.geolocation.analysis.ocr import (  # noqa: E402
     CLS_MODEL_KEY,
     DET_MODEL_KEY,
+    MOBILE_MODEL_PROFILE,
+    MODEL_PROFILES,
     PPOCR_VERSION,
     REC_MODEL_KEY,
+    SERVER_MODEL_PROFILE,
     OCRAnalyzer,
     RapidOCREngine,
     normalize_provider,
@@ -65,11 +68,12 @@ class FakeEngine:
             self.concurrent -= 1
 
 
-def fake_analyzer(records):
+def fake_analyzer(records, model_type="server"):
     engine = FakeEngine(records)
     analyzer = OCRAnalyzer(
         provider="rapidocr",
-        engine=RapidOCREngine(loader=lambda params: engine),
+        model_type=model_type,
+        engine=RapidOCREngine(model_type=model_type, loader=lambda params: engine),
     )
     return analyzer, engine
 
@@ -133,15 +137,25 @@ class OCRProviderTest(unittest.TestCase):
         self.assertAlmostEqual(extra["line_confidence"], 0.95, places=3)
         self.assertEqual(extra["model_version"], PPOCR_VERSION)
         self.assertTrue(extra["reliable"])
-        self.assertEqual(extra["det_model"], DET_MODEL_KEY)
-        self.assertEqual(extra["rec_model"], REC_MODEL_KEY)
-        self.assertEqual(extra["cls_model"], CLS_MODEL_KEY)
+        self.assertEqual(extra["model_type"], "server")
+        self.assertEqual(extra["det_model"], SERVER_MODEL_PROFILE.det_model)
+        self.assertEqual(extra["rec_model"], SERVER_MODEL_PROFILE.rec_model)
+        self.assertEqual(extra["cls_model"], SERVER_MODEL_PROFILE.cls_model)
 
         status = analyzer.status()
         self.assertEqual(status["state"], "ok")
         self.assertEqual(status["line_count"], 5)
         self.assertEqual(status["engine"], "onnxruntime")
         self.assertEqual(status["model_version"], PPOCR_VERSION)
+        self.assertEqual(status["model_type"], "server")
+        self.assertEqual(
+            status["models"],
+            {
+                "det": SERVER_MODEL_PROFILE.det_model,
+                "rec": SERVER_MODEL_PROFILE.rec_model,
+                "cls": SERVER_MODEL_PROFILE.cls_model,
+            },
+        )
 
     def test_unknown_provider_is_safe_diagnostic(self):
         analyzer = OCRAnalyzer(provider="mystery")
@@ -237,7 +251,7 @@ class OCRProviderTest(unittest.TestCase):
         self.assertNotIn("someone", detail)
         self.assertNotIn(".onnx", detail)
 
-    def test_engine_build_params_pin_ppocrv5_on_cpu(self):
+    def test_engine_build_params_default_to_ppocrv5_server_on_cpu(self):
         from rapidocr import EngineType, ModelType, OCRVersion
 
         engine = RapidOCREngine(model_dir="/data/ocr-models")
@@ -245,24 +259,52 @@ class OCRProviderTest(unittest.TestCase):
         for task in ("Det", "Cls", "Rec"):
             self.assertIs(params[f"{task}.engine_type"], EngineType.ONNXRUNTIME)
             self.assertIs(params[f"{task}.ocr_version"], OCRVersion.PPOCRV5)
-            self.assertIs(params[f"{task}.model_type"], ModelType.MOBILE)
+            self.assertIs(params[f"{task}.model_type"], ModelType.SERVER)
             value = params[f"{task}.ocr_version"].value
             self.assertEqual(value, "PP-OCRv5")
             self.assertEqual(params[f"{task}.engine_type"].value, "onnxruntime")
         self.assertEqual(params["Global.model_root_dir"], "/data/ocr-models")
         self.assertNotIn("Global.use_cuda", params)
-        # det resize policy verified for PP-OCRv5 mobile on signage crops
         self.assertEqual(params["Det.limit_type"], "max")
         self.assertEqual(params["Det.limit_side_len"], 1280)
+        self.assertEqual(engine.model_identity()["det_model"], SERVER_MODEL_PROFILE.det_model)
 
-    def test_explicit_model_paths_override_ids(self):
+    def test_mobile_profile_remains_explicitly_supported(self):
+        from rapidocr import ModelType
+
+        engine = RapidOCREngine(model_type="mobile", model_dir="/data/ocr-models")
+        params = engine._build_params()
+        for task in ("Det", "Cls", "Rec"):
+            self.assertIs(params[f"{task}.model_type"], ModelType.MOBILE)
+        identity = engine.model_identity()
+        self.assertEqual(identity["model_type"], "mobile")
+        self.assertEqual(identity["det_model"], DET_MODEL_KEY)
+        self.assertEqual(identity["rec_model"], REC_MODEL_KEY)
+        self.assertEqual(identity["cls_model"], CLS_MODEL_KEY)
+
+    def test_invalid_model_type_is_rejected(self):
+        with self.assertRaises(ValueError):
+            RapidOCREngine(model_type="large")
+        with self.assertRaises(ValueError):
+            OCRAnalyzer(provider="rapidocr", model_type="large")
+
+    def test_explicit_model_paths_override_ids_with_safe_basename_provenance(self):
         engine = RapidOCREngine(
-            det_model_path="det.onnx", rec_model_path="rec.onnx", cls_model_path="cls.onnx"
+            model_type="server",
+            det_model_path="C:\\weights\\custom_det.onnx",
+            rec_model_path="/opt/models/custom_rec.onnx",
+            cls_model_path="custom_cls.onnx",
         )
         params = engine._build_params()
-        self.assertEqual(params["Det.model_path"], "det.onnx")
-        self.assertEqual(params["Rec.model_path"], "rec.onnx")
-        self.assertEqual(params["Cls.model_path"], "cls.onnx")
+        self.assertEqual(params["Det.model_path"], "C:\\weights\\custom_det.onnx")
+        self.assertEqual(params["Rec.model_path"], "/opt/models/custom_rec.onnx")
+        self.assertEqual(params["Cls.model_path"], "custom_cls.onnx")
+        identity = engine.model_identity()
+        self.assertEqual(identity["det_model"], "custom_det.onnx")
+        self.assertEqual(identity["rec_model"], "custom_rec.onnx")
+        self.assertEqual(identity["cls_model"], "custom_cls.onnx")
+        self.assertNotIn("C:\\", identity["det_model"])
+        self.assertNotIn("/opt/", identity["rec_model"])
 
 
 class OCRLanguageEvidenceTest(unittest.TestCase):

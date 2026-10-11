@@ -66,7 +66,8 @@ export function useGeoSession() {
     if (response.scores) scores.value = sortScores(response.scores)
     if (response.messages) messages.value = [...response.messages]
     if (response.exclusions) exclusions.value = [...response.exclusions]
-    if (response.action) action.value = response.action
+    // A missing action means no pending question: never keep stale answer buttons.
+    action.value = response.action ?? null
   }
 
   /** Apply a cities response; empty results clear any previous city candidates. */
@@ -87,7 +88,8 @@ export function useGeoSession() {
     if (response.scores) scores.value = sortScores(response.scores)
     if (response.messages) messages.value = [...response.messages]
     if (response.exclusions) exclusions.value = [...response.exclusions]
-    if (response.action) action.value = response.action
+    // Point analysis replaces the pending question, or clears it when absent.
+    action.value = response.action ?? null
   }
 
   function reset(): void {

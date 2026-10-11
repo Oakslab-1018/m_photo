@@ -1,6 +1,8 @@
 <script setup lang="ts">
-import { computed, nextTick, ref } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 import type { FeedbackPayload, HypothesisAction } from '@/types'
+import { dimensionLabel } from '@/utils/clues'
+import { answerPayload, groupActionOptions, type DialogueOption } from '@/utils/dialogue'
 
 const props = defineProps<{
   action: HypothesisAction | null
@@ -12,16 +14,26 @@ const emit = defineEmits<{
   feedback: [payload: FeedbackPayload]
 }>()
 
-const inputRef = ref<HTMLInputElement | null>(null)
+const inputRef = ref<HTMLTextAreaElement | null>(null)
 const text = ref('')
 const composing = ref(false)
+
+const optionGroups = computed(() => groupActionOptions(props.action))
+const canSend = computed(() => text.value.trim().length > 0 && !props.busy && !props.disabled)
 
 async function focusInput(): Promise<void> {
   await nextTick()
   inputRef.value?.focus()
 }
 
-const canSend = computed(() => text.value.trim().length > 0 && !props.busy && !props.disabled)
+// Auto-grow the textarea up to its CSS max-height so long scene descriptions stay readable.
+watch(text, async () => {
+  await nextTick()
+  const element = inputRef.value
+  if (!element) return
+  element.style.height = 'auto'
+  element.style.height = `${Math.min(element.scrollHeight, 96)}px`
+})
 
 function submit(): void {
   if (composing.value) return
@@ -34,8 +46,15 @@ function submit(): void {
 function onEnter(event: KeyboardEvent): void {
   // Chinese IME composition: Enter confirms the composition, never sends.
   if (event.isComposing || composing.value) return
+  // Shift+Enter inserts a newline; plain Enter sends.
+  if (event.shiftKey) return
   event.preventDefault()
   submit()
+}
+
+function chooseOption(option: DialogueOption): void {
+  if (props.busy || props.disabled) return
+  emit('feedback', answerPayload(option))
 }
 
 function confirmIso(action: HypothesisAction): void {
@@ -78,22 +97,41 @@ defineExpose({ focusInput })
         class="action-btn"
         @click="focusInput"
       >
-        ✍️ 我来补充{{ action.payload?.dimensions?.length ? `（${action.payload.dimensions.join('、')}）` : '' }}
+        ✍️ 我来补充{{ action.payload?.dimensions?.length ? `（${action.payload.dimensions.map(dimensionLabel).join('、')}）` : '' }}
       </button>
       <button v-if="action.kind === 'done'" type="button" class="action-btn success" disabled>🎉 推理完成</button>
     </div>
+
+    <div v-if="optionGroups.length" class="answer-options">
+      <div v-for="group in optionGroups" :key="group.dimension" class="answer-group">
+        <span class="answer-dim">{{ group.label }}</span>
+        <div class="answer-chips">
+          <button
+            v-for="option in group.options"
+            :key="`${option.dimension}-${option.value}`"
+            type="button"
+            class="option-chip"
+            :disabled="busy || disabled"
+            @click="chooseOption(option)"
+          >
+            {{ option.label }}
+          </button>
+        </div>
+      </div>
+    </div>
+
     <div class="chat-input-row">
-      <input
+      <textarea
         ref="inputRef"
         v-model="text"
         class="chat-input"
-        type="text"
+        rows="1"
         :placeholder="action?.kind === 'ask' || action?.kind === 'request_clue' ? '输入补充线索或直接描述场景…' : '输入反馈，或直接描述线索…'"
         :disabled="disabled || busy"
         @compositionstart="composing = true"
         @compositionend="composing = false"
         @keydown.enter="onEnter"
-      >
+      ></textarea>
       <button type="button" class="primary-btn send-btn" :disabled="!canSend" @click="submit">
         {{ busy ? '处理中…' : '发送' }}
       </button>

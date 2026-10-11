@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator, model_serializer, model_validator
 
 FeedbackType = Literal["confirm", "reject", "answer", "free_text"]
 MessageRole = Literal["user", "ai", "system"]
@@ -187,6 +187,21 @@ class CityScoreModel(BaseModel):
     score: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
     score_type: str = "city_text_cosine"
     reference_cosine: float | None = Field(default=None, ge=-1.0, le=1.0, allow_inf_nan=False)
+    # Backend-only clue rerank provenance. Both stay ``None`` and are dropped
+    # from the JSON unless this session's own evidence matched this row, so an
+    # unfused city payload keeps its exact previous shape. ``city_clue_fusion``
+    # is produced only here, *after* gateway validation; the provider contract
+    # still rejects that value at the gateway.
+    matched_clues: list[MatchedClueModel] | None = None
+    fusion: dict[str, Any] | None = None
+
+    @model_serializer(mode="wrap")
+    def _drop_absent_clue_evidence(self, handler):
+        data = handler(self)
+        for key in ("matched_clues", "fusion"):
+            if data.get(key) is None:
+                data.pop(key, None)
+        return data
 
 
 class CityScopeModel(BaseModel):
@@ -208,6 +223,20 @@ class CitiesResponse(BaseModel):
     country_iso: str
     scope: CityScopeModel | None = None
     status: Literal["ok", "no_cities", "unavailable"]
+    # Present only when session clues actually changed a returned row, or when
+    # exact evidence matched a catalog city outside the returned rows (then
+    # ``clue_note`` explains it was *not* scored). Both keys are omitted when
+    # absent so existing responses keep their exact shape.
+    clue_dimensions: list[str] | None = None
+    clue_note: str | None = None
+
+    @model_serializer(mode="wrap")
+    def _drop_absent_city_clue_evidence(self, handler):
+        data = handler(self)
+        for key in ("clue_dimensions", "clue_note"):
+            if data.get(key) is None:
+                data.pop(key, None)
+        return data
 
 
 class AnalyzePointRequest(BaseModel):

@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import type { CityScore, CountryScore } from '@/types'
+import { cityMatchedClueCount, cityScoreLabel } from '@/utils/city'
 import { scoreLabel } from '@/utils/map'
 import ReferenceMatches from '@/components/ReferenceMatches.vue'
 
@@ -68,15 +69,7 @@ function isForeignCitySelection(): boolean {
   )
 }
 
-/** City hybrid rows must show the composite rank score next to the raw cosine. */
-function cityScoreLabel(city: CityScore): string {
-  const cosine = Number.isFinite(city.raw_cosine) ? city.raw_cosine.toFixed(3) : '—'
-  if (city.score_type === 'city_reference_hybrid') {
-    const composite = Number.isFinite(city.score) ? city.score.toFixed(3) : '—'
-    return `融合排序 ${composite} · 全图余弦 ${cosine}（非概率）`
-  }
-  return `城市文本余弦 ${cosine}（非概率）`
-}
+
 </script>
 
 <template>
@@ -173,6 +166,9 @@ function cityScoreLabel(city: CityScore): string {
             <div>
               <div class="candidate-name">{{ city.name }}</div>
               <div class="candidate-score">{{ city.region }} · {{ cityScoreLabel(city) }}</div>
+              <div v-if="cityMatchedClueCount(city)" class="candidate-score city-clues">
+                命中线索 {{ cityMatchedClueCount(city) }} 条（排序诊断，非概率）
+              </div>
             </div>
           </div>
         </article>

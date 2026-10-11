@@ -7,10 +7,11 @@ Modes
     returns an empty clue list so the pipeline stays offline and deterministic.
 
 ``rapidocr``
-    Lazily loads RapidOCR with **explicitly pinned PP-OCRv5 (mobile)** det/cls/rec
-    models on the ``onnxruntime`` engine (CPU). No torch, no easyocr and no TLS
-    monkeypatching is involved; the optional ``OCR_DET/REC/CLS_MODEL_PATH``
-    settings point at locally cached ``.onnx`` files instead of model IDs.
+    Lazily loads RapidOCR with the selected PP-OCRv5 det/cls/rec profile on the
+    ``onnxruntime`` engine (CPU): ``server`` by default, ``mobile`` for lower
+    latency. No torch, no easyocr and no TLS monkeypatching is involved; the
+    optional ``OCR_DET/REC/CLS_MODEL_PATH`` settings point at locally cached
+    ``.onnx`` files instead of model IDs.
 
 If RapidOCR (or its model files) is unavailable while ``rapidocr`` mode is
 requested, the analyzer degrades to ``mock`` and records a *diagnostic status*
@@ -33,6 +34,7 @@ from typing import Any, Callable, Dict, List, Sequence, Tuple
 
 from .base import BaseAnalyzer
 from ..clue import Clue
+from ....config import DEFAULT_OCR_MODEL_TYPE, normalize_ocr_model_type
 
 logger = logging.getLogger("m_photo.ocr")
 
@@ -40,18 +42,49 @@ MOCK_PROVIDER = "mock"
 RAPIDOCR_PROVIDER = "rapidocr"
 VALID_PROVIDERS = (MOCK_PROVIDER, RAPIDOCR_PROVIDER)
 
-# Model identity is pinned explicitly: PP-OCRv5 mobile det/cls/rec on CPU.
-# RapidOCR 3.10.0 is pinned in pyproject.toml; its ``default_models.yaml``
-# records the exact URL + SHA256 for each of these files.
+# Model identity is pinned explicitly: PP-OCRv5 det/cls/rec on CPU.  RapidOCR
+# 3.10.0 is pinned in pyproject.toml; its ``default_models.yaml`` records the
+# exact URL + SHA256 for every profile below.  Server is the accuracy-oriented
+# default; mobile remains available for lower-latency deployments.
 PPOCR_VERSION = "PP-OCRv5"
 OCR_ENGINE = "onnxruntime"
-DET_MODEL_KEY = "ch_PP-OCRv5_det_mobile"
-CLS_MODEL_KEY = "ch_PP-LCNet_x0_25_textline_ori_cls_mobile"
-REC_MODEL_KEY = "ch_PP-OCRv5_rec_mobile"
+DEFAULT_MODEL_TYPE = DEFAULT_OCR_MODEL_TYPE
+
+
+@dataclass(frozen=True)
+class OCRModelProfile:
+    """One complete PP-OCRv5 det/cls/rec model family."""
+
+    name: str
+    det_model: str
+    cls_model: str
+    rec_model: str
+
+
+MOBILE_MODEL_PROFILE = OCRModelProfile(
+    name="mobile",
+    det_model="ch_PP-OCRv5_det_mobile",
+    cls_model="ch_PP-LCNet_x0_25_textline_ori_cls_mobile",
+    rec_model="ch_PP-OCRv5_rec_mobile",
+)
+SERVER_MODEL_PROFILE = OCRModelProfile(
+    name="server",
+    det_model="ch_PP-OCRv5_det_server",
+    cls_model="ch_PP-LCNet_x1_0_textline_ori_cls_server",
+    rec_model="ch_PP-OCRv5_rec_server",
+)
+MODEL_PROFILES: Dict[str, OCRModelProfile] = {
+    profile.name: profile for profile in (MOBILE_MODEL_PROFILE, SERVER_MODEL_PROFILE)
+}
+
+#: Backwards-compatible imports for callers that still use the old mobile keys.
+DET_MODEL_KEY = MOBILE_MODEL_PROFILE.det_model
+CLS_MODEL_KEY = MOBILE_MODEL_PROFILE.cls_model
+REC_MODEL_KEY = MOBILE_MODEL_PROFILE.rec_model
 DEFAULT_MIN_TEXT_SCORE = 0.5
 # Detection resize policy: cap the long side instead of upscaling the short
-# side. Verified against PP-OCRv5 mobile det: ``min``-side upscaling fails on
-# small/wide signage crops, while ``max`` @1280 recognizes them reliably.
+# side. Verified against PP-OCRv5 det on small/wide signage crops: ``min``-side
+# upscaling fails, while ``max`` @1280 recognizes them reliably.
 DET_LIMIT_SIDE_LEN = 1280
 DET_LIMIT_TYPE = "max"
 
@@ -63,6 +96,14 @@ _URL_RE = re.compile(r"https?://[^\s'\"<>]+", re.IGNORECASE)
 _WIN_PATH_RE = re.compile(r"[A-Za-z]:\\[^\s'\"<>|]+")
 _UNC_PATH_RE = re.compile(r"\\\\[^\s'\"<>|]+")
 _POSIX_PATH_RE = re.compile(r"(?<![\w.])/(?:[\w.\-]+/)+[\w.\-]*")
+
+
+def _model_label(path: str | Path | None, fallback: str) -> str:
+    """Return a provenance-safe model label without exposing a local path."""
+    if not path:
+        return fallback
+    name = str(path).replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+    return name or fallback
 
 
 def sanitize_diagnostic(message: str) -> str:
@@ -85,6 +126,11 @@ class OCRLine:
     confidence: float
     bbox: List[List[float]]
     provider: str = RAPIDOCR_PROVIDER
+    det_model: str = SERVER_MODEL_PROFILE.det_model
+    rec_model: str = SERVER_MODEL_PROFILE.rec_model
+    cls_model: str = SERVER_MODEL_PROFILE.cls_model
+    model_type: str = SERVER_MODEL_PROFILE.name
+    model_version: str = PPOCR_VERSION
 
     def to_extra(self) -> Dict[str, Any]:
         return {
@@ -98,10 +144,11 @@ class OCRLine:
             "bbox": self.bbox,
             "quad": self.bbox,
             "line_confidence": self.confidence,
-            "det_model": DET_MODEL_KEY,
-            "rec_model": REC_MODEL_KEY,
-            "cls_model": CLS_MODEL_KEY,
-            "model_version": PPOCR_VERSION,
+            "det_model": self.det_model,
+            "rec_model": self.rec_model,
+            "cls_model": self.cls_model,
+            "model_type": self.model_type,
+            "model_version": self.model_version,
         }
 
 
@@ -113,6 +160,7 @@ class OCRStatus:
     state: str = "idle"  # idle | ok | unavailable | failed
     engine: str | None = None
     model_version: str | None = None
+    model_type: str | None = None
     models: Dict[str, str | None] = field(default_factory=dict)
     detail: str | None = None
     line_count: int = 0
@@ -123,6 +171,7 @@ class OCRStatus:
             "state": self.state,
             "engine": self.engine,
             "model_version": self.model_version,
+            "model_type": self.model_type,
             "models": dict(self.models),
             "detail": self.detail,
             "line_count": self.line_count,
@@ -150,6 +199,8 @@ class _InferenceFailed(RuntimeError):
 class RapidOCREngine:
     """Minimal lazy adapter around :class:`rapidocr.RapidOCR` (PP-OCRv5/CPU).
 
+    ``model_type`` selects the complete server or mobile det/cls/rec family.
+
     The heavy dependency is imported only inside :meth:`load`, which lets the
     backend run with mock mode even when RapidOCR is not installed.
     """
@@ -157,6 +208,7 @@ class RapidOCREngine:
     def __init__(
         self,
         *,
+        model_type: str = DEFAULT_MODEL_TYPE,
         model_dir: str | Path | None = None,
         det_model_path: str | Path | None = None,
         rec_model_path: str | Path | None = None,
@@ -164,6 +216,7 @@ class RapidOCREngine:
         min_text_score: float = DEFAULT_MIN_TEXT_SCORE,
         loader: Callable[..., Any] | None = None,
     ) -> None:
+        self.model_type = normalize_ocr_model_type(model_type)
         self.model_dir = str(model_dir) if model_dir else None
         self.det_model_path = str(det_model_path) if det_model_path else None
         self.rec_model_path = str(rec_model_path) if rec_model_path else None
@@ -172,6 +225,21 @@ class RapidOCREngine:
         self._loader = loader
         self._engine: Any | None = None
         self._lock = threading.Lock()
+
+    @property
+    def profile(self) -> OCRModelProfile:
+        return MODEL_PROFILES[self.model_type]
+
+    def model_identity(self) -> Dict[str, str]:
+        """Return safe per-task labels for selected or explicit models."""
+        profile = self.profile
+        return {
+            "det_model": _model_label(self.det_model_path, profile.det_model),
+            "rec_model": _model_label(self.rec_model_path, profile.rec_model),
+            "cls_model": _model_label(self.cls_model_path, profile.cls_model),
+            "model_type": self.model_type,
+            "model_version": PPOCR_VERSION,
+        }
 
     # -- construction -------------------------------------------------
     def _build_params(self) -> Dict[str, Any]:
@@ -184,9 +252,15 @@ class RapidOCREngine:
         if EngineType is not None:
             engine_type: Any = EngineType.ONNXRUNTIME
             version: Any = OCRVersion.PPOCRV5
-            model_type: Any = ModelType.MOBILE
+            model_type: Any = (
+                ModelType.SERVER if self.model_type == "server" else ModelType.MOBILE
+            )
         else:  # pragma: no cover - fallback for exotic injected runtimes
-            engine_type, version, model_type = ("onnxruntime", "PP-OCRv5", "mobile")
+            engine_type, version, model_type = (
+                "onnxruntime",
+                "PP-OCRv5",
+                self.model_type,
+            )
 
         params: Dict[str, Any] = {
             "Global.text_score": self.min_text_score,
@@ -262,8 +336,7 @@ class RapidOCREngine:
                 raise _InferenceFailed(f"rapidocr inference failed: {exc}") from exc
         return self._parse_output(output)
 
-    @staticmethod
-    def _parse_output(output: Any) -> List[OCRLine]:
+    def _parse_output(self, output: Any) -> List[OCRLine]:
         """Convert RapidOCR output into :class:`OCRLine` objects.
 
         Accepts the ``RapidOCROutput`` dataclass (``.txts``/``.scores``/
@@ -288,6 +361,7 @@ class RapidOCREngine:
             import json
 
             records = json.loads(records)
+        identity = self.model_identity()
         lines: List[OCRLine] = []
         for record in records or ():
             text = str(record.get("txt") or "").strip()
@@ -299,7 +373,9 @@ class RapidOCREngine:
                 confidence = 0.0
             confidence = max(0.0, min(1.0, confidence))
             bbox = _normalize_bbox(record.get("box"))
-            lines.append(OCRLine(text=text, confidence=confidence, bbox=bbox))
+            lines.append(
+                OCRLine(text=text, confidence=confidence, bbox=bbox, **identity)
+            )
         return lines
 
 
@@ -328,6 +404,7 @@ class OCRAnalyzer(BaseAnalyzer):
         self,
         provider: str = MOCK_PROVIDER,
         *,
+        model_type: str = DEFAULT_MODEL_TYPE,
         model_dir: str | Path | None = None,
         det_model_path: str | Path | None = None,
         rec_model_path: str | Path | None = None,
@@ -336,14 +413,20 @@ class OCRAnalyzer(BaseAnalyzer):
         engine: Any | None = None,
     ) -> None:
         self.provider = normalize_provider(provider)
+        self.model_type = normalize_ocr_model_type(model_type)
+        if engine is not None and hasattr(engine, "model_type"):
+            self.model_type = normalize_ocr_model_type(engine.model_type)
         self.model_dir = model_dir
         self.det_model_path = det_model_path
         self.rec_model_path = rec_model_path
         self.cls_model_path = cls_model_path
         self.min_text_score = min_text_score
-        self.last_status = OCRStatus(provider=self.provider)
+        self.last_status = OCRStatus(
+            provider=self.provider, model_type=self.model_type
+        )
         if engine is None:
             self._engine = RapidOCREngine(
+                model_type=self.model_type,
                 model_dir=model_dir,
                 det_model_path=det_model_path,
                 rec_model_path=rec_model_path,
@@ -354,7 +437,36 @@ class OCRAnalyzer(BaseAnalyzer):
             self._engine = engine
         else:
             # Accept a bare RapidOCR-compatible runtime and serialize it.
-            self._engine = RapidOCREngine(loader=lambda _params: engine)
+            self._engine = RapidOCREngine(
+                model_type=self.model_type, loader=lambda _params: engine
+            )
+        self._refresh_status_identity()
+
+    def _identity(self) -> Dict[str, str]:
+        identity = getattr(self._engine, "model_identity", None)
+        if callable(identity):
+            try:
+                return dict(identity())
+            except Exception:
+                pass
+        profile = MODEL_PROFILES[self.model_type]
+        return {
+            "det_model": _model_label(self.det_model_path, profile.det_model),
+            "rec_model": _model_label(self.rec_model_path, profile.rec_model),
+            "cls_model": _model_label(self.cls_model_path, profile.cls_model),
+            "model_type": self.model_type,
+            "model_version": PPOCR_VERSION,
+        }
+
+    def _refresh_status_identity(self) -> None:
+        identity = self._identity()
+        self.model_type = normalize_ocr_model_type(identity["model_type"])
+        self.last_status.model_type = self.model_type
+        self.last_status.models = {
+            "det": identity["det_model"],
+            "rec": identity["rec_model"],
+            "cls": identity["cls_model"],
+        }
 
     # ``mode`` kept as an alias so legacy call sites keep working.
     @property
@@ -362,7 +474,7 @@ class OCRAnalyzer(BaseAnalyzer):
         return self.provider
 
     def status(self) -> Dict[str, Any]:
-        """Safe diagnostic snapshot (no paths beyond configured model dirs)."""
+        """Safe diagnostic snapshot with basename-only model provenance."""
         return self.last_status.to_dict()
 
     def _fail(self, state: str, detail: str) -> List[Clue]:
@@ -375,6 +487,7 @@ class OCRAnalyzer(BaseAnalyzer):
 
     def analyze(self, image_path: str) -> List[Clue]:
         if self.provider == MOCK_PROVIDER:
+            self._refresh_status_identity()
             self.last_status.state = "ok"
             self.last_status.detail = "mock provider: no OCR performed"
             self.last_status.line_count = 0
@@ -391,14 +504,10 @@ class OCRAnalyzer(BaseAnalyzer):
         except Exception as exc:  # defensive: never take the pipeline down
             return self._fail("failed", type(exc).__name__)
 
+        self._refresh_status_identity()
         self.last_status.state = "ok"
         self.last_status.engine = OCR_ENGINE
         self.last_status.model_version = PPOCR_VERSION
-        self.last_status.models = {
-            "det": self.det_model_path or DET_MODEL_KEY,
-            "rec": self.rec_model_path or REC_MODEL_KEY,
-            "cls": self.cls_model_path or CLS_MODEL_KEY,
-        }
         self.last_status.detail = None
         self.last_status.line_count = len(lines)
 
@@ -434,6 +543,11 @@ def _lines_from_clues(clues: Sequence[Clue]) -> List[OCRLine]:
                 confidence=float(clue.confidence),
                 bbox=extra.get("bbox") or extra.get("quad") or [],
                 provider=str(extra.get("provider") or RAPIDOCR_PROVIDER),
+                det_model=str(extra.get("det_model") or SERVER_MODEL_PROFILE.det_model),
+                rec_model=str(extra.get("rec_model") or SERVER_MODEL_PROFILE.rec_model),
+                cls_model=str(extra.get("cls_model") or SERVER_MODEL_PROFILE.cls_model),
+                model_type=str(extra.get("model_type") or SERVER_MODEL_PROFILE.name),
+                model_version=str(extra.get("model_version") or PPOCR_VERSION),
             )
         )
     return lines

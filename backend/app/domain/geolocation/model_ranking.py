@@ -1,4 +1,16 @@
-"""Full-image StreetCLIP prior fused with unique crop cosines and trusted clues."""
+"""Full-image StreetCLIP prior fused with unique crop cosines and trusted clues.
+
+Trusted clues are user answers and explicitly reliable/catalog-validated
+evidence (OCR, text_language, SemanticClueAnalyzer). Heuristic analyzers
+(vegetation color, building color, ...) never count as model evidence, and
+observation-only dimensions (signage/road/terrain/waterbody/infrastructure)
+never score because they have no country-catalog metadata.
+
+Boost scales are deterministic and bounded, never probabilistic:
+- ordinary catalog clues keep the historical 0.02 scale, total cap 0.15;
+- validated semantic evidence is weighted per dimension
+  (place_name 0.12, driving_side 0.08, culture 0.06) with a 0.35 total cap.
+"""
 from __future__ import annotations
 
 from .engine import ReasoningEngine, CountryScore
@@ -11,6 +23,9 @@ from config import MIN_CLUE_CONFIDENCE, TOP_N_HYPOTHESES
 CROP_WEIGHT = 0.25
 CLUE_BOOST_SCALE = 0.02
 CLUE_BOOST_CAP = 0.15
+# Validated semantic evidence gets a larger, still bounded, deterministic term.
+SEMANTIC_BOOST_SCALES = {"place_name": 0.12, "driving_side": 0.08, "culture": 0.06}
+SEMANTIC_BOOST_CAP = 0.35
 _RELIABLE_SOURCES = {"ocr", "text_language"}
 
 
@@ -36,38 +51,63 @@ class ModelAwareEngine(ReasoningEngine):
 
     @staticmethod
     def _is_trusted(clue) -> bool:
-        """User clues and explicitly reliable OCR/text clues only.
+        """User clues plus explicitly reliable/catalog-validated evidence only.
 
-        Color/vegetation/building heuristics are never trusted model evidence.
+        Color/vegetation/building heuristics are never trusted model evidence;
+        observation-only semantic clues (``display_only``) stay display only.
         """
         extra = clue.extra if isinstance(clue.extra, dict) else {}
+        if extra.get("display_only") is True or extra.get("affects_ranking") is False:
+            # 观察型证据（road/terrain/waterbody/infrastructure/signage）
+            # 只展示，绝不进入融合排序。
+            return False
         if clue.source == "user":
             return True
+        origin = extra.get("origin_source", clue.source)
+        if extra.get("validated") is True:
+            # Catalog-checked semantic evidence (place_name / culture / driving_side).
+            return (origin in _RELIABLE_SOURCES or clue.source in _RELIABLE_SOURCES
+                    or clue.source == "semantic")
         if extra.get("reliable") is not True:
             return False
-        origin = extra.get("origin_source", clue.source)
         return origin in _RELIABLE_SOURCES or clue.source in _RELIABLE_SOURCES
 
-    def _trusted_clues(self, clues) -> list:
-        """Deduplicate trusted clues per (dimension, value).
+    def _dedupe_key(self, clue) -> tuple[str, str]:
+        """Canonical (dimension, value) key so equivalent spellings count once."""
+        if clue.dimension == "place_name":
+            resolved = self.resolve_country_key(clue.value)
+            if resolved:
+                return (clue.dimension, resolved)
+        if clue.dimension == "driving_side" and isinstance(clue.value, str):
+            return (clue.dimension, clue.value.strip().lower())
+        return (clue.dimension, clue.value)
 
-        The strongest confidence wins; a user clue wins ties so a weak OCR
-        observation can never mask a stronger manual one. Output order is
+    def _trusted_clues(self, clues) -> list:
+        """Deduplicate trusted clues per canonical (dimension, value).
+
+        The strongest confidence wins; a user clue wins ties, then validated
+        evidence wins over plain reliable evidence. Output order is
         deterministic regardless of clue insertion order.
         """
         best: dict[tuple[str, str], object] = {}
         for clue in clues:
             if clue.confidence < MIN_CLUE_CONFIDENCE or not self._is_trusted(clue):
                 continue
-            key = (clue.dimension, clue.value)
+            key = self._dedupe_key(clue)
             current = best.get(key)
             if current is None:
                 best[key] = clue
                 continue
             if clue.confidence > current.confidence:
                 best[key] = clue
-            elif clue.confidence == current.confidence and clue.source == "user" and current.source != "user":
-                best[key] = clue
+            elif clue.confidence == current.confidence:
+                clue_extra = clue.extra if isinstance(clue.extra, dict) else {}
+                current_extra = current.extra if isinstance(current.extra, dict) else {}
+                if clue.source == "user" and current.source != "user":
+                    best[key] = clue
+                elif (clue_extra.get("validated") is True
+                      and current_extra.get("validated") is not True):
+                    best[key] = clue
         return [best[key] for key in sorted(best)]
 
     def _crop_means(self, prior: dict) -> dict[str, float]:
@@ -128,12 +168,29 @@ class ModelAwareEngine(ReasoningEngine):
                 base_score = (full_cosine + crop_contribution) / (1.0 + CROP_WEIGHT)
             clue_score = 0.0
             matched_clues = []
+            boost_terms = []
             if trusted:
                 clue_result = self._score_country(country, trusted, [])
                 if clue_result is not None:
                     clue_score = clue_result.score
                     matched_clues = clue_result.matched_clues
-            clue_boost = min(CLUE_BOOST_CAP, clue_score * CLUE_BOOST_SCALE)
+                    for item in matched_clues:
+                        if not item.get("counted", True):
+                            # 同一 OCR 行派生出的相关证据只计最强的一条。
+                            continue
+                        scale = SEMANTIC_BOOST_SCALES.get(item["dimension"], CLUE_BOOST_SCALE)
+                        boost_terms.append({
+                            "dimension": item["dimension"],
+                            "gain": item["gain"],
+                            "scale": scale,
+                            "boost": round(float(item["gain"]) * scale, 6),
+                        })
+            boost_cap = (
+                SEMANTIC_BOOST_CAP
+                if any(term["dimension"] in SEMANTIC_BOOST_SCALES for term in boost_terms)
+                else CLUE_BOOST_CAP
+            )
+            clue_boost = min(boost_cap, sum(term["boost"] for term in boost_terms))
             # Honest semantics: only countries with actual secondary evidence
             # are labelled hybrid; a pure full-image prior stays "cosine".
             hybrid = crop_mean is not None or clue_boost > 0
@@ -147,6 +204,9 @@ class ModelAwareEngine(ReasoningEngine):
                 "clue_score": round(clue_score, 6),
                 "clue_boost": round(clue_boost, 6),
             } if hybrid else {}
+            if boost_terms:
+                fusion["clue_boost_terms"] = boost_terms
+                fusion["clue_boost_cap"] = boost_cap
             scores.append(CountryScore(
                 iso=iso, name=country["name"], name_zh=country["name_zh"],
                 score=base_score + clue_boost,
@@ -161,20 +221,62 @@ class ModelAwareEngine(ReasoningEngine):
 
 
 class ModelAwareHypotheses(HypothesisManager):
-    def next_action(self, scores, clues):
+    """Fused-score question policy: distinguishing, non-repeating, option-backed.
+
+    The StreetCLIP prior is ranking evidence, never confirmation evidence, so
+    this manager keeps asking for user-verifiable clues. Heuristic image clues
+    never count as user knowledge, so a color/climate guess cannot suppress a
+    better question to the user.
+    """
+
+    def next_action(self, scores, clues, asked=None):
+        asked_dims = {d for d in (asked or ()) if isinstance(d, str)}
         if not scores or scores[0].raw_cosine is None:
-            return super().next_action(scores, clues)
+            return super().next_action(scores, clues, asked=asked_dims)
         top = scores[0]
         candidates = [item.iso for item in scores[:2]]
+        blocked = self._user_known_dimensions(clues) | asked_dims
+        dimension = None
         if len(scores) > 1:
-            dimension = self._discriminating_dimension(scores[0], scores[1], clues)
-            if dimension:
-                return HypothesisAction("ask",
-                    f"StreetCLIP 将「{top.name_zh}」排在候选首位（全图余弦 {top.raw_cosine:.3f}，融合排序不是概率）。"
-                    f"还不能确定拍摄地，请补充{DIM_LABELS.get(dimension, dimension)}线索。",
-                    {"dimensions": [dimension], "candidates": candidates, "score_type": top.score_type})
-        missing = self._missing_dimensions(clues)
-        return HypothesisAction("request_clue",
-            f"当前候选首位为「{top.name_zh}」，这仅是当前候选国家目录（{len(self.engine.countries)} 国）内的排序，不是已确认的拍摄地。请补充可辨识线索或手动确认。",
-            {"dimensions": missing or ["language", "culture"], "candidates": candidates,
-             "score_type": top.score_type})
+            dimension = self._discriminating_dimension(scores[0], scores[1], clues, blocked)
+        if dimension:
+            second = scores[1]
+            options = self._options_for(dimension, scores[:2], clues)
+            reason = (f"「{top.name_zh}」与「{second.name_zh}」在这个维度上的目录特征不同，"
+                      f"可以用它区分候选。")
+            return HypothesisAction(
+                "ask",
+                f"StreetCLIP 把「{top.name_zh}」排在候选首位（全图余弦 {top.raw_cosine:.3f}，"
+                f"融合排序不是概率）。还不能确定拍摄地，请补充{self.dimension_label(dimension)}线索。",
+                {"dimensions": [dimension], "candidates": candidates, "options": options,
+                 "reason": reason, "score_type": top.score_type},
+            )
+        # No distinguishing dimension left: ask the highest-priority dimension
+        # that still lacks trustworthy user evidence, without repeating what
+        # the dialogue already asked.
+        remaining = [d for d in self.QUESTION_ORDER if d not in blocked]
+        lead = remaining[0] if remaining else None
+        options = self._options_for(lead, scores[:2], clues) if lead else []
+        if lead:
+            reason = f"当前缺少{self.dimension_label(lead)}维度的用户证据。"
+            tail = f"请补充{self.dimension_label(lead)}等线索，或手动确认。"
+        else:
+            reason = "所有优先维度都已询问过；请直接描述画面或点击可疑区域。"
+            tail = "请直接描述画面中的可辨识线索，或手动确认。"
+        return HypothesisAction(
+            "request_clue",
+            f"当前候选首位为「{top.name_zh}」，这仅是当前候选国家目录"
+            f"（{len(self.engine.countries)} 国）内的排序，不是已确认的拍摄地。{tail}",
+            {"dimensions": [lead] if lead else [], "candidates": candidates,
+             "options": options, "reason": reason, "score_type": top.score_type},
+        )
+
+__all__ = [
+    "CLUE_BOOST_CAP",
+    "CLUE_BOOST_SCALE",
+    "CROP_WEIGHT",
+    "SEMANTIC_BOOST_CAP",
+    "SEMANTIC_BOOST_SCALES",
+    "ModelAwareEngine",
+    "ModelAwareHypotheses",
+]
