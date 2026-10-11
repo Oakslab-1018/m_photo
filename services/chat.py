@@ -20,7 +20,15 @@
 5. 地点线索只在拍摄/画面语境、"是/在/位于"直陈或回答上一轮地名问题时
    成立，并且必须校验到国家目录内的国家/ISO；
 6. 上一轮 AI 问题的维度/选项会成为语境：短回答（"左边"、点击选项 chip）
-   也能转化为对应维度的线索。
+   也能转化为对应维度的线索；
+7. 每轮反馈都产生确定性的 ``feedback_receipt``（action.payload 与 AI 消息
+   meta 各一份）：说明理解并应用了什么；文本没有产生证据时明确回执"未识别到
+   新证据"，并只用已有证据解释当前候选排序，不编造检测结果。
+
+国家/地区边界（country_policy 是单一真源）：确认意图
+归一为目录国家（TW/HK/MO -> CN）；区域否定仍按原始区域 ISO 排除（TW 只排除
+中国台湾地区，CN 才展开全部成员）；地点证据保留用户字面城市文本并记录
+source_iso/parent_iso，country 输出为 CN。
 """
 from __future__ import annotations
 
@@ -34,6 +42,11 @@ from backend.app.domain.geolocation.clue import Clue, DIM_LABELS, VALUE_LABELS, 
 from backend.app.domain.geolocation.engine import ReasoningEngine
 from backend.app.domain.geolocation.hypotheses import HypothesisManager, dimension_label, value_label
 from backend.app.domain.geolocation import knowledge_graph as kg
+
+from backend.app.domain.geolocation.country_policy import (
+    canonical_country_iso,
+    source_region_iso,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +230,248 @@ def _truncate(text: Any, limit: int) -> str:
     return value if len(value) <= limit else value[:limit]
 
 
+# ---------------------------------------------------------------------------
+# 国家/地区策略适配（country_policy 是单一真源）
+# ---------------------------------------------------------------------------
+# 原始区域 ISO 的展示名；区域不能当成国家名（country_policy 不提供展示标签，
+# 这里只保留受控的这三个条目）。
+_REGION_LABELS = {
+    "TW": "中国台湾地区",
+    "HK": "中国香港地区",
+    "MO": "中国澳门地区",
+}
+_ISO_TOKEN_RE = re.compile(r"[A-Za-z]{2}")
+
+
+def _apply_country_policy_to_clue(clue: Dict[str, Any]) -> Dict[str, Any]:
+    """Copy a parsed place clue and attach region metadata without rewriting scope.
+
+    Regional place evidence keeps its raw source ISO (``value="TW"`` with
+    ``place_kind="region"``, ``source_iso="TW"``, ``parent_iso="CN"``): the
+    engine scores it on the raw member row, so a region exclusion (TW) drops
+    that evidence instead of letting it boost the mainland (CN) row. City
+    evidence keeps the user's literal text with a canonical ``country_hint``
+    plus raw source metadata. Region-scoped rejections/clear-exclusions never
+    pass through here: they keep their raw ISO (see ``handle_feedback``).
+    """
+    result = dict(clue)
+    if result.get("dimension") != "place_name":
+        return result
+    extra = dict(result.get("extra") or {})
+    if extra.get("place_kind") == "city":
+        raw = str(extra.get("country_hint") or "").strip().upper()
+        canonical = canonical_country_iso(raw)
+        region = source_region_iso(raw)
+        if canonical:
+            extra["country_hint"] = canonical
+            if region:
+                extra["source_iso"] = region
+                extra["parent_iso"] = canonical
+        result["extra"] = extra
+        return result
+    raw = str(result.get("value") or "").strip().upper()
+    if _ISO_TOKEN_RE.fullmatch(raw):
+        region = source_region_iso(raw)
+        canonical = canonical_country_iso(raw)
+        if region and canonical:
+            result["value"] = region
+            extra["place_kind"] = "region"
+            extra["source_iso"] = region
+            extra["parent_iso"] = canonical
+    result["extra"] = extra
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 每轮反馈回执（确定性，先于可选 LLM 旁白，且不被旁白覆盖）
+# ---------------------------------------------------------------------------
+def _user_clues(clues: Any) -> List[Dict[str, Any]]:
+    return [clue for clue in (clues or ())
+            if isinstance(clue, dict) and clue.get("source") == "user"]
+
+
+def _clue_key(clue: Dict[str, Any]) -> Tuple[str, str]:
+    return (str(clue.get("dimension") or ""), str(clue.get("value") or ""))
+
+
+def _clues_removed(before: Sequence[Dict[str, Any]],
+                   after: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Clue dicts that existed before a correction but no longer do."""
+    remaining = list(after)
+    removed: List[Dict[str, Any]] = []
+    for clue in before:
+        if clue in remaining:
+            remaining.remove(clue)
+        else:
+            removed.append(clue)
+    return removed
+
+
+def _clue_value_text(dimension: str, value: str,
+                     extra: Optional[Dict[str, Any]] = None) -> str:
+    """Display text for one clue value; region sources never read as countries."""
+    extra = extra if isinstance(extra, dict) else {}
+    text = str(value or "")
+    if dimension == "place_name":
+        if extra.get("place_kind") == "city":
+            return text or str(value_label(value))
+        source_iso = str(extra.get("source_iso") or "").strip().upper()
+        if source_iso in _REGION_LABELS:
+            return _REGION_LABELS[source_iso]
+        token = text.strip().upper()
+        if _ISO_TOKEN_RE.fullmatch(token):
+            country = kg.get_by_iso(token)
+            if country:
+                return str(country.get("name_zh") or country.get("name") or text)
+        return text or str(value_label(value))
+    return str(value_label(value))
+
+
+def _clue_entry(clue: Dict[str, Any]) -> Dict[str, Any]:
+    dimension = str(clue.get("dimension") or "")
+    value = str(clue.get("value") or "")
+    extra = clue.get("extra") if isinstance(clue.get("extra"), dict) else {}
+    entry: Dict[str, Any] = {
+        "dimension": dimension,
+        "value": value,
+        "dimension_label": dimension_label(dimension),
+        "value_label": _clue_value_text(dimension, value, extra),
+    }
+    for key in ("source_iso", "parent_iso"):
+        token = extra.get(key)
+        if isinstance(token, str) and token:
+            entry[key] = token
+    return entry
+
+
+def _clue_phrase(clue: Dict[str, Any]) -> str:
+    dimension = str(clue.get("dimension") or "")
+    value = str(clue.get("value") or "")
+    extra = clue.get("extra") if isinstance(clue.get("extra"), dict) else {}
+    return f"{dimension_label(dimension)}={_clue_value_text(dimension, value, extra)}"
+
+
+def _ranking_change(before_scores: Sequence[Any],
+                    after_scores: Sequence[Any]) -> Optional[Dict[str, Any]]:
+    """Deterministic before/after view, only when the visible order changed."""
+    order_before = [score.iso for score in before_scores]
+    order_after = [score.iso for score in after_scores]
+    if order_before == order_after:
+        return None
+    leader_before = before_scores[0] if before_scores else None
+    leader_after = after_scores[0] if after_scores else None
+    return {
+        "leader_before": leader_before.iso if leader_before else None,
+        "leader_after": leader_after.iso if leader_after else None,
+        "leader_before_name_zh": leader_before.name_zh if leader_before else None,
+        "leader_after_name_zh": leader_after.name_zh if leader_after else None,
+        "leader_changed": (leader_before.iso if leader_before else None)
+                          != (leader_after.iso if leader_after else None),
+        "order_before": order_before,
+        "order_after": order_after,
+    }
+
+
+def _ranking_change_text(change: Optional[Dict[str, Any]]) -> str:
+    if not change:
+        return ""
+    if change.get("leader_changed"):
+        before_name = change.get("leader_before_name_zh")
+        after_name = change.get("leader_after_name_zh")
+        if before_name and after_name:
+            return f"候选首位由「{before_name}」变为「{after_name}」"
+        if after_name:
+            return f"当前候选首位为「{after_name}」"
+        return "当前已没有可用的候选国家"
+    return "候选排序已更新"
+
+
+def _basis_sentence(scores: Sequence[Any]) -> str:
+    """Grounded short 'why' from matched clues / rank delta / uncertainty.
+
+    Answering question-only turns with this keeps the reply tied to evidence the
+    engine actually produced; nothing here is a fabricated detection.
+    """
+    if not scores:
+        return "目前还没有足够的可用线索，可以补充画面中可辨识的文字、路牌或地形特征。"
+    top = scores[0]
+    evidence: List[str] = []
+    for item in getattr(top, "matched_clues", None) or []:
+        if len(evidence) >= 3:
+            break
+        dimension = item.get("dimension") if isinstance(item, dict) else None
+        value = item.get("value") if isinstance(item, dict) else None
+        if isinstance(dimension, str) and dimension and isinstance(value, str) and value:
+            evidence.append(f"{dimension_label(dimension)}={_clue_value_text(dimension, value)}")
+    if evidence:
+        why = f"当前候选首位是「{top.name_zh}」，主要依据已记录的" + "、".join(evidence)
+    elif getattr(top, "raw_cosine", None) is not None:
+        why = (f"当前候选首位是「{top.name_zh}」，来自图片相似度排序（不是概率），"
+               "目前还没有可复核的文字线索")
+    else:
+        why = f"当前候选首位是「{top.name_zh}」，但目前还没有能解释该排序的可靠线索"
+    parts = [why]
+    if len(scores) > 1:
+        second = scores[1]
+        try:
+            margin = float(top.score) - float(second.score)
+        except (TypeError, ValueError):
+            margin = None
+        if margin is not None and margin < 0.2:
+            parts.append(f"「{top.name_zh}」与「{second.name_zh}」排序接近，当前只是一组未确定的候选")
+    parts.append("这只是候选排序，不是照片定位结论")
+    return "；".join(parts) + "。"
+
+
+def _useful_answer_example(pending: Optional["PendingQuestion"]) -> str:
+    """One concrete example answer, shaped by the pending question if any."""
+    if pending is not None:
+        for option in pending.options:
+            dimension = option.get("dimension")
+            label = option.get("label") or value_label(str(option.get("value") or ""))
+            if isinstance(dimension, str) and dimension and label:
+                return f"例如「{dimension_label(dimension)}是{label}」"
+        for dimension in pending.dimensions:
+            if isinstance(dimension, str) and dimension:
+                return f"例如补充{dimension_label(dimension)}线索"
+    return "例如「招牌文字是韩文」「靠左行驶」「路边有热带雨林」"
+
+
+def _make_receipt(*, ftype: str, status: str, summary: str,
+                  added: Sequence[Dict[str, Any]] = (),
+                  removed: Sequence[Dict[str, Any]] = (),
+                  exclusions_added: Sequence[str] = (),
+                  exclusions_removed: Sequence[str] = (),
+                  confirmed_iso: Optional[str] = None,
+                  before_scores: Sequence[Any] = (),
+                  after_scores: Sequence[Any] = (),
+                  question: bool = False) -> Dict[str, Any]:
+    receipt: Dict[str, Any] = {
+        "type": ftype,
+        "status": status,
+        "summary": summary,
+        "added_clues": [_clue_entry(clue) for clue in added],
+        "removed_clues": [_clue_entry(clue) for clue in removed],
+        "exclusions_added": list(exclusions_added),
+        "exclusions_removed": list(exclusions_removed),
+        "confirmed_iso": confirmed_iso,
+    }
+    change = _ranking_change(before_scores, after_scores)
+    if change:
+        receipt["ranking_change"] = change
+    if question:
+        receipt["question"] = True
+    return receipt
+
+
+def format_feedback_receipt(receipt: Optional[Dict[str, Any]]) -> str:
+    """Deterministic acknowledgment text that must prefix any LLM narration."""
+    if not isinstance(receipt, dict):
+        return ""
+    summary = receipt.get("summary")
+    return summary.strip() if isinstance(summary, str) else ""
+
+
 def _find_anchor(text: str, candidates: Sequence[Any]) -> Optional[Tuple[int, str]]:
     lowered = text.lower()
     best: Optional[Tuple[int, str]] = None
@@ -247,14 +502,23 @@ def _place_alias_matcher() -> Tuple[re.Pattern, Dict[str, Tuple[str, str]]]:
             if isinstance(key, str) and key.strip():
                 table.setdefault(key.strip(), ("country", iso))
     valid = set(kg.all_isos())
-    for alias, iso in _EXTRA_PLACE_ALIASES.items():
+
+    def _alias_supported(iso: str) -> bool:
+        # Raw region codes (TW/HK/MO) stay raw here even when grouped under a
+        # parent country: place evidence and exclusions keep that raw scope.
         if iso in valid:
+            return True
+        canonical = canonical_country_iso(iso)
+        return bool(canonical and kg.get_by_iso(canonical))
+
+    for alias, iso in _EXTRA_PLACE_ALIASES.items():
+        if _alias_supported(iso):
             table.setdefault(alias, ("country", iso))
     for alias, iso in _CITY_ALIASES.items():
-        if iso in valid:
+        if _alias_supported(iso):
             table.setdefault(alias, ("city", iso))
     for alias, iso in _CITY_ALIASES_EN.items():
-        if iso in valid:
+        if _alias_supported(iso):
             table.setdefault(alias, ("city", iso))
     entries: List[str] = []
     for alias in sorted(table, key=len, reverse=True):
@@ -1004,8 +1268,19 @@ class ChatService:
 
     @staticmethod
     def _country_name(iso: str) -> str:
-        country = kg.get_by_iso(iso)
-        return country["name_zh"] if country else iso
+        """Display name; raw regions never read as countries (TW -> 中国台湾地区)."""
+        raw = str(iso or "").strip().upper()
+        if raw in _REGION_LABELS:
+            return _REGION_LABELS[raw]
+        canonical = canonical_country_iso(raw)
+        if canonical and canonical != raw:
+            # 其他区域范围（HK/MO 等）按区域名展示，不冒用国家名。
+            country = kg.get_by_iso(raw)
+            if country:
+                return str(country.get("name_zh") or country.get("name") or raw)
+            raw = canonical
+        country = kg.get_by_iso(raw)
+        return str(country["name_zh"]) if country else raw
 
     def _safe_messages(self, session_id: int) -> List[Dict[str, Any]]:
         try:
@@ -1063,19 +1338,27 @@ class ChatService:
             return hypothesis.next_action(scores, clues, asked=asked)
         return hypothesis.next_action(scores, clues)
 
-    def _remove_corrected_clues(self, session_id: int, plan: ParsedFeedback) -> None:
+    def _current_user_clues(self, session_id: int) -> List[Dict[str, Any]]:
+        session = self.session_service.get(session_id)
+        return _user_clues(session.clues if session else [])
+
+    def _remove_corrected_clues(self, session_id: int,
+                                plan: ParsedFeedback) -> List[Dict[str, Any]]:
         """Apply the bounded correction plan before appending new evidence.
 
         Only *user-sourced* clues are dropped: OCR/heuristic evidence and
-        unrelated dimensions are always preserved.
+        unrelated dimensions are always preserved. Returns the dropped clue
+        dicts so the turn receipt can report them.
         """
         remover = getattr(self.session_service, "remove_user_clues", None)
         if not callable(remover):
-            return
+            return []
+        before = self._current_user_clues(session_id)
         for dimension, value in plan.remove_clue_values:
             remover(session_id, dimension=dimension, value=value)
         for dimension in plan.replace_dimensions:
             remover(session_id, dimension=dimension)
+        return _clues_removed(before, self._current_user_clues(session_id))
 
     def initial_analysis(self, session_id: int) -> Dict[str, Any]:
         """AI 首次分析后生成初始假设动作。"""
@@ -1099,6 +1382,15 @@ class ChatService:
 
         feedback 结构：
         {"type": "confirm"|"reject"|"answer"|"free_text", "iso"?, "dimension"?, "value"?, "text"?}
+
+        每轮反馈都会生成确定性的 ``feedback_receipt``（action.payload 与 AI
+        消息 meta 各一份）：说明本轮理解并应用了什么；无法解析的文本或纯提问
+        明确回执"没有新证据"，并只引用已有证据解释当前候选排序。
+        国家/地区意图在应用边界归一：确认 -> 目录国家（TW/HK/MO -> CN）；
+        区域否定保持原始区域 ISO（TW 只排除中国台湾地区，CN 才展开成员）。
+        只有产生实质线索/排除/更正时才推进到下一个维度；没有实质变化的回合
+        （纯提问、寒暄、重复线索、无对象更正、重复排除等）保留原问题
+        （回执 question_kept=True），避免用户感觉被忽略。
         """
         session = self.session_service.get(session_id)
         if not session:
@@ -1106,88 +1398,315 @@ class ChatService:
 
         ftype = feedback.get("type")
         user_msg = feedback.get("text") or ""
+        pending = self._pending_question(session_id)
 
         if ftype == "confirm":
-            iso = feedback.get("iso")
+            iso = canonical_country_iso(feedback.get("iso"))
             if iso:
-                self.session_service.set_confirmed(session_id, iso)
-                cname = self._country_name(iso)
-                self.session_service.add_message(session_id, "user", f"确认：{cname}")
                 self.session_service.add_message(
-                    session_id, "ai",
-                    f"已记录你确认的国家为「{cname}」。"
-                    "这是国家候选目录内的国家确认，不是照片 GPS 坐标。",
-                    meta={"action": {"kind": "done", "iso": iso}},
-                )
-                return {"done": True, "iso": iso,
-                        "messages": self.session_service.list_messages(session_id)}
+                    session_id, "user", f"确认：{self._country_name(iso)}")
+                return self._confirm_turn(session_id, iso, ftype=ftype, session=session)
 
-        elif ftype == "reject":
+        # Before/after scores are computed locally (no external call) so the
+        # receipt can report a meaningful leader/ranking change.
+        before_scores = self.engine.infer(
+            self._clues_of(session), exclusions=list(session.exclusions))
+
+        plan: Optional[ParsedFeedback] = None
+        added_clues: List[Dict[str, Any]] = []
+        removed_clues: List[Dict[str, Any]] = []
+        duplicate_clues: List[Dict[str, Any]] = []
+        exclusions_added: List[str] = []
+        exclusions_removed: List[str] = []
+        exclusions_duplicate: List[str] = []
+        clears_missing: List[str] = []
+
+        if ftype == "reject":
             iso = feedback.get("iso")
             if iso:
-                self.session_service.add_exclusion(session_id, iso)
-                cname = self._country_name(iso)
-                self.session_service.add_message(session_id, "user", f"排除：{cname}")
+                # 区域否定保留原始 ISO：排除 TW 只排除中国台湾地区，绝不
+                # 扩张为排除整个中国（CN 的成员展开由 geo worker 负责）。
+                raw_iso = str(iso).strip().upper()
+                if raw_iso in list(session.exclusions):
+                    exclusions_duplicate.append(raw_iso)
+                else:
+                    self.session_service.add_exclusion(session_id, raw_iso)
+                    exclusions_added.append(raw_iso)
+                self.session_service.add_message(
+                    session_id, "user", f"排除：{self._country_name(raw_iso)}")
 
         elif ftype == "answer":
             dim = feedback.get("dimension")
             value = feedback.get("value")
             if isinstance(dim, str) and isinstance(value, str) and dim.strip() and value.strip():
                 dim = dim.strip()
-                value = value.strip()[:64]
-                self.session_service.add_clue(session_id, {
+                clue = _apply_country_policy_to_clue({
                     "dimension": dim,
-                    "value": value,
+                    "value": value.strip()[:64],
                     "confidence": 0.9,
                     "evidence": "用户确认",
                     "source": "user",
                     "extra": {"parser": "answer"},
                 })
+                existing = {_clue_key(item) for item in _user_clues(session.clues)}
+                if _clue_key(clue) in existing:
+                    # 同一条用户线索不重复追加，回执明确说明本轮无变化。
+                    duplicate_clues.append(clue)
+                else:
+                    self.session_service.add_clue(session_id, clue)
+                    added_clues.append(clue)
                 self.session_service.add_message(
                     session_id, "user",
-                    f"补充线索：{dimension_label(dim)} = {value_label(value)}")
+                    f"补充线索：{dimension_label(dim)} = "
+                    f"{_clue_value_text(dim, clue['value'], clue.get('extra'))}")
 
         elif ftype == "free_text":
             plan = self._take_free_text_plan(user_msg)
             if plan is None:
-                plan = self.parser.parse(user_msg, pending=self._pending_question(session_id))
+                plan = self.parser.parse(user_msg, pending=pending)
             self.session_service.add_message(session_id, "user", user_msg)
-            self._remove_corrected_clues(session_id, plan)
+            removed_clues = self._remove_corrected_clues(session_id, plan)
+            current = self.session_service.get(session_id) or session
+            current_exclusions = list(current.exclusions)
             for iso in plan.clear_exclusions:
-                self._remove_exclusion(session_id, iso)
+                # 更正只撤回同范围的排除：clear TW 不会顺带撤回 CN。
+                raw_iso = str(iso).strip().upper()
+                if raw_iso in current_exclusions:
+                    self._remove_exclusion(session_id, raw_iso)
+                    exclusions_removed.append(raw_iso)
+                else:
+                    clears_missing.append(raw_iso)
             for iso in plan.reject_isos:
-                self.session_service.add_exclusion(session_id, iso)
+                raw_iso = str(iso).strip().upper()
+                if raw_iso in current_exclusions:
+                    exclusions_duplicate.append(raw_iso)
+                else:
+                    self.session_service.add_exclusion(session_id, raw_iso)
+                    exclusions_added.append(raw_iso)
+            current = self.session_service.get(session_id) or current
+            existing = {_clue_key(item) for item in _user_clues(current.clues)}
             for clue in plan.clues:
+                clue = _apply_country_policy_to_clue(clue)
+                key = _clue_key(clue)
+                if key[0] and key[1] and key in existing:
+                    duplicate_clues.append(clue)
+                    continue
                 self.session_service.add_clue(session_id, clue)
+                if key[0] and key[1]:
+                    existing.add(key)
+                    added_clues.append(clue)
             if plan.confirm_iso:
                 # 用户对确认问题的明确肯定：这是用户本人的确认，不是 LLM 自动确认。
-                iso = plan.confirm_iso
-                cname = self._country_name(iso)
-                self.session_service.set_confirmed(session_id, iso)
-                self.session_service.add_message(
-                    session_id, "ai",
-                    f"已记录你确认的国家为「{cname}」。"
-                    "这是国家候选目录内的国家确认，不是照片 GPS 坐标。",
-                    meta={"action": {"kind": "done", "iso": iso}},
-                )
-                return {"done": True, "iso": iso,
-                        "messages": self.session_service.list_messages(session_id)}
+                iso = canonical_country_iso(plan.confirm_iso)
+                if iso:
+                    refreshed = self.session_service.get(session_id) or current
+                    return self._confirm_turn(
+                        session_id, iso, ftype=ftype, session=refreshed,
+                        added=added_clues, removed=removed_clues,
+                        exclusions_added=exclusions_added,
+                        exclusions_removed=exclusions_removed)
 
-        # 重新推理
+        # 重新推理（本地确定性，无外部调用）
         session = self.session_service.get(session_id)  # 刷新
         clues = self._clues_of(session)
         scores = self.engine.infer(clues, exclusions=session.exclusions)
-        asked = self._asked_dimensions(self._safe_messages(session_id))
-        action = self._call_next_action(self.hypothesis, scores, clues, asked)
+
+        receipt = self._turn_receipt(
+            ftype=ftype, text=user_msg, plan=plan, pending=pending,
+            before_scores=before_scores, after_scores=scores,
+            added=added_clues, removed=removed_clues, duplicates=duplicate_clues,
+            exclusions_added=exclusions_added, exclusions_removed=exclusions_removed,
+            exclusions_duplicate=exclusions_duplicate, clears_missing=clears_missing)
+
+        # 没有产生新证据的回合（提问/寒暄/重复线索/无对象更正/重复排除）
+        # 一律不推进问题维度：沿用上一条 AI 问题的动作，让 pending 问题
+        # 保持不变（question_kept=True）。
+        kept_question = False
+        previous = (self._previous_question_action(session_id)
+                    if receipt["status"] in {"unrecognized", "unchanged"} else None)
+        if previous is not None:
+            action = self._reemit_question(previous)
+            kept_question = True
+        else:
+            asked = self._asked_dimensions(self._safe_messages(session_id))
+            action = self._call_next_action(self.hypothesis, scores, clues, asked).to_dict()
+        if kept_question:
+            receipt["question_kept"] = True
+        payload = action.get("payload")
+        if isinstance(payload, dict):
+            payload["feedback_receipt"] = receipt
+        prefix = format_feedback_receipt(receipt)
+        if prefix:
+            action["message"] = f"{prefix}\n{action.get('message') or ''}".rstrip()
 
         self.session_service.add_message(
-            session_id, "ai", action.message,
-            meta={"action": action.to_dict(), "scores": [s.to_dict() for s in scores]},
+            session_id, "ai", action["message"],
+            meta={"action": action, "scores": [s.to_dict() for s in scores],
+                  "feedback_receipt": receipt},
         )
         return {
             "scores": [s.to_dict() for s in scores],
-            "action": action.to_dict(),
+            "action": action,
         }
+
+    def _confirm_turn(self, session_id: int, iso: str, *, ftype: str, session,
+                      added: Sequence[Dict[str, Any]] = (),
+                      removed: Sequence[Dict[str, Any]] = (),
+                      exclusions_added: Sequence[str] = (),
+                      exclusions_removed: Sequence[str] = ()) -> Dict[str, Any]:
+        """Record a user confirmation (canonical country) and return the turn."""
+        cname = self._country_name(iso)
+        already = (getattr(session, "confirmed_iso", None) == iso
+                   and getattr(session, "status", "") == "done")
+        self.session_service.set_confirmed(session_id, iso)
+        if already:
+            status = "unchanged"
+            summary = f"「{cname}」此前已确认，本轮确认保持不变。"
+        else:
+            status = "applied"
+            summary = f"已确认国家「{cname}」（目录内国家，不是照片 GPS 坐标）。"
+        receipt = _make_receipt(
+            ftype=ftype, status=status, summary=summary,
+            added=added, removed=removed,
+            exclusions_added=exclusions_added, exclusions_removed=exclusions_removed,
+            confirmed_iso=iso)
+        message = (f"已记录你确认的国家为「{cname}」。"
+                   "这是国家候选目录内的国家确认，不是照片 GPS 坐标。")
+        action = {"kind": "done", "message": message, "iso": iso,
+                  "payload": {"feedback_receipt": receipt}}
+        self.session_service.add_message(
+            session_id, "ai", message,
+            meta={"action": action, "feedback_receipt": receipt})
+        return {"done": True, "iso": iso, "action": action,
+                "messages": self.session_service.list_messages(session_id)}
+
+    def _previous_question_action(self, session_id: int) -> Optional[Dict[str, Any]]:
+        """Last AI question action, used to keep the pending question unchanged."""
+        for message in reversed(self._safe_messages(session_id)):
+            if not isinstance(message, dict) or message.get("role") != "ai":
+                continue
+            meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+            action = meta.get("action")
+            if isinstance(action, dict) and action.get("kind") in {"ask", "request_clue", "confirm"}:
+                return action
+            return None
+        return None
+
+    @staticmethod
+    def _reemit_question(action: Dict[str, Any]) -> Dict[str, Any]:
+        """Copy a previous question action, dropping any prior receipt prefix."""
+        payload = action.get("payload")
+        payload = dict(payload) if isinstance(payload, dict) else {}
+        message = str(action.get("message") or "")
+        old_prefix = format_feedback_receipt(payload.get("feedback_receipt"))
+        if old_prefix and message.startswith(old_prefix):
+            message = message[len(old_prefix):].lstrip("\n")
+        payload.pop("feedback_receipt", None)
+        return {
+            "kind": str(action.get("kind") or "request_clue"),
+            "message": message,
+            "payload": payload,
+        }
+
+    def _turn_receipt(self, *, ftype: str, text: str, plan: Optional[ParsedFeedback],
+                      pending: Optional["PendingQuestion"],
+                      before_scores: Sequence[Any], after_scores: Sequence[Any],
+                      added: Sequence[Dict[str, Any]],
+                      removed: Sequence[Dict[str, Any]],
+                      duplicates: Sequence[Dict[str, Any]],
+                      exclusions_added: Sequence[str],
+                      exclusions_removed: Sequence[str],
+                      exclusions_duplicate: Sequence[str],
+                      clears_missing: Sequence[str]) -> Dict[str, Any]:
+        """Deterministic per-turn receipt: what was understood and applied.
+
+        Status is ``applied`` (state changed), ``unchanged`` (understood but
+        nothing to change) or ``unrecognized`` (no valid evidence found). The
+        summary is prefixed to the AI message so remote narration cannot erase
+        the acknowledgment; unrecognized turns explain the current ranking from
+        existing evidence instead of fabricating detections.
+        """
+        change = _ranking_change(before_scores, after_scores)
+        change_text = _ranking_change_text(change)
+        question = bool(getattr(plan, "question", False))
+        tail = ""
+
+        if ftype == "reject":
+            if exclusions_added:
+                status = "applied"
+                summary = f"已排除「{self._country_name(exclusions_added[0])}」"
+            else:
+                status = "unchanged"
+                iso = exclusions_duplicate[0] if exclusions_duplicate else None
+                summary = (f"「{self._country_name(iso)}」此前已排除，本轮没有变化"
+                           if iso else "本轮没有变化")
+        elif ftype == "answer":
+            if added:
+                status = "applied"
+                summary = f"已记录线索 {_clue_phrase(added[0])}"
+            elif duplicates:
+                status = "unchanged"
+                summary = f"线索 {_clue_phrase(duplicates[0])} 此前已记录，本轮未重复添加"
+            else:
+                status = "unchanged"
+                summary = "本轮没有可记录的线索"
+        elif ftype == "free_text":
+            effective = bool(added or removed or exclusions_added or exclusions_removed)
+            if effective:
+                status = "applied"
+                parts: List[str] = []
+                for clue in removed[:2]:
+                    parts.append(f"已移除线索 {_clue_phrase(clue)}")
+                for clue in added[:2]:
+                    parts.append(f"已记录线索 {_clue_phrase(clue)}")
+                for iso in exclusions_added[:2]:
+                    parts.append(f"已排除「{self._country_name(iso)}」")
+                for iso in exclusions_removed[:2]:
+                    parts.append(f"已撤回对「{self._country_name(iso)}」的排除")
+                summary = "；".join(parts)
+            elif plan is not None and (plan.clues or plan.reject_isos or plan.clear_exclusions
+                                       or plan.replace_dimensions or plan.remove_clue_values):
+                status = "unchanged"
+                parts = []
+                for clue in duplicates[:2]:
+                    parts.append(f"线索 {_clue_phrase(clue)} 此前已记录")
+                for iso in exclusions_duplicate[:2]:
+                    parts.append(f"「{self._country_name(iso)}」此前已排除")
+                for iso in clears_missing[:2]:
+                    parts.append(f"「{self._country_name(iso)}」当前并未被排除")
+                if not parts:
+                    parts.append("更正目标没有对应的既有用户线索")
+                summary = ("识别到你的意思（" + "；".join(parts)
+                           + "），但没有需要变更的证据，本轮保持不变")
+            else:
+                status = "unrecognized"
+                example = _useful_answer_example(pending)
+                if question:
+                    reason = "这条消息是提问，不包含新的可验证线索"
+                    tail = f"你可以先回答当前问题，或直接描述画面特征，{example}。"
+                elif _has_any(text, _UNCERTAIN_TOKENS):
+                    reason = "不确定的表述不会作为线索证据"
+                    tail = f"你可以直接描述画面中看得清的特征，{example}。"
+                else:
+                    reason = "没有从这条消息中提取到可用线索"
+                    tail = f"你可以直接描述画面中看得清的特征，{example}。"
+                summary = f"已收到消息，但{reason}"
+        else:
+            status = "unchanged"
+            summary = "本轮没有可应用的反馈"
+
+        if change_text:
+            summary = f"{summary}；{change_text}"
+        if status == "unrecognized":
+            summary = f"{summary}。{_basis_sentence(after_scores)}{tail}"
+        else:
+            summary = f"{summary}。"
+        return _make_receipt(
+            ftype=ftype, status=status, summary=summary,
+            added=added, removed=removed,
+            exclusions_added=exclusions_added, exclusions_removed=exclusions_removed,
+            confirmed_iso=None, before_scores=before_scores,
+            after_scores=after_scores, question=question)
 
     def reason_only(self, session_id: int,
                     new_clues: Optional[List[Dict[str, Any]]] = None,

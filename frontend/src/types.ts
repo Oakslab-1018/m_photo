@@ -56,6 +56,19 @@ export interface ReferenceRegion {
 
 export type CityScoreType = 'city_text_cosine' | 'city_reference_hybrid' | 'city_clue_fusion' | string
 
+/**
+ * One raw regional source aggregated under country CN (TW/HK/MO), optionally
+ * with member diagnostics. Unknown extra keys are preserved untouched.
+ */
+export interface SourceRegionRef {
+  source_iso?: string | null
+  iso?: string | null
+  name_zh?: string | null
+  parent_iso?: string | null
+  [key: string]: unknown
+}
+
+export type SourceRegionEntry = string | SourceRegionRef
 export interface CityScore {
   city_id: string
   iso: string
@@ -67,6 +80,10 @@ export interface CityScore {
   score: number
   score_type: CityScoreType
   reference_cosine?: number | null
+  /** CN aggregate metadata: TW/HK/MO city rows keep their raw source region. */
+  country_iso?: string | null
+  source_iso?: string | null
+  source_region?: SourceRegionEntry | null
   /** Optional clue-fusion diagnostics for city_clue_fusion rows; shape owned by the backend contract. */
   matched_clues?: Array<Record<string, unknown>>
   fusion?: Record<string, unknown>
@@ -88,6 +105,11 @@ export interface CitiesResponse {
   status: CitiesStatus
   clue_dimensions?: string[] | null
   clue_note?: string | null
+  /** Present when the request filtered one CN region scope (e.g. source_iso TW). */
+  source_iso?: string | null
+  source_region?: SourceRegionEntry | null
+  source_isos?: string[]
+  note?: string | null
 }
 
 export interface CountryScore {
@@ -106,6 +128,17 @@ export interface CountryScore {
   matched_clues?: Array<Record<string, unknown>>
   lat: number
   lng: number
+  /**
+   * Geopolicy aggregation metadata. The backend may expose TW as an upstream
+   * region under the canonical CN country row; the shared geo utility folds any
+   * leftover raw TW row into CN before display.
+   */
+  parent_iso?: string | null
+  is_region?: boolean
+  is_grouped?: boolean
+  source_regions?: SourceRegionEntry[]
+  /** Optional backend-provided region-scope label (e.g. 中国台湾). */
+  region_scope?: string | null
 }
 
 export interface Country extends CountryScore {
@@ -135,6 +168,11 @@ export interface HypothesisAction {
     candidates?: string[]
     /** Answer choices for the pending question; the AI may question or reason. */
     options?: ClueAnswerOption[]
+    /**
+     * Optional server receipt for the last submitted feedback; status is
+     * `applied | unchanged | unrecognized` plus a human summary.
+     */
+    feedback_receipt?: Record<string, unknown> | null
     [key: string]: unknown
   }
 }
@@ -185,6 +223,28 @@ export interface FeedbackPayload {
   dimension?: string
   value?: string
   text?: string
+}
+
+/**
+ * Client-side optimistic chat entry. Rendering and retry live entirely in the
+ * UI layer; it is replaced exactly once by the authoritative server messages.
+ */
+export interface PendingChatMessage {
+  id: number
+  role: 'user'
+  content: string
+  status: 'sending' | 'failed'
+  error?: string | null
+  payload: FeedbackPayload
+  /** Session the message was submitted against; null when no session existed. */
+  sessionId?: number | null
+  /** UI epoch at submission time; superseded requests stay visible as failures. */
+  epoch?: number
+  /**
+   * True when the session/epoch this bubble belonged to was replaced. Retry is
+   * blocked so old-photo feedback is never silently sent to a new session.
+   */
+  orphaned?: boolean
 }
 
 export interface Point {

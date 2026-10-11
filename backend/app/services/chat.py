@@ -6,7 +6,7 @@ import json
 import logging
 from types import SimpleNamespace
 
-from services.chat import ChatService as LegacyChatService
+from services.chat import ChatService as LegacyChatService, format_feedback_receipt
 from ..config import Settings
 from ..domain.geolocation.model_ranking import ModelAwareEngine, ModelAwareHypotheses
 from .deepseek import DeepSeekClient
@@ -90,7 +90,15 @@ class ChatService(LegacyChatService):
     def _finish(self, result, session_id):
         if self._prepared and result.get("action") and _signature(result) == self._prepared[0]:
             message = self._prepared[1]
-            result["action"] = {**result["action"], "message": message}
+            action = result["action"]
+            payload = action.get("payload") if isinstance(action.get("payload"), dict) else {}
+            # The deterministic receipt is the acknowledgment of what the
+            # user's turn was understood to mean; remote narration may add
+            # wording but must never erase it, so it prefixes the final text.
+            prefix = format_feedback_receipt(payload.get("feedback_receipt"))
+            if prefix and not message.lstrip().startswith(prefix):
+                message = f"{prefix}\n{message}"
+            result["action"] = {**action, "message": message}
             self.session_service.replace_last_ai_message(session_id, message, result["action"])
         self._prepared = None
         self._free_text_plan = None

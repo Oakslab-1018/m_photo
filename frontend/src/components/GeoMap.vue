@@ -52,16 +52,19 @@ function markerElement(point: MapPoint): HTMLElement {
   if (point.confirmed) el.classList.add('confirmed')
   if (point.kind === 'country' && point.iso === props.selectedIso) el.classList.add('selected')
   const cosine = point.cosine != null ? ` · 余弦 ${point.cosine.toFixed(3)}（非概率）` : ''
+  // A CN candidate that aggregates regional evidence stays 中国; the tooltip
+  // only adds the regional hit (中国台湾/中国香港/中国澳门).
+  const scope = point.subregion ? `（区域命中：${point.subregion}）` : ''
   el.setAttribute(
     'aria-label',
     point.kind === 'city'
-      ? `城市候选 ${point.name}（代表点，不是照片位置）`
-      : `候选国家 ${point.name}，单击选中，双击确认国家`,
+      ? `城市候选 ${point.name}${point.subregion ? `（${point.subregion}区域代表点，不是照片位置）` : '（代表点，不是照片位置）'}`
+      : `候选国家 ${point.name}${scope}，单击选中，双击确认国家`,
   )
   el.title =
     point.kind === 'city'
-      ? `${point.name} · 城市代表点，不是照片位置${cosine}`
-      : `${point.name}${point.confirmed ? ' · 用户已确认的国家（非照片 GPS）' : '，单击选中，双击确认国家'}`
+      ? `${point.name}${point.subregion ? ` · ${point.subregion}` : ''} · 城市代表点，不是照片位置${cosine}`
+      : `${point.name}${scope}${point.confirmed ? ' · 用户已确认的国家（非照片 GPS）' : '，单击选中，双击确认国家'}`
   if (point.kind === 'country') {
     el.addEventListener('click', (event) => {
       event.preventDefault()
@@ -155,7 +158,7 @@ onBeforeUnmount(() => {
         <span><i class="legend-dot city" />城市候选</span>
         <span><i class="legend-dot confirmed" />用户已确认国家</span>
       </div>
-      <span>单击选中国家 · 双击确认国家 · 标记均为代表点，不是照片 GPS</span>
+      <span class="map-hint">单击选中国家 · 双击确认国家 · 标记均为代表点，不是照片 GPS</span>
       <div class="focus-group">
         <button type="button" class="ghost-btn" :disabled="!countries.length" @click="focusCountries">聚焦国家</button>
         <button type="button" class="ghost-btn" :disabled="!cities.length" @click="focusCities">聚焦城市</button>

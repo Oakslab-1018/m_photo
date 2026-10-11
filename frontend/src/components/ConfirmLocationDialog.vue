@@ -5,6 +5,8 @@ import { scoreLabel } from '@/utils/map'
 
 const props = defineProps<{
   country: CountryScore
+  /** Region scope of an aggregated CN hit, e.g. 中国台湾. */
+  subregion?: string | null
   busy?: boolean
 }>()
 
@@ -40,6 +42,9 @@ onBeforeUnmount(() => {
     <div class="confirm-box">
       <div class="confirm-msg">
         是否确认这张照片拍摄的国家是「{{ country.name_zh }}」？
+        <div v-if="subregion" class="confirm-sub">
+          区域命中：{{ subregion }}（属于中国候选范围，不是独立国家）
+        </div>
         <div class="confirm-sub">
           当前{{ scoreLabel(country) }} · 确认的是候选国家，不是照片 GPS 坐标
         </div>

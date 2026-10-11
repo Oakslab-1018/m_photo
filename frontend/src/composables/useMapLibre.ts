@@ -37,6 +37,8 @@ export interface MapPoint {
   cosine?: number | null
   scoreType?: string
   confirmed?: boolean
+  /** Optional region scope evidence (中国台湾/中国香港/中国澳门) for tooltips. */
+  subregion?: string | null
 }
 
 export interface MapLifecycleOptions {

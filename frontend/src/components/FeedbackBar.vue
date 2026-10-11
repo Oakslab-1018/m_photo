@@ -8,22 +8,39 @@ const props = defineProps<{
   action: HypothesisAction | null
   busy: boolean
   disabled?: boolean
+  /**
+   * Controlled draft. When provided the parent owns the text and clears it on
+   * submit acknowledgment / restores it after a failure; omitted keeps local
+   * state for standalone use.
+   */
+  draft?: string
 }>()
 
 const emit = defineEmits<{
   feedback: [payload: FeedbackPayload]
+  'update:draft': [value: string]
 }>()
 
 const inputRef = ref<HTMLTextAreaElement | null>(null)
-const text = ref('')
+const localText = ref('')
 const composing = ref(false)
 
+const text = computed(() => (props.draft !== undefined ? props.draft : localText.value))
 const optionGroups = computed(() => groupActionOptions(props.action))
 const canSend = computed(() => text.value.trim().length > 0 && !props.busy && !props.disabled)
 
 async function focusInput(): Promise<void> {
   await nextTick()
   inputRef.value?.focus()
+}
+
+function setText(value: string): void {
+  if (props.draft !== undefined) emit('update:draft', value)
+  else localText.value = value
+}
+
+function onInput(event: Event): void {
+  setText((event.target as HTMLTextAreaElement).value)
 }
 
 // Auto-grow the textarea up to its CSS max-height so long scene descriptions stay readable.
@@ -39,8 +56,9 @@ function submit(): void {
   if (composing.value) return
   const value = text.value.trim()
   if (!canSend.value) return
+  // Never clear here: the parent acknowledges the submit into its optimistic
+  // pipeline and restores the draft if the request fails.
   emit('feedback', { type: 'free_text', text: value })
-  text.value = ''
 }
 
 function onEnter(event: KeyboardEvent): void {
@@ -99,7 +117,7 @@ defineExpose({ focusInput })
       >
         ✍️ 我来补充{{ action.payload?.dimensions?.length ? `（${action.payload.dimensions.map(dimensionLabel).join('、')}）` : '' }}
       </button>
-      <button v-if="action.kind === 'done'" type="button" class="action-btn success" disabled>🎉 推理完成</button>
+      <span v-if="action.kind === 'done'" class="action-note">🎉 推理已完成</span>
     </div>
 
     <div v-if="optionGroups.length" class="answer-options">
@@ -123,11 +141,12 @@ defineExpose({ focusInput })
     <div class="chat-input-row">
       <textarea
         ref="inputRef"
-        v-model="text"
+        :value="text"
         class="chat-input"
         rows="1"
         :placeholder="action?.kind === 'ask' || action?.kind === 'request_clue' ? '输入补充线索或直接描述场景…' : '输入反馈，或直接描述线索…'"
         :disabled="disabled || busy"
+        @input="onInput"
         @compositionstart="composing = true"
         @compositionend="composing = false"
         @keydown.enter="onEnter"

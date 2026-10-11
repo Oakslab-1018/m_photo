@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import type { CountryScore } from '@/types'
+import { normalizeCountryIso } from '@/utils/geo'
 import {
   REFERENCE_MATCH_DISCLAIMER,
   REFERENCE_SIMILARITY_SEMANTICS,
@@ -53,11 +54,11 @@ function formatSupport(value: number): string {
       <ol v-if="matches.length" class="reference-list">
         <li v-for="match in matches" :key="match.reference_id" class="reference-item">
           <div class="reference-line">
-            <span class="reference-place">{{ match.place || match.iso }}</span>
+            <span class="reference-place">{{ match.place || normalizeCountryIso(match.iso) }}</span>
             <span class="reference-cosine">{{ formatReferenceCosine(match.raw_cosine) }}</span>
           </div>
           <div class="reference-meta">
-            {{ match.iso }}
+            {{ normalizeCountryIso(match.iso) }}
             <template v-if="match.city"> · {{ match.city }}</template>
             <template v-else-if="match.region"> · {{ match.region }}</template>
             <template v-if="match.viewpoint"> · {{ match.viewpoint }}</template>
@@ -66,10 +67,10 @@ function formatSupport(value: number): string {
         </li>
       </ol>
 
-      <div v-if="regions.length" class="reference-subtitle">国家/区域原型分数</div>
+      <div v-if="regions.length" class="reference-subtitle">国家/地区原型分数</div>
       <div v-if="regions.length" class="reference-regions">
         <div v-for="region in regions" :key="`${region.iso}-${region.region}`" class="reference-region">
-          <span class="reference-place">{{ region.iso }} · {{ region.region }}</span>
+          <span class="reference-place">{{ normalizeCountryIso(region.iso) }} · {{ region.region }}</span>
           <span class="reference-region-meta">
             {{ formatReferenceCosine(region.raw_cosine) }} · 原型 {{ region.prototype_count }} ·
             支持 {{ formatSupport(region.support) }}

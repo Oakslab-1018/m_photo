@@ -31,6 +31,7 @@ from ..domain.geolocation.engine import (
     find_place_phrase,
     normalize_place_text,
 )
+from ..domain.geolocation.country_policy import canonical_country_iso, normalize_iso
 
 
 CITY_CLUE_BOOST_SCALE = 0.12
@@ -180,9 +181,20 @@ class CityClueReasoner:
             confidence = float(clue.confidence) if isinstance(clue.confidence, (int, float)) else 0.0
             if not (confidence >= MIN_EVIDENCE_CONFIDENCE):
                 continue
-            catalog_iso = extra.get("catalog_iso")
-            catalog_iso = str(catalog_iso).strip().upper() if catalog_iso else None
-            if catalog_iso and catalog_iso != iso:
+            catalog_iso = normalize_iso(extra.get("catalog_iso"))
+            source_iso = normalize_iso(extra.get("source_iso"))
+            if source_iso:
+                # A validated regional clue is scoped to its raw source only.
+                # A canonical country value/parent may still match the same
+                # source scope, but another child region never cross-matches.
+                if source_iso != iso:
+                    continue
+                if catalog_iso and (
+                    catalog_iso != iso
+                    and canonical_country_iso(catalog_iso) != canonical_country_iso(iso)
+                ):
+                    continue
+            elif catalog_iso and catalog_iso != iso:
                 continue  # 线索自己声明了别的国家，不在本次城市范围内
             texts = [clue.value]
             city_name = extra.get("city_name")

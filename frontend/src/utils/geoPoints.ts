@@ -1,4 +1,5 @@
 import type { CityScore, CountryScore } from '@/types'
+import { cityRegionLabel, regionScopeLabel } from '@/utils/geo'
 
 export interface GeoPoint {
   key: string
@@ -10,6 +11,8 @@ export interface GeoPoint {
   cosine: number | null
   scoreType?: string
   confirmed: boolean
+  /** Optional region scope (中国台湾 / 中国香港 / 中国澳门) for tooltip evidence. */
+  subregion?: string | null
 }
 
 function finite(value: unknown): number | null {
@@ -44,6 +47,7 @@ export function countryPoints(
       cosine: finite(score.raw_cosine),
       scoreType: score.score_type,
       confirmed: confirmedIso === score.iso,
+      subregion: regionScopeLabel(score),
     })
   }
   return points
@@ -68,6 +72,7 @@ export function cityPoints(cities: readonly CityScore[] | undefined): GeoPoint[]
       cosine: finite(city.raw_cosine),
       scoreType: city.score_type,
       confirmed: false,
+      subregion: cityRegionLabel(city),
     })
   }
   return points

@@ -131,18 +131,33 @@ export class GeoApi {
    * Fetch representative city candidates for one country. City points are
    * ranking diagnostics, never photo GPS; an unavailable backend (404/older
    * deployment) surfaces as a normalized ApiError for the caller to fall back on.
+   *
+   * The optional `sourceIso` filters one aggregated CN region scope
+   * (CN/TW/HK/MO). Omitting it keeps the legacy merged-country request, so the
+   * third argument stays backward compatible with older deployments.
    */
-  async cities(sessionId: number, iso: string): Promise<CitiesResponse> {
+  async cities(sessionId: number, iso: string, sourceIso?: string | null): Promise<CitiesResponse> {
+    const source = typeof sourceIso === 'string' ? sourceIso.trim().toUpperCase() : ''
+    const payload: JsonRecord = source ? { iso, source_iso: source } : { iso }
     const raw = await this.request<JsonRecord>(`/api/geo/${sessionId}/cities`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ iso }),
+      body: JSON.stringify(payload),
     })
     return {
       city_scores: asArray<CitiesResponse['city_scores'][number]>(raw.city_scores),
       country_iso: typeof raw.country_iso === 'string' ? raw.country_iso : iso,
       scope: isRecord(raw.scope) ? (raw.scope as unknown as CitiesResponse['scope']) : null,
       status: typeof raw.status === 'string' ? (raw.status as CitiesResponse['status']) : 'ok',
+      clue_dimensions: Array.isArray(raw.clue_dimensions)
+        ? (raw.clue_dimensions.filter((item) => typeof item === 'string') as string[])
+        : null,
+      clue_note: typeof raw.clue_note === 'string' && raw.clue_note.trim() ? raw.clue_note.trim() : null,
+      source_iso: typeof raw.source_iso === 'string' ? raw.source_iso : null,
+      source_region: typeof raw.source_region === 'string' || isRecord(raw.source_region)
+        ? (raw.source_region as CitiesResponse['source_region']) : null,
+      source_isos: asArray<string>(raw.source_isos),
+      note: typeof raw.note === 'string' && raw.note.trim() ? raw.note.trim() : null,
     }
   }
 

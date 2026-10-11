@@ -13,7 +13,8 @@ Boost scales are deterministic and bounded, never probabilistic:
 """
 from __future__ import annotations
 
-from .engine import ReasoningEngine, CountryScore
+from .engine import ReasoningEngine, CountryScore, group_country_scores
+from .country_policy import canonical_country_iso, is_excluded, normalize_iso
 from .hypotheses import HypothesisManager, HypothesisAction
 from .clue import DIM_LABELS
 from config import MIN_CLUE_CONFIDENCE, TOP_N_HYPOTHESES
@@ -73,8 +74,12 @@ class ModelAwareEngine(ReasoningEngine):
         return origin in _RELIABLE_SOURCES or clue.source in _RELIABLE_SOURCES
 
     def _dedupe_key(self, clue) -> tuple[str, str]:
-        """Canonical (dimension, value) key so equivalent spellings count once."""
+        """Canonical key while preserving distinct regional source scopes."""
         if clue.dimension == "place_name":
+            extra = clue.extra if isinstance(clue.extra, dict) else {}
+            claimed_source = normalize_iso(extra.get("source_iso"))
+            if claimed_source:
+                return (clue.dimension, claimed_source)
             resolved = self.resolve_country_key(clue.value)
             if resolved:
                 return (clue.dimension, resolved)
@@ -140,7 +145,7 @@ class ModelAwareEngine(ReasoningEngine):
         scores = []
         for country in self.countries:
             iso = country["iso"]
-            if iso in (exclusions or []) or iso not in prior:
+            if is_excluded(exclusions, iso) or iso not in prior:
                 continue
             # Retrieval-only diagnostics: never a term in the ranking below.
             diagnostics: dict = {}
@@ -217,7 +222,11 @@ class ModelAwareEngine(ReasoningEngine):
                 fusion=fusion,
                 **diagnostics,
             ))
-        return sorted(scores, key=lambda item: (-item.score, item.iso))[:top_n]
+        # Group raw source scopes before the top-N slice. A persisted CN
+        # exclusion removes all children; a raw TW/HK/MO exclusion removes
+        # only that source region before the max aggregation.
+        grouped = group_country_scores(scores, self._country_by_iso)
+        return sorted(grouped, key=lambda item: (-item.score, item.iso))[:top_n]
 
 
 class ModelAwareHypotheses(HypothesisManager):
@@ -266,7 +275,7 @@ class ModelAwareHypotheses(HypothesisManager):
         return HypothesisAction(
             "request_clue",
             f"当前候选首位为「{top.name_zh}」，这仅是当前候选国家目录"
-            f"（{len(self.engine.countries)} 国）内的排序，不是已确认的拍摄地。{tail}",
+            f"（{len({canonical_country_iso(c['iso']) for c in self.engine.countries})} 国）内的排序，不是已确认的拍摄地。{tail}",
             {"dimensions": [lead] if lead else [], "candidates": candidates,
              "options": options, "reason": reason, "score_type": top.score_type},
         )

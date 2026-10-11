@@ -37,12 +37,29 @@ from ..services.geo_session import GeoSessionService
 from ..services.pipeline import PipelineService
 from ..services.model_gateway import StreetClipGateway
 from ..domain.geolocation.clue import dicts_to_clues
+from ..domain.geolocation import knowledge_graph as kg
+from ..domain.geolocation.country_policy import (
+    canonical_country_iso,
+    country_members,
+    is_country_member,
+    is_excluded,
+    normalize_iso,
+    region_metadata,
+    source_region_iso,
+)
 from ..services.city_catalog import CityCatalogError, load_city_index
 from ..services.city_reasoning import CityClueReasoner
 
 router = APIRouter(prefix="/geo", tags=["geo"])
 
 UPLOAD_CHUNK_BYTES = 1024 * 1024
+CITY_PUBLIC_LIMIT = 10
+_SOURCE_REGION_LABELS = {
+    "CN": "中国大陆",
+    "HK": "中国香港",
+    "MO": "中国澳门",
+    "TW": "中国台湾",
+}
 
 
 def _check_response_serializable(response: BaseModel) -> None:
@@ -157,6 +174,13 @@ def submit_feedback(
         raise HTTPException(status_code=404, detail="session not found")
 
     feedback = payload.model_dump(exclude_none=True)
+    # Confirmation is a country-level action: raw TW/HK/MO confirmations are
+    # recorded as CN. Rejections intentionally keep their raw region scope so
+    # "not Taiwan, but mainland China" can be represented.
+    if feedback.get("type") == "confirm":
+        canonical = canonical_country_iso(feedback.get("iso"))
+        if canonical:
+            feedback["iso"] = canonical
     chat.prepare_update(session_id, feedback=feedback)
     with geo.transaction():
         result = chat.handle_feedback(session_id, feedback)
@@ -194,13 +218,13 @@ def list_cities(
     settings: Settings = Depends(get_settings),
     geo: GeoSessionService = Depends(get_geo_service),
 ) -> CitiesResponse:
-    """Rank the requested country's cities for this session's own image.
+    """Rank canonical-country cities, optionally scoped to one raw source.
 
-    Read-only and stateless: it neither writes messages nor changes the country
-    ranking, so browsing another country's cities can never alter the analysis
-    or the confirmed country. Cities come from the GeoNames catalog the backend
-    validates against, and their coordinates are representative points, not the
-    photo's location.
+    Raw city rows are validated by the existing gateway contract before any
+    normalization or clue rerank. A canonical query (for example ``CN``)
+    merges the member scopes (CN/TW/HK/MO) deterministically; an explicit
+    ``source_iso`` narrows the query to one raw scope. A legacy request with
+    ``iso=TW`` still returns raw Taiwan cities but presents them under CN.
     """
     geo_session = geo.get(session_id)
     if geo_session is None:
@@ -211,47 +235,202 @@ def list_cities(
         raise HTTPException(status_code=404, detail="image not found")
 
     gateway = StreetClipGateway(settings)
-    if payload.iso not in gateway.country_isos():
+    available_isos = gateway.country_isos()
+
+    requested_raw = normalize_iso(payload.iso)
+    requested_country = canonical_country_iso(requested_raw)
+    if not requested_raw or not requested_country or requested_country not in available_isos:
         raise HTTPException(status_code=422, detail="unknown country")
 
-    result = gateway.rank_cities(image_path, payload.iso)
-    if result is None:
-        return CitiesResponse(city_scores=[], country_iso=payload.iso,
-                              scope=None, status="unavailable")
+    explicit_source = normalize_iso(payload.source_iso)
+    legacy_region = source_region_iso(requested_raw)
+    if explicit_source:
+        if not is_country_member(requested_country, explicit_source):
+            raise HTTPException(status_code=422, detail="source_iso is not a member of the requested country")
+        if explicit_source not in available_isos:
+            raise HTTPException(status_code=422, detail="unknown source_iso")
+        scopes = [explicit_source]
+    elif legacy_region:
+        # Legacy isoTW remains a useful raw scoped query, but the public
+        # country identity below is canonical CN.
+        scopes = [legacy_region] if legacy_region in available_isos else []
+    else:
+        scopes = [
+            member for member in country_members(requested_country)
+            if member in available_isos
+        ]
+    persisted_exclusions = list(geo_session.exclusions or [])
+    excluded_scopes = [scope for scope in scopes if is_excluded(persisted_exclusions, scope)]
+    scopes = [scope for scope in scopes if scope not in excluded_scopes]
+    if not scopes:
+        # An excluded region/country is an honest empty result, not a provider
+        # outage. Keep metadata so the frontend can explain the skipped scope.
+        excluded_single = excluded_scopes[0] if len(excluded_scopes) == 1 else None
+        excluded_region = (
+            region_metadata(excluded_single, kg.get_by_iso(excluded_single))
+            if excluded_single else None
+        )
+        if excluded_single:
+            note = f"{_SOURCE_REGION_LABELS.get(excluded_single, excluded_single)}已被排除，未检索城市候选。"
+        elif excluded_scopes:
+            note = "所选范围已被排除，未检索城市候选。"
+        else:
+            note = "没有可检索的城市范围。"
+        response = CitiesResponse(
+            city_scores=[],
+            country_iso=requested_country,
+            source_iso=excluded_single,
+            source_region=excluded_region,
+            source_isos=[],
+            scope=None,
+            status="no_cities",
+            note=note,
+        )
+        _check_response_serializable(response)
+        return response
 
-    city_scores = result["city_scores"]
-    clue_dimensions = None
-    clue_note = None
-    if city_scores:
-        # Optional clue rerank over already-validated rows: read-only, never
-        # adds rows, and degrades to the untouched gateway payload.
-        try:
-            catalog = load_city_index(settings.cities_path)
-        except CityCatalogError:
-            catalog = None
-        if catalog is not None:
+    try:
+        catalog = load_city_index(settings.cities_path)
+    except CityCatalogError:
+        catalog = None
+    try:
+        session_clues = dicts_to_clues(geo_session.clues)
+    except (KeyError, TypeError, ValueError):
+        session_clues = []
+
+    rows_by_id: dict[str, dict] = {}
+    successful_sources: list[str] = []
+    failed_sources: list[str] = []
+    empty_sources: list[str] = []
+    clue_dimensions: set[str] = set()
+    clue_notes: list[str] = []
+    limits: list[int] = []
+    revisions: list[str] = []
+    considered = 0
+
+    for source_iso in scopes:
+        result = gateway.rank_cities(image_path, source_iso)
+        if result is None:
+            # Partial provider failure: keep any other source's rows instead
+            # of turning canonical China into a false empty result.
+            failed_sources.append(source_iso)
+            continue
+
+        successful_sources.append(source_iso)
+        scope = result.get("scope") if isinstance(result.get("scope"), dict) else {}
+        limit = scope.get("city_limit_per_country")
+        if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0:
+            limits.append(limit)
+        revision = scope.get("city_catalog_revision")
+        if isinstance(revision, str) and revision:
+            revisions.append(revision)
+        cities_considered = scope.get("cities_considered")
+        if isinstance(cities_considered, int) and not isinstance(cities_considered, bool):
+            considered += max(0, cities_considered)
+
+        city_scores = list(result.get("city_scores") or [])
+        if not city_scores:
+            empty_sources.append(source_iso)
+            continue
+
+        # Rerank over the validated raw scope first: this retains Taiwan's
+        # native city aliases and never operates on normalized CN rows.
+        if catalog is not None and session_clues:
             try:
-                session_clues = dicts_to_clues(geo_session.clues)
                 reranked = CityClueReasoner(catalog).rerank(
-                    city_scores, session_clues, iso=payload.iso
+                    city_scores, session_clues, iso=source_iso
                 )
             except (KeyError, TypeError, ValueError):
                 reranked = None
             if reranked is not None:
                 city_scores = reranked.city_scores
-                clue_dimensions = list(reranked.clue_dimensions) or None
-                clue_note = reranked.coverage_note
+                clue_dimensions.update(reranked.clue_dimensions)
+                if reranked.coverage_note:
+                    clue_notes.append(reranked.coverage_note)
+
+        region = region_metadata(source_iso, kg.get_by_iso(source_iso))
+        for row in city_scores:
+            if not isinstance(row, dict):
+                continue
+            city_id = row.get("city_id")
+            if not isinstance(city_id, str) or not city_id:
+                continue
+            normalized = {
+                **row,
+                "iso": requested_country,
+                "country_iso": requested_country,
+                "source_iso": source_iso,
+                "source_region": region,
+            }
+            current = rows_by_id.get(city_id)
+            if current is None or _city_row_order(normalized) < _city_row_order(current):
+                rows_by_id[city_id] = normalized
+
+    city_scores = sorted(rows_by_id.values(), key=_city_row_order)[:CITY_PUBLIC_LIMIT]
+    if city_scores:
+        status = "ok"
+    elif successful_sources or empty_sources:
+        status = "no_cities"
+    else:
+        status = "unavailable"
+
+    scope_payload = None
+    if successful_sources:
+        scope_payload = {
+            "city_limit_per_country": max(limits) if limits else None,
+            "city_catalog_revision": revisions[0] if revisions else None,
+            "cities_considered": considered,
+        }
+
+    single_source = scopes[0] if len(scopes) == 1 else None
+    source_region = (
+        region_metadata(single_source, kg.get_by_iso(single_source))
+        if single_source else None
+    )
+
+    notes: list[str] = []
+    if excluded_scopes:
+        notes.append("已跳过排除范围：" + "、".join(
+            _SOURCE_REGION_LABELS.get(scope, scope) for scope in excluded_scopes
+        ))
+    if failed_sources:
+        notes.append("以下地区城市模型暂不可用：" + "、".join(
+            _SOURCE_REGION_LABELS.get(scope, scope) for scope in failed_sources
+        ))
+    if empty_sources and len(scopes) > 1:
+        notes.append("以下地区没有符合目录的城市候选：" + "、".join(
+            _SOURCE_REGION_LABELS.get(scope, scope) for scope in empty_sources
+        ))
+    if notes and city_scores:
+        notes.append("已保留可用地区的结果。")
+    if len(scopes) > 1 and scope_payload and scope_payload["city_limit_per_country"]:
+        notes.append(f"每个地区最多检索 {scope_payload['city_limit_per_country']} 个城市。")
+    if status == "unavailable":
+        notes.append("城市模型暂不可用，未返回可用地区结果。")
 
     response = CitiesResponse(
         city_scores=city_scores,
-        country_iso=result["country_iso"],
-        scope=result["scope"],
-        status=result["status"],
-        clue_dimensions=clue_dimensions,
-        clue_note=clue_note,
+        country_iso=requested_country,
+        source_iso=single_source,
+        source_region=source_region,
+        source_isos=successful_sources,
+        scope=scope_payload,
+        status=status,
+        note="；".join(dict.fromkeys(notes)) if notes else None,
+        clue_dimensions=sorted(clue_dimensions) or None,
+        clue_note="；".join(dict.fromkeys(clue_notes)) if clue_notes else None,
     )
     _check_response_serializable(response)
     return response
+
+
+def _city_row_order(row: dict) -> tuple[float, str]:
+    """Deterministic max-by-score order for merged validated city rows."""
+    try:
+        score = float(row.get("score") or 0.0)
+    except (TypeError, ValueError):
+        score = 0.0
+    return (-score, str(row.get("city_id") or ""))
 
 
 def _crop_bounds(x_ratio: float, y_ratio: float, width: int, height: int):

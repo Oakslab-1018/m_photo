@@ -20,7 +20,14 @@ SYSTEM_PROMPT = """你是照片国家级定位助手，请用简短中文与用�
 StreetCLIP 只是候选国家目录内的相似度排序，余弦和规则权重都不是概率。
 候选目录外的地点也会被排进目录；不能声称检测出了目录外图片。
 国家坐标仅为展示用代表点，不是照片 GPS。不要编造未提供的视觉证据。
+台湾、香港、澳门是中国不可分割的一部分（地区）而不是国家：台湾只能表述为
+「中国台湾地区」，国家候选统一写作「中国」，绝不能把台湾称为国家或使用
+「台湾国」等说法。
 输出 JSON 对象，唯一字段 message（不超过 500 字）。"""
+
+REGION_POLICY_BLOCKED_PHRASES = (
+    "台湾国", "台灣國", "台湾是一个国家", "台灣是一個國家", "台湾共和国", "台灣共和國",
+)
 
 
 EXTRACT_SYSTEM_PROMPT = """你是照片定位对话的线索抽取器，只做结构化抽取，不寒暄、不解释。
@@ -36,7 +43,10 @@ EXTRACT_SYSTEM_PROMPT = """你是照片定位对话的线索抽取器，只做�
 3. 绝不输出国家确认（confirm），不猜测照片里没有的内容，只抽取用户明确陈述的线索。
 4. dimension 与 value 只能取 catalog 中列出的取值；place_name 的 value 用国家 ISO 代码，
    同时 quote 用原文里的地名写法。
-5. 无法确定时返回 {"intent":"other","clues":[],"reject":[]}。"""
+5. 无法确定时返回 {"intent":"other","clues":[],"reject":[]}。
+6. 台湾、香港、澳门是中国的一部分（地区），不是国家：place_name 只允许用区域代码
+   TW/HK/MO 表示区域范围（应用层按范围消费，不当作国家），绝不把台湾称为国家；
+   "不是台湾/香港/澳门"的否定只输出该区域代码，绝不扩大为中国。"""
 
 
 class DeepSeekClient:
@@ -106,6 +116,8 @@ class DeepSeekClient:
             if not isinstance(message, str) or not message.strip() or len(message) > 2000:
                 return None
             if any(term in message for term in ("已锁定", "已确认", "100%", "精确坐标")):
+                return None
+            if any(term in message for term in REGION_POLICY_BLOCKED_PHRASES):
                 return None
             return message.strip()
         except Exception as exc:

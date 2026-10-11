@@ -72,6 +72,11 @@ class CountryScoreModel(BaseModel):
     lng: float = 0.0
     # Optional non-probabilistic fusion breakdown (full cosine + crop mean + clue boost).
     fusion: dict[str, Any] | None = None
+    # Grouped-country provenance. These fields stay absent for ordinary
+    # single-source countries so existing response shapes are preserved.
+    parent_iso: str | None = None
+    source_regions: list[dict[str, Any]] | None = None
+    is_grouped: bool = False
     # ``reference_matches`` / ``reference_regions`` / ``reference_cosine`` are
     # deliberately *not* declared: they must stay absent from the JSON unless a
     # labeled reference index is configured, and ``extra="allow"`` passes them
@@ -80,6 +85,17 @@ class CountryScoreModel(BaseModel):
     # indistinguishable from "configured, nothing matched".
 
     model_config = {"extra": "allow"}
+
+    @model_serializer(mode="wrap")
+    def _drop_absent_group_metadata(self, handler):
+        data = handler(self)
+        if data.get("parent_iso") is None:
+            data.pop("parent_iso", None)
+        if data.get("source_regions") is None:
+            data.pop("source_regions", None)
+        if data.get("is_grouped") is not True:
+            data.pop("is_grouped", None)
+        return data
 
 
 class ActionModel(BaseModel):
@@ -160,9 +176,10 @@ class MessagesResponse(BaseModel):
 
 
 class CitiesRequest(BaseModel):
-    """Country whose city candidates are requested for one session's image."""
+    """Canonical country plus optional raw source-region scope for cities."""
 
     iso: str = Field(min_length=2, max_length=2)
+    source_iso: str | None = Field(default=None, min_length=2, max_length=2)
 
     @field_validator("iso")
     @classmethod
@@ -172,13 +189,28 @@ class CitiesRequest(BaseModel):
             raise ValueError("iso must be a two-letter country code")
         return normalised
 
+    @field_validator("source_iso")
+    @classmethod
+    def _normalise_source_iso(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalised = value.strip().upper()
+        if len(normalised) != 2 or not normalised.isalpha():
+            raise ValueError("source_iso must be a two-letter source code")
+        return normalised
+
 
 class CityScoreModel(BaseModel):
     """One catalog city candidate; representative point, never photo GPS."""
 
     # Serialised as a decimal string: the UI keys map markers and list rows on it.
     city_id: str
+    # Public country identity is canonical (for example CN for a raw TW city).
+    # ``source_iso``/``source_region`` retain the validated catalog provenance.
     iso: str
+    country_iso: str | None = None
+    source_iso: str | None = None
+    source_region: dict[str, Any] | None = None
     name: str
     region: str = ""
     lat: float
@@ -198,7 +230,7 @@ class CityScoreModel(BaseModel):
     @model_serializer(mode="wrap")
     def _drop_absent_clue_evidence(self, handler):
         data = handler(self)
-        for key in ("matched_clues", "fusion"):
+        for key in ("country_iso", "source_iso", "source_region", "matched_clues", "fusion"):
             if data.get(key) is None:
                 data.pop(key, None)
         return data
@@ -221,8 +253,16 @@ class CitiesResponse(BaseModel):
 
     city_scores: list[CityScoreModel] = Field(default_factory=list)
     country_iso: str
+    # Raw source scope when the response covers one region; absent for merged
+    # canonical queries (for example CN with CN/TW/HK/MO scopes).
+    source_iso: str | None = None
+    source_region: dict[str, Any] | None = None
+    source_isos: list[str] = Field(default_factory=list)
     scope: CityScopeModel | None = None
     status: Literal["ok", "no_cities", "unavailable"]
+    # Honest partial-coverage note, e.g. when one scoped provider call failed
+    # while another returned usable rows.
+    note: str | None = None
     # Present only when session clues actually changed a returned row, or when
     # exact evidence matched a catalog city outside the returned rows (then
     # ``clue_note`` explains it was *not* scored). Both keys are omitted when
@@ -233,9 +273,11 @@ class CitiesResponse(BaseModel):
     @model_serializer(mode="wrap")
     def _drop_absent_city_clue_evidence(self, handler):
         data = handler(self)
-        for key in ("clue_dimensions", "clue_note"):
+        for key in ("source_iso", "source_region", "note", "clue_dimensions", "clue_note"):
             if data.get(key) is None:
                 data.pop(key, None)
+        if not data.get("source_isos"):
+            data.pop("source_isos", None)
         return data
 
 

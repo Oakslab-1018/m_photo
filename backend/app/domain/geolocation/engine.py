@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import json
 import unicodedata
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
@@ -35,6 +35,13 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 from config import BASE_DIR, MIN_CLUE_CONFIDENCE, TOP_N_HYPOTHESES
 from .clue import CATALOG_DIMENSIONS, Clue
 from . import knowledge_graph as kg
+from .country_policy import (
+    canonical_country_iso,
+    country_members,
+    is_excluded,
+    normalize_iso,
+    source_region_iso,
+)
 
 
 LANGUAGE_WEIGHT = 2.0  # 语言线索权重更高
@@ -290,6 +297,11 @@ class CountryScore:
     reference_matches: Optional[List[Dict[str, Any]]] = None
     reference_regions: Optional[List[Dict[str, Any]]] = None
     reference_cosine: Optional[float] = None
+    # Present only when a policy group was formed from subordinate source
+    # scopes.  The public ``iso`` remains the canonical product country.
+    parent_iso: Optional[str] = None
+    source_regions: Optional[List[Dict[str, Any]]] = None
+    is_grouped: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         result = {
@@ -305,6 +317,12 @@ class CountryScore:
         }
         if self.fusion:
             result["fusion"] = self.fusion
+        if self.parent_iso:
+            result["parent_iso"] = self.parent_iso
+        if self.source_regions is not None:
+            result["source_regions"] = self.source_regions
+        if self.is_grouped:
+            result["is_grouped"] = True
         if self.reference_matches is not None or self.reference_regions is not None:
             result["reference_matches"] = self.reference_matches or []
             result["reference_regions"] = self.reference_regions or []
@@ -312,11 +330,183 @@ class CountryScore:
         return result
 
 
+def _source_region_record(score: CountryScore, parent_iso: str) -> Dict[str, Any]:
+    """Return one source-scope record for grouped candidate metadata."""
+    record: Dict[str, Any] = {
+        "source_iso": score.iso,
+        "parent_iso": parent_iso,
+        "name": score.name,
+        "name_zh": score.name_zh,
+        "score": round(score.score, 4),
+        "raw_cosine": score.raw_cosine,
+        "score_type": score.score_type,
+    }
+    if score.matched_clues:
+        record["matched_clues"] = score.matched_clues
+    if score.fusion:
+        record["fusion"] = score.fusion
+    return record
+
+
+def _merge_group_clues(members: List[CountryScore], parent_iso: str) -> List[Dict[str, Any]]:
+    """Merge member clue diagnostics without changing their scoring semantics."""
+    merged: List[Dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for member in members:
+        for item in member.matched_clues:
+            if not isinstance(item, dict):
+                continue
+            row = dict(item)
+            row.setdefault("source_iso", member.iso)
+            row.setdefault("parent_iso", parent_iso)
+            key = (
+                row.get("source_iso"),
+                row.get("dimension"),
+                row.get("value"),
+                row.get("evidence"),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(row)
+    return merged
+
+
+def _merge_group_reference(members: List[CountryScore]) -> Dict[str, Any]:
+    """Merge retrieval-only reference diagnostics for a grouped candidate."""
+    has_matches = any(member.reference_matches is not None for member in members)
+    has_regions = any(member.reference_regions is not None for member in members)
+    if not has_matches and not has_regions:
+        return {}
+
+    matches: List[Dict[str, Any]] = []
+    regions: List[Dict[str, Any]] = []
+    seen_matches: set[tuple[Any, ...]] = set()
+    seen_regions: set[tuple[Any, ...]] = set()
+    for member in members:
+        for row in member.reference_matches or []:
+            if not isinstance(row, dict):
+                continue
+            key = (row.get("reference_id"), row.get("iso"), row.get("region"), row.get("place"))
+            if key in seen_matches:
+                continue
+            seen_matches.add(key)
+            matches.append(row)
+        for row in member.reference_regions or []:
+            if not isinstance(row, dict):
+                continue
+            key = (row.get("iso"), row.get("region"), row.get("city"))
+            if key in seen_regions:
+                continue
+            seen_regions.add(key)
+            regions.append(row)
+
+    matches.sort(
+        key=lambda row: (-float(row.get("raw_cosine") or 0.0), str(row.get("reference_id") or ""))
+    )
+    regions.sort(
+        key=lambda row: (
+            -float(row.get("raw_cosine") or 0.0),
+            str(row.get("iso") or ""),
+            str(row.get("region") or ""),
+            str(row.get("city") or ""),
+        )
+    )
+    cosine = max(
+        (float(row.get("raw_cosine")) for row in (regions or matches)
+         if isinstance(row.get("raw_cosine"), (int, float))),
+        default=None,
+    )
+    return {
+        "reference_matches": matches if has_matches else None,
+        "reference_regions": regions if has_regions else None,
+        "reference_cosine": cosine,
+    }
+
+
+def group_country_scores(
+    scores: Iterable[CountryScore],
+    countries_by_iso: Mapping[str, Mapping[str, Any]] | None = None,
+) -> List[CountryScore]:
+    """Group raw source scores into canonical product countries.
+
+    Grouping happens before top-N slicing and normalization.  The group score is
+    the maximum member score: summing members would double-count related
+    Taiwan/mainland prompts, while max preserves every source scope's actual
+    evidence in ``source_regions`` and ``fusion.members``.
+    """
+    grouped: Dict[str, List[CountryScore]] = {}
+    for score in scores:
+        canonical = canonical_country_iso(score.iso)
+        if not canonical:
+            continue
+        grouped.setdefault(canonical, []).append(score)
+
+    result: List[CountryScore] = []
+    lookup = countries_by_iso or {}
+    for canonical, members in grouped.items():
+        members = sorted(members, key=lambda item: (-item.score, item.iso))
+        best = members[0]
+        policy_members = country_members(canonical)
+        needs_group = len(members) > 1 or best.iso != canonical or policy_members != (canonical,)
+        if not needs_group:
+            result.append(best)
+            continue
+
+        root = lookup.get(canonical) or {}
+        name = str(root.get("name") or best.name)
+        name_zh = str(root.get("name_zh") or best.name_zh)
+        lat = root.get("lat", best.lat)
+        lng = root.get("lng", best.lng)
+        source_regions = [
+            _source_region_record(member, canonical)
+            for member in members
+        ]
+        fusion = dict(best.fusion or {})
+        fusion.update({
+            "aggregation": "max",
+            "group_iso": canonical,
+            "member_count": len(members),
+            "members": [
+                {
+                    "source_iso": member.iso,
+                    "score": round(member.score, 6),
+                    "raw_cosine": member.raw_cosine,
+                    "score_type": member.score_type,
+                }
+                for member in members
+            ],
+        })
+        reference = _merge_group_reference(members)
+        result.append(replace(
+            best,
+            iso=canonical,
+            name=name,
+            name_zh=name_zh,
+            lat=float(lat) if isinstance(lat, (int, float)) else 0.0,
+            lng=float(lng) if isinstance(lng, (int, float)) else 0.0,
+            matched_clues=_merge_group_clues(members, canonical),
+            fusion=fusion,
+            parent_iso=None,
+            source_regions=source_regions,
+            is_grouped=True,
+            reference_matches=reference.get("reference_matches"),
+            reference_regions=reference.get("reference_regions"),
+            reference_cosine=reference.get("reference_cosine"),
+        ))
+
+    return sorted(result, key=lambda item: (-item.score, item.iso))
+
+
 class ReasoningEngine:
     """线索 -> 候选国家评分。"""
 
     def __init__(self):
         self.countries = kg.load_countries()
+        self._country_by_iso = {
+            c["iso"]: c for c in self.countries
+            if isinstance(c.get("iso"), str)
+        }
         self._iso_set = {c["iso"] for c in self.countries if isinstance(c.get("iso"), str)}
         self._iso3_index = {
             str(c["iso3"]).upper(): c["iso"]
@@ -373,7 +563,7 @@ class ReasoningEngine:
     def _score_country(self, country: Dict[str, Any], clues: List[Clue],
                        exclusions: List[str]) -> Optional[CountryScore]:
         iso = country["iso"]
-        if iso in exclusions:
+        if is_excluded(exclusions, iso):
             return None
 
         features = country.get("features", {})
@@ -407,18 +597,47 @@ class ReasoningEngine:
                         and value.strip().lower() == side.strip().lower()):
                     matched_value = value
             elif dim == "place_name":
+                # Validated regional provenance may arrive with a canonical
+                # value (for example value=CN, source_iso=TW) while the raw
+                # source row is TW. Scope the evidence to that source row
+                # before grouping so it cannot boost mainland CN and so an
+                # exclusion of TW neutralizes the evidence.
+                claimed_source = normalize_iso(extra.get("source_iso"))
+                if claimed_source and claimed_source not in self._iso_set:
+                    continue
+                if claimed_source and claimed_source != iso:
+                    continue
+
                 resolved = self.resolve_place(value)
-                if resolved is not None and resolved.iso == iso:
+                if resolved is not None and claimed_source:
+                    # A canonical country value is allowed for a regional
+                    # source only when it resolves to the same parent group.
+                    # A different region source is never cross-credited.
+                    if resolved.iso != claimed_source:
+                        if source_region_iso(resolved.iso):
+                            resolved = None
+                        elif canonical_country_iso(resolved.iso) != canonical_country_iso(claimed_source):
+                            resolved = None
+                elif resolved is not None and resolved.iso != iso:
+                    resolved = None
+
+                if resolved is not None:
                     gain_factor = resolved.confidence_factor
                     provenance = {"resolution": resolved.resolution}
+                    if claimed_source:
+                        provenance["source_iso"] = claimed_source
+                        parent = canonical_country_iso(claimed_source)
+                        if parent:
+                            provenance["parent_iso"] = parent
                     if resolved.city_name:
                         provenance["city_name"] = resolved.city_name
                     if resolved.city_id:
                         provenance["city_id"] = resolved.city_id
                     # 外部声明的城市必须由目录重新核实，不信任 extra 本身。
-                    claimed_iso = extra.get("catalog_iso")
-                    if resolved is not None and claimed_iso is not None:
-                        if str(claimed_iso).strip().upper() != iso:
+                    claimed_iso = normalize_iso(extra.get("catalog_iso"))
+                    if claimed_iso:
+                        if (claimed_iso != resolved.iso
+                                and canonical_country_iso(claimed_iso) != canonical_country_iso(resolved.iso)):
                             resolved = None
                     claimed_name = extra.get("city_name")
                     if isinstance(claimed_name, str) and claimed_name.strip():
@@ -428,6 +647,11 @@ class ReasoningEngine:
                         else:
                             gain_factor = min(gain_factor, recheck.confidence_factor)
                             provenance = {"resolution": recheck.resolution}
+                            if claimed_source:
+                                provenance["source_iso"] = claimed_source
+                                parent = canonical_country_iso(claimed_source)
+                                if parent:
+                                    provenance["parent_iso"] = parent
                             if recheck.city_name:
                                 provenance["city_name"] = recheck.city_name
                             if recheck.city_id:
@@ -499,13 +723,16 @@ class ReasoningEngine:
               exclusions: Optional[List[str]] = None,
               top_n: int = TOP_N_HYPOTHESES) -> List[CountryScore]:
         exclusions = exclusions or []
-        scores: List[CountryScore] = []
+        raw_scores: List[CountryScore] = []
         for country in self.countries:
             cs = self._score_country(country, clues, exclusions)
             if cs is not None:
-                scores.append(cs)
+                raw_scores.append(cs)
 
-        scores.sort(key=lambda x: x.score, reverse=True)
+        # Group source scopes before normalization and top-N slicing. A raw
+        # TW/HK/MO exclusion removes only that member; canonical CN removes
+        # the complete product country.
+        scores = group_country_scores(raw_scores, self._country_by_iso)
         # 归一化到 [0,1] 便于展示
         if scores:
             max_score = scores[0].score
@@ -533,7 +760,10 @@ __all__ = [
     "LATIN_JOINER_STOPWORDS",
     "build_city_name_index",
     "build_country_name_index",
+    "canonical_country_iso",
+    "country_members",
     "find_exact_phrase",
+    "group_country_scores",
     "find_place_phrase",
     "is_negated_prefix",
     "load_city_name_index",

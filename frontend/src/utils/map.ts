@@ -55,6 +55,11 @@ export function scoreLabel(score: CountryScore): string {
     score.raw_cosine != null && Number.isFinite(score.raw_cosine) ? score.raw_cosine : null
   const composite = Number.isFinite(score.score) ? score.score : 0
 
+  if (score.is_grouped || score.fusion?.aggregation === 'max') {
+    return rawCosine != null
+      ? `地区汇总排序 ${composite.toFixed(3)} · 来源余弦 ${rawCosine.toFixed(3)}（非概率）`
+      : `地区汇总权重 ${composite.toFixed(3)}（非概率）`
+  }
   if (score.score_type === 'hybrid_rank') {
     // Composite fusion score must never be presented as a lone cosine/probability.
     return rawCosine != null
