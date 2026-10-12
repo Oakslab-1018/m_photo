@@ -26,7 +26,12 @@ from .cities import (
     select_cities,
 )
 from .config import MODEL_ID, MODEL_REVISION, Settings
-from .predictor import Predictor, PredictorUnavailableError, StreetClipPredictor
+from .predictor import (
+    Predictor,
+    PredictorUnavailableError,
+    SceneAnalysisUnavailableError,
+    StreetClipPredictor,
+)
 from .schema import (
     DecodeError,
     EmptyImageError,
@@ -35,6 +40,8 @@ from .schema import (
     ImageValidationError,
     InvalidCountryError,
     build_city_prediction,
+    build_scene_analysis,
+    compute_image_sha256,
     decode_image_bytes,
     validate_image_bytes,
 )
@@ -308,6 +315,54 @@ class StreetClipService:
                 result["reference"] = sidecar
         return result
 
+    def analyze_region(self, payload: bytes) -> dict[str, Any]:
+        """Run bounded zero-shot scene hypotheses with the shared encoder.
+
+        The uploaded image is validated and EXIF-orientation normalized once
+        before the inference critical section. The same ``_predict_lock`` used
+        by country and city requests then wraps the shared image embedding and
+        cached text-prototype scoring. A predictor without the scene capability
+        is reported as unavailable rather than scored with fabricated output.
+        """
+        validate_image_bytes(payload, max_bytes=self.settings.max_upload_bytes)
+        if self._predictor is None or not self._predictor.ready:
+            raise SceneAnalysisUnavailableError(
+                "scene analysis requires a loaded StreetCLIP model"
+            )
+
+        encode_image = getattr(self._predictor, "encode_image", None)
+        scene_text_scores = getattr(self._predictor, "scene_text_scores", None)
+        if not callable(encode_image) or not callable(scene_text_scores):
+            raise SceneAnalysisUnavailableError(
+                "scene analysis capability is not available for this predictor"
+            )
+
+        image = decode_image_bytes(payload)
+        try:
+            with self._predict_lock:
+                vector = encode_image(image)
+                groups = scene_text_scores(vector)
+        except SceneAnalysisUnavailableError:
+            raise
+        except PredictorUnavailableError as exc:
+            raise SceneAnalysisUnavailableError(
+                f"scene analysis failed: {exc}"
+            ) from exc
+        except Exception as exc:  # pragma: no cover - delegated capability boundary
+            raise SceneAnalysisUnavailableError(
+                f"scene analysis failed: {type(exc).__name__}"
+            ) from exc
+
+        try:
+            return build_scene_analysis(
+                image_sha256=compute_image_sha256(payload),
+                scene_groups=groups,
+            ).as_dict()
+        except (TypeError, ValueError) as exc:
+            raise SceneAnalysisUnavailableError(
+                f"scene analysis returned invalid bounded results: {exc}"
+            ) from exc
+
     def predict_cities(self, country_iso: str, payload: bytes) -> dict[str, Any]:
         """Rank the selected country's top cities by real image/text CLIP.
 
@@ -385,6 +440,7 @@ __all__ = [
     "ImageTooLargeError",
     "ImageValidationError",
     "InvalidCountryError",
+    "SceneAnalysisUnavailableError",
     "StreetClipService",
 ]
 

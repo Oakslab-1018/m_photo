@@ -26,6 +26,7 @@ single RapidOCR session is never shared across concurrent analyzer threads.
 from __future__ import annotations
 
 import logging
+import math
 import re
 import threading
 from dataclasses import dataclass, field
@@ -133,7 +134,7 @@ class OCRLine:
     model_version: str = PPOCR_VERSION
 
     def to_extra(self) -> Dict[str, Any]:
-        return {
+        extra: Dict[str, Any] = {
             # ``origin_source`` is the clue source ('ocr'); ``provider`` names
             # the concrete engine so point_click fusion keeps provenance.
             "origin_source": "ocr",
@@ -141,8 +142,6 @@ class OCRLine:
             # Lines are already filtered by the provider's text-score floor, so
             # they may be consumed as reliable OCR evidence by fusion.
             "reliable": True,
-            "bbox": self.bbox,
-            "quad": self.bbox,
             "line_confidence": self.confidence,
             "det_model": self.det_model,
             "rec_model": self.rec_model,
@@ -150,6 +149,12 @@ class OCRLine:
             "model_type": self.model_type,
             "model_version": self.model_version,
         }
+        # Invalid/zero-area provider boxes are omitted rather than represented
+        # by a fabricated all-zero quad.
+        if _normalize_bbox(self.bbox):
+            extra["bbox"] = [list(point) for point in self.bbox]
+            extra["quad"] = [list(point) for point in self.bbox]
+        return extra
 
 
 @dataclass
@@ -169,6 +174,8 @@ class OCRStatus:
         return {
             "provider": self.provider,
             "state": self.state,
+            "enabled": self.provider != MOCK_PROVIDER,
+            "available": self.provider != MOCK_PROVIDER and self.state == "ok",
             "engine": self.engine,
             "model_version": self.model_version,
             "model_type": self.model_type,
@@ -364,13 +371,19 @@ class RapidOCREngine:
         identity = self.model_identity()
         lines: List[OCRLine] = []
         for record in records or ():
+            if not isinstance(record, dict):
+                continue
             text = str(record.get("txt") or "").strip()
             if not text:
                 continue
             try:
                 confidence = float(record.get("score", 0.0))
             except (TypeError, ValueError):
-                confidence = 0.0
+                continue
+            if not math.isfinite(confidence) or confidence < self.min_text_score:
+                # Enforce the configured floor after provider parsing too: a
+                # custom/older provider must not bypass Global.text_score.
+                continue
             confidence = max(0.0, min(1.0, confidence))
             bbox = _normalize_bbox(record.get("box"))
             lines.append(
@@ -380,19 +393,25 @@ class RapidOCREngine:
 
 
 def _normalize_bbox(box: Any) -> List[List[float]]:
-    """Coerce a RapidOCR quad box into four ``[x, y]`` points."""
+    """Coerce a RapidOCR quad box into four finite, non-zero-area points."""
     points: List[List[float]] = []
     if box is not None:
         for point in box:
             try:
                 x, y = float(point[0]), float(point[1])
             except (TypeError, IndexError, ValueError):
-                continue
+                return []
+            if not math.isfinite(x) or not math.isfinite(y):
+                return []
             points.append([x, y])
-    if len(points) >= 4:
-        return points[:4]
-    # Degenerate fallback: a zero-area box keeps the schema stable.
-    return [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0]]
+    if len(points) != 4:
+        return []
+    area = abs(sum(
+        points[index][0] * points[(index + 1) % 4][1]
+        - points[(index + 1) % 4][0] * points[index][1]
+        for index in range(4)
+    )) / 2.0
+    return points if area > 1e-6 else []
 
 
 class OCRAnalyzer(BaseAnalyzer):
@@ -496,7 +515,7 @@ class OCRAnalyzer(BaseAnalyzer):
             return self._fail("unavailable", f"unknown OCR provider: {self.provider!r}")
 
         try:
-            lines = self._engine.recognize(image_path)
+            lines = self._filter_lines(self._engine.recognize(image_path))
         except _EngineUnavailable as exc:
             return self._fail("unavailable", str(exc))
         except _InferenceFailed as exc:
@@ -524,6 +543,25 @@ class OCRAnalyzer(BaseAnalyzer):
                 )
             )
         return clues
+
+    def _filter_lines(self, lines: Sequence[OCRLine]) -> List[OCRLine]:
+        """Apply the score floor to provider output, including injected engines."""
+        accepted: List[OCRLine] = []
+        for line in lines or ():
+            if not isinstance(line, OCRLine):
+                continue
+            text = str(line.text or "").strip()
+            try:
+                confidence = float(line.confidence)
+            except (TypeError, ValueError):
+                continue
+            if not text or not math.isfinite(confidence) or confidence < self.min_text_score:
+                continue
+            line.text = text
+            line.confidence = max(0.0, min(1.0, confidence))
+            line.bbox = _normalize_bbox(line.bbox)
+            accepted.append(line)
+        return accepted
 
     def analyze_lines(self, image_path: str) -> Tuple[List[Clue], List[OCRLine]]:
         """Return both clues and raw :class:`OCRLine` objects (used by pipeline)."""

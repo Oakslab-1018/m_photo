@@ -30,6 +30,35 @@ SEMANTIC_BOOST_CAP = 0.35
 _RELIABLE_SOURCES = {"ocr", "text_language"}
 
 
+def _crop_region_identity(region: dict):
+    """Identity used to keep one crop vote per ROI, not per repeated call."""
+    region_id = region.get("region_id")
+    if isinstance(region_id, str) and region_id:
+        return ("region_id", region_id)
+    bbox = region.get("bbox_norm")
+    if isinstance(bbox, dict):
+        try:
+            return (
+                "bbox_norm",
+                round(float(bbox["x"]), 6),
+                round(float(bbox["y"]), 6),
+                round(float(bbox["w"]), 6),
+                round(float(bbox["h"]), 6),
+                str(region.get("purpose") or ""),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+    try:
+        return (
+            "legacy_click",
+            round(float(region["x"]), 6),
+            round(float(region["y"]), 6),
+            int(region["size"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def _reference_by_iso(reference: dict) -> tuple[dict[str, list], dict[str, list]]:
     """Group a validated reference sidecar into ``(matches, regions)`` per ISO.
 
@@ -116,10 +145,19 @@ class ModelAwareEngine(ReasoningEngine):
         return [best[key] for key in sorted(best)]
 
     def _crop_means(self, prior: dict) -> dict[str, float]:
-        """Mean unique crop cosine per country from validated crop evidence."""
-        values: dict[str, list[float]] = {}
+        """Per-region crop means, then one vote per region for each country."""
+        region_values: dict[tuple, dict[str, list[float]]] = {}
         for crop in self.evidence.get("crops") or []:
             if not isinstance(crop, dict):
+                continue
+            region = crop.get("region") if isinstance(crop.get("region"), dict) else {}
+            if region.get("ranking_applied") is False:
+                continue
+            purpose = region.get("purpose")
+            if purpose is not None and purpose not in {"auto", "scene"}:
+                continue
+            key = _crop_region_identity(region)
+            if key is None:
                 continue
             for row in crop.get("rankings") or []:
                 if not isinstance(row, dict):
@@ -128,16 +166,42 @@ class ModelAwareEngine(ReasoningEngine):
                 value = row.get("raw_cosine")
                 if iso not in prior or isinstance(value, bool) or not isinstance(value, (int, float)):
                     continue
-                values.setdefault(iso, []).append(float(value))
-        return {iso: sum(items) / len(items) for iso, items in values.items() if items}
+                region_values.setdefault(key, {}).setdefault(iso, []).append(float(value))
+
+        country_region_means: dict[str, list[float]] = {}
+        for values_by_iso in region_values.values():
+            for iso, items in values_by_iso.items():
+                if items:
+                    country_region_means.setdefault(iso, []).append(sum(items) / len(items))
+        return {
+            iso: sum(items) / len(items)
+            for iso, items in country_region_means.items()
+            if items
+        }
+
+    def _crop_region_count(self) -> int:
+        regions = set()
+        for crop in self.evidence.get("crops") or []:
+            if not isinstance(crop, dict):
+                continue
+            region = crop.get("region") if isinstance(crop.get("region"), dict) else {}
+            if region.get("ranking_applied") is False:
+                continue
+            purpose = region.get("purpose")
+            if purpose is not None and purpose not in {"auto", "scene"}:
+                continue
+            key = _crop_region_identity(region)
+            if key is not None:
+                regions.add(key)
+        return len(regions)
 
     def infer(self, clues, exclusions=None, top_n=TOP_N_HYPOTHESES):
         if not self.evidence:
             return super().infer(clues, exclusions, top_n)
         prior = {row["iso"]: row["raw_cosine"] for row in self.evidence["rankings"]}
         crop_means = self._crop_means(prior)
+        crop_region_count = self._crop_region_count()
         trusted = self._trusted_clues(clues)
-        crops = self.evidence.get("crops") or []
         reference = self.evidence.get("reference")
         reference_matches, reference_regions = (
             _reference_by_iso(reference) if isinstance(reference, dict) else ({}, {})
@@ -203,7 +267,7 @@ class ModelAwareEngine(ReasoningEngine):
                 "full_weight": 1.0,
                 "full_cosine": round(full_cosine, 6),
                 "crop_weight": CROP_WEIGHT,
-                "crop_count": len(crops),
+                "crop_count": crop_region_count,
                 "crop_mean": round(crop_mean, 6) if crop_mean is not None else None,
                 "crop_contribution": round(crop_contribution, 6),
                 "clue_score": round(clue_score, 6),

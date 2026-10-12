@@ -1,18 +1,37 @@
-import type { CityScore, CountryScore } from '@/types'
+import type {
+  CityScore,
+  CountryScore,
+  GuidedConfirmedPath,
+  GuidedLocationLevel,
+  GuidedStage,
+  LocationCandidate,
+  LocationTarget,
+} from '@/types'
 import { cityRegionLabel, regionScopeLabel } from '@/utils/geo'
+import { guidedTargetKey } from '@/utils/guided'
 
 export interface GeoPoint {
   key: string
-  kind: 'country' | 'city'
+  kind: GuidedLocationLevel
   iso: string
   name: string
+  label?: string
   lat: number
   lng: number
   cosine: number | null
-  scoreType?: string
+  scoreType?: string | null
   confirmed: boolean
   /** Optional region scope (中国台湾 / 中国香港 / 中国澳门) for tooltip evidence. */
   subregion?: string | null
+  /** Guided target backing this marker. Absent for legacy country/city rows. */
+  target?: LocationTarget
+  level?: GuidedLocationLevel
+  score?: number | null
+  coordinateSource?: string | null
+  coordinateQuality?: string | null
+  isCurrentCandidate?: boolean
+  resolved?: boolean
+  derivedCoordinate?: boolean
 }
 
 function finite(value: unknown): number | null {
@@ -76,6 +95,132 @@ export function cityPoints(cities: readonly CityScore[] | undefined): GeoPoint[]
     })
   }
   return points
+}
+
+export interface GuidedMapPointSet {
+  /** Parent/path markers first, current-stage candidates last so candidates stay clickable. */
+  points: GeoPoint[]
+  /** Current-stage candidates with their own catalog coordinates, suitable for fitting. */
+  fitPoints: GeoPoint[]
+  currentStagePoints: GeoPoint[]
+  /** Real confirmed ancestor markers usable as a focus fallback; never child targets at parent coordinates. */
+  fallbackPoints: GeoPoint[]
+  /** Candidate targets without a usable lat/lng pair; these receive no marker. */
+  missingCoordinates: LocationTarget[]
+}
+
+function targetLabelValue(target: LocationTarget): string {
+  const label = typeof target.label === 'string' ? target.label.trim() : ''
+  return label || target.id
+}
+
+function isDerivedCoordinate(target: LocationTarget): boolean {
+  return (
+    target.coordinate_source === 'admin1-largest-city-v1' ||
+    target.coordinate_quality === 'derived'
+  )
+}
+
+/**
+ * Guided-map markers for the current stage plus the confirmed path.
+ *
+ * Markers are only emitted for real catalog coordinates. A missing admin1/city
+ * coordinate is listed as missing and receives no marker. ``(0, 0)``,
+ * non-finite, out-of-range, and missing pairs never become invented positions.
+ */
+export function guidedLocationPoints(
+  candidates: readonly LocationCandidate[] | undefined,
+  confirmed: GuidedConfirmedPath | null | undefined,
+  stage: GuidedStage | null | undefined,
+): GuidedMapPointSet {
+  const byKey = new Map<string, GeoPoint>()
+  const missingByKey = new Map<string, LocationTarget>()
+  const confirmedPath = confirmed ?? null
+
+  function addPoint(point: GeoPoint): void {
+    byKey.set(point.key, point)
+  }
+
+  const confirmedLevels: GuidedLocationLevel[] = ['country', 'admin1', 'city']
+  for (const level of confirmedLevels) {
+    const target = confirmedPath ? confirmedPath[level] : null
+    if (!target || !guidedTargetKey(target) || !isUsableLngLat(target.lng, target.lat)) continue
+    addPoint({
+      key: guidedTargetKey(target) as string,
+      kind: target.level,
+      level: target.level,
+      iso: target.country_iso || target.source_iso || target.id,
+      name: targetLabelValue(target),
+      label: targetLabelValue(target),
+      lat: target.lat as number,
+      lng: target.lng as number,
+      cosine: null,
+      scoreType: null,
+      confirmed: true,
+      target,
+      score: null,
+      coordinateSource: target.coordinate_source ?? null,
+      coordinateQuality: target.coordinate_quality ?? null,
+      isCurrentCandidate: false,
+      resolved: stage === 'resolved' && target.level === 'city',
+      derivedCoordinate: isDerivedCoordinate(target),
+      subregion: null,
+    })
+  }
+
+  const currentStage = stage && stage !== 'resolved' ? stage : null
+  if (currentStage) {
+    for (const candidate of candidates ?? []) {
+      const target = candidate?.target
+      if (!target || target.level !== currentStage) continue
+      const key = guidedTargetKey(target)
+      if (!key || byKey.has(key)) continue
+
+      const ownCoordinate = isUsableLngLat(target.lng, target.lat)
+      if (!ownCoordinate) {
+        missingByKey.set(key, target)
+        continue
+      }
+      addPoint({
+        key,
+        kind: target.level,
+        level: target.level,
+        iso: target.country_iso || target.source_iso || target.id,
+        name: targetLabelValue(target),
+        label: targetLabelValue(target),
+        lat: target.lat as number,
+        lng: target.lng as number,
+        cosine: null,
+        score: finite(candidate.score),
+        scoreType: candidate.score_type ?? null,
+        confirmed: false,
+        target,
+        coordinateSource: target.coordinate_source ?? null,
+        coordinateQuality: target.coordinate_quality ?? null,
+        isCurrentCandidate: true,
+        resolved: false,
+        derivedCoordinate: isDerivedCoordinate(target),
+        subregion: null,
+      })
+    }
+  }
+
+  const ordered = [
+    ...Array.from(byKey.values()).filter((point) => !point.isCurrentCandidate),
+    ...Array.from(byKey.values()).filter((point) => point.isCurrentCandidate),
+  ]
+  return {
+    points: ordered,
+    fitPoints: ordered.filter((point) => point.isCurrentCandidate),
+    currentStagePoints: ordered.filter((point) => point.isCurrentCandidate),
+    fallbackPoints: ordered.filter((point) => {
+      if (!point.confirmed) return false
+      if (stage === 'city') return point.level === 'admin1' || point.level === 'country'
+      if (stage === 'admin1') return point.level === 'country'
+      return false
+    }),
+    missingCoordinates: Array.from(missingByKey.values()),
+  }
 }
 
 export interface LngLatBoundsLike {

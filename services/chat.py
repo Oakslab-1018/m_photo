@@ -1710,7 +1710,11 @@ class ChatService:
 
     def reason_only(self, session_id: int,
                     new_clues: Optional[List[Dict[str, Any]]] = None,
-                    click_pos: Optional[tuple] = None) -> Dict[str, Any]:
+                    click_pos: Optional[tuple] = None,
+                    point_analysis: Optional[Dict[str, Any]] = None,
+                    point_analysis_input: Optional[Dict[str, Any]] = None,
+                    point_analysis_cacheable: Optional[bool] = None,
+                    point_analysis_provider_signature: Optional[str] = None) -> Dict[str, Any]:
         """仅根据当前线索重新推理（用于局部点击分析后更新评分）。
 
         new_clues: 本次局部分析新发现的线索，用于在对话中给出分析依据。
@@ -1743,10 +1747,19 @@ class ChatService:
 
         msg = f"{pos_text}已完成局部区域分析。" + "\n".join(basis_lines) + f"\n{action.message}"
 
-        self.session_service.add_message(
-            session_id, "ai", msg,
-            meta={"action": action.to_dict(), "scores": [s.to_dict() for s in scores]},
-        )
+        meta: Dict[str, Any] = {
+            "action": action.to_dict(),
+            "scores": [s.to_dict() for s in scores],
+        }
+        if point_analysis is not None:
+            meta["point_analysis"] = point_analysis
+        if point_analysis_input is not None:
+            meta["point_analysis_input"] = point_analysis_input
+        if point_analysis_cacheable is not None:
+            meta["point_analysis_cacheable"] = bool(point_analysis_cacheable)
+        if point_analysis_provider_signature is not None:
+            meta["point_analysis_provider_signature"] = point_analysis_provider_signature
+        self.session_service.add_message(session_id, "ai", msg, meta=meta)
         return {
             "scores": [s.to_dict() for s in scores],
             "action": action.to_dict(),

@@ -87,6 +87,51 @@ class PipelineService:
         """Run all analyzers and return plain clue dictionaries."""
         return self._get_pipeline().analyze_as_dict(image_path)
 
+    def analyze_region(
+        self,
+        image_path: str,
+        *,
+        image_size: tuple[int, int],
+        crop_px: tuple[int, int, int, int],
+        ocr_scale: float = 1.0,
+        region_id: str | None = None,
+        region_bbox_norm: dict[str, float] | None = None,
+    ) -> dict[str, Any]:
+        """Run focused OCR/text analysis for local-region reports.
+
+        The legacy :meth:`analyze` contract is unchanged. This helper avoids all
+        color-only analyzers and returns the OCR status captured by the same
+        pipeline instance that produced the clues.
+        """
+        try:
+            pipeline = self._get_pipeline()
+            clues = pipeline.analyze_region_as_dict(
+                image_path,
+                image_size=image_size,
+                crop_px=crop_px,
+                ocr_scale=ocr_scale,
+                region_id=region_id,
+                region_bbox_norm=region_bbox_norm,
+            )
+            return {"clues": clues, "ocr_status": pipeline.ocr_status}
+        except Exception as exc:  # defensive: report status, never leak details
+            logger.warning("regional analysis unavailable (%s)", type(exc).__name__)
+            return {
+                "clues": [],
+                "ocr_status": {
+                    "provider": self.ocr_provider,
+                    "state": "unavailable",
+                    "enabled": self.ocr_provider != "mock",
+                    "available": False,
+                    "line_count": 0,
+                    "detail": type(exc).__name__,
+                },
+            }
+
+    def detailed_analyze_region(self, *args, **kwargs) -> dict[str, Any]:
+        """Backward-friendly alias for callers that need the richer result."""
+        return self.analyze_region(*args, **kwargs)
+
     def ocr_status(self) -> dict[str, Any]:
         """Safe OCR diagnostic status (never raises into callers)."""
         try:

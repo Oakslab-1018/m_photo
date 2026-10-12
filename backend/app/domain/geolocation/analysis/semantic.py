@@ -356,6 +356,7 @@ class SemanticClueAnalyzer:
              city_id: Optional[str] = None,
              confidence_factor: Optional[float] = None) -> None:
         key = (dimension, value)
+        origin_extra = clue.extra if isinstance(clue.extra, dict) else {}
         confidence = min(float(clue.confidence), _CONFIDENCE_CAPS.get(dimension, 0.6))
         entry = collected.get(key)
         if entry is None:
@@ -373,6 +374,10 @@ class SemanticClueAnalyzer:
                 "city_id": city_id,
                 "confidence_factor": confidence_factor,
                 "origin_group": origin_group_for_clue(clue),
+                "region_id": origin_extra.get("region_id"),
+                "provider": origin_extra.get("provider"),
+                "bbox_norm": origin_extra.get("bbox_norm") or origin_extra.get("image_bbox_norm"),
+                "quad_norm": origin_extra.get("quad_norm") or origin_extra.get("image_quad_norm"),
             }
             collected[key] = entry
         else:
@@ -392,6 +397,9 @@ class SemanticClueAnalyzer:
                     float(current_factor) if current_factor is not None else 1.0,
                     float(confidence_factor),
                 )
+            for key_name in ("region_id", "provider", "bbox_norm", "quad_norm"):
+                if entry.get(key_name) is None and origin_extra.get(key_name) is not None:
+                    entry[key_name] = origin_extra[key_name]
         entry["occurrences"] += 1
         if confidence > entry["confidence"]:
             entry["confidence"] = confidence
@@ -430,6 +438,14 @@ class SemanticClueAnalyzer:
             # Stable identity of the OCR source line: used by the engine to
             # avoid counting correlated evidence from one line twice.
             extra["origin_group"] = str(entry["origin_group"])
+        if entry.get("region_id"):
+            extra["region_id"] = str(entry["region_id"])
+        if entry.get("provider"):
+            extra["provider"] = str(entry["provider"])
+        if isinstance(entry.get("bbox_norm"), dict):
+            extra["bbox_norm"] = dict(entry["bbox_norm"])
+        if isinstance(entry.get("quad_norm"), dict):
+            extra["quad_norm"] = dict(entry["quad_norm"])
         if not validated:
             extra["display_only"] = True
         return Clue(

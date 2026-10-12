@@ -1,5 +1,6 @@
 import {
   type AnalyzePointResponse,
+  type AnalyzePointRequest,
   type ChatMessage,
   type CitiesResponse,
   type CountriesResponse,
@@ -184,11 +185,18 @@ export class GeoApi {
     })
   }
 
-  async analyzePoint(sessionId: number, point: Point): Promise<AnalyzePointResponse> {
+  async analyzePoint(sessionId: number, request: AnalyzePointRequest | Point): Promise<AnalyzePointResponse> {
+    const payload: AnalyzePointRequest = { x: request.x, y: request.y }
+    if ('scale' in request && request.scale !== undefined) payload.scale = request.scale
+    if ('image_region' in request && request.image_region !== undefined) payload.image_region = request.image_region
+    if ('purpose' in request && request.purpose !== undefined) payload.purpose = request.purpose
+    if ('client_request_id' in request && request.client_request_id !== undefined) {
+      payload.client_request_id = request.client_request_id
+    }
     return this.request<AnalyzePointResponse>(`/api/geo/${sessionId}/analyze-point`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ x: point.x, y: point.y }),
+      body: JSON.stringify(payload),
     })
   }
 }

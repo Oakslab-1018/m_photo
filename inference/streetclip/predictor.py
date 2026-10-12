@@ -19,6 +19,7 @@ prototype computation beyond the single GPU inference lock.
 from __future__ import annotations
 
 import logging
+import math
 import threading
 from collections import OrderedDict
 from pathlib import Path
@@ -35,13 +36,23 @@ from .config import (
     MODEL_REVISION,
     PROMPT_TEMPLATE_VERSION,
 )
-from .schema import build_prediction
+from .scene import (
+    SCENE_GROUPS,
+    SCENE_MAX_CANDIDATES,
+    SCENE_UNCERTAIN_MARGIN_THRESHOLD,
+    iter_scene_prompts,
+)
+from .schema import build_prediction, build_scene_analysis
 
 logger = logging.getLogger(__name__)
 
 
 class PredictorUnavailableError(RuntimeError):
     """Raised when the model cannot be loaded or executed safely."""
+
+
+class SceneAnalysisUnavailableError(PredictorUnavailableError):
+    """Raised when the real scene-analysis capability cannot run."""
 
 
 @runtime_checkable
@@ -98,6 +109,8 @@ class StreetClipPredictor:
         self._city_cache: "OrderedDict[str, tuple[tuple[int, ...], np.ndarray]]" = OrderedDict()
         self._city_locks: dict[str, threading.Lock] = {}
         self._city_cache_limit = max(1, int(CITY_TEXT_FEATURE_CACHE_COUNTRIES))
+        self._scene_cache_lock = threading.Lock()
+        self._scene_text_cache: tuple[np.ndarray, ...] | None = None
 
     @property
     def ready(self) -> bool:
@@ -305,6 +318,139 @@ class StreetClipPredictor:
                     self._city_cache.popitem(last=False)
             return prototypes
 
+    def _scene_text_features(self) -> tuple[np.ndarray, ...]:
+        """Return normalized scene option prototypes, cached lazily once.
+
+        Prompts are flattened in the fixed group/option order exposed by
+        ``scene.py``. The first call performs one bounded text batch (or chunked
+        batch) under the shared inference lock; later calls only reuse the
+        normalized NumPy rows and perform the image/text dot product.
+        """
+        if not self._ready or self._model is None:
+            raise SceneAnalysisUnavailableError("model is not loaded")
+        with self._scene_cache_lock:
+            cached = self._scene_text_cache
+            if cached is not None:
+                return cached
+
+            prompts = list(iter_scene_prompts())
+            if not prompts:
+                raise SceneAnalysisUnavailableError("no curated scene prompts were defined")
+            try:
+                flat = self._encode_text_prompts(prompts)
+            except PredictorUnavailableError as exc:
+                raise SceneAnalysisUnavailableError(
+                    f"StreetCLIP scene text encoding failed: {exc}"
+                ) from exc
+            if flat.ndim != 2 or flat.shape[0] != len(prompts):
+                raise SceneAnalysisUnavailableError(
+                    "StreetCLIP returned an invalid scene text embedding matrix"
+                )
+
+            group_prototypes: list[np.ndarray] = []
+            cursor = 0
+            for group in SCENE_GROUPS:
+                option_prototypes: list[np.ndarray] = []
+                for option in group.options:
+                    count = len(option.prompts)
+                    rows = flat[cursor : cursor + count]
+                    cursor += count
+                    if count <= 0 or rows.shape[0] != count:
+                        raise SceneAnalysisUnavailableError(
+                            f"scene prompt rows are incomplete for {option.value}"
+                        )
+                    averaged = rows.mean(axis=0, dtype=np.float32)
+                    prototype = _l2_normalize_numpy(averaged.reshape(1, -1))[0]
+                    option_prototypes.append(prototype)
+                group_prototypes.append(
+                    np.ascontiguousarray(np.stack(option_prototypes, axis=0), dtype=np.float32)
+                )
+            if cursor != len(prompts):
+                raise SceneAnalysisUnavailableError(
+                    "StreetCLIP scene text embeddings do not match the curated prompts"
+                )
+            resolved = tuple(group_prototypes)
+            self._scene_text_cache = resolved
+            return resolved
+
+    def scene_text_scores(self, image_vector: np.ndarray) -> list[dict[str, Any]]:
+        """Return bounded top-two scene hypotheses for all fixed dimensions.
+
+        The image vector must be the shared :meth:`encode_image` output. Text
+        prototypes are loaded lazily and cached; scoring itself is a single
+        normalized image/text matrix product per group. Raw cosine values are
+        semantic similarities, never calibrated probabilities.
+        """
+        if not self._ready or self._model is None:
+            raise SceneAnalysisUnavailableError("model is not loaded")
+        try:
+            query = np.asarray(image_vector, dtype=np.float32)
+        except (TypeError, ValueError) as exc:
+            raise SceneAnalysisUnavailableError(
+                "scene scoring requires a numeric image vector"
+            ) from exc
+        if query.ndim != 1 or query.size == 0:
+            raise SceneAnalysisUnavailableError("scene scoring requires a 1-D image vector")
+        norm = float(np.linalg.norm(query.astype(np.float64)))
+        if not math.isfinite(norm) or norm <= 1e-12:
+            raise SceneAnalysisUnavailableError(
+                "scene scoring requires a non-zero finite image vector"
+            )
+        query = query / np.float32(norm)
+
+        try:
+            group_features = self._scene_text_features()
+            if len(group_features) != len(SCENE_GROUPS):
+                raise SceneAnalysisUnavailableError("scene text feature group count mismatch")
+            groups: list[dict[str, Any]] = []
+            for definition, prototypes in zip(SCENE_GROUPS, group_features):
+                if prototypes.ndim != 2 or prototypes.shape[0] != len(definition.options):
+                    raise SceneAnalysisUnavailableError(
+                        f"scene text features do not match dimension {definition.dimension}"
+                    )
+                if prototypes.shape[1] != query.shape[0]:
+                    raise SceneAnalysisUnavailableError(
+                        "scene text feature dimension does not match the image encoder"
+                    )
+                raw_scores = prototypes @ query
+                ranked: list[tuple[Any, float]] = []
+                for option, raw_score in zip(definition.options, raw_scores):
+                    score = float(raw_score)
+                    if not math.isfinite(score):
+                        raise SceneAnalysisUnavailableError(
+                            f"scene cosine is non-finite for {option.value}"
+                        )
+                    ranked.append((option, min(1.0, max(-1.0, score))))
+                ranked.sort(key=lambda item: (-item[1], item[0].value))
+                top = ranked[:SCENE_MAX_CANDIDATES]
+                margin = top[0][1] - top[1][1] if len(top) >= 2 else 0.0
+                groups.append(
+                    {
+                        "dimension": definition.dimension,
+                        "candidates": [
+                            {
+                                "value": option.value,
+                                "label": option.label,
+                                "raw_cosine": score,
+                            }
+                            for option, score in top
+                        ],
+                        "margin": max(0.0, float(margin)),
+                        "uncertain": bool(margin < SCENE_UNCERTAIN_MARGIN_THRESHOLD),
+                    }
+                )
+            return groups
+        except SceneAnalysisUnavailableError:
+            raise
+        except PredictorUnavailableError as exc:
+            raise SceneAnalysisUnavailableError(
+                f"StreetCLIP scene analysis failed: {exc}"
+            ) from exc
+        except Exception as exc:  # pragma: no cover - defensive
+            raise SceneAnalysisUnavailableError(
+                f"StreetCLIP scene analysis failed: {exc}"
+            ) from exc
+
     def city_text_scores(
         self,
         image_vector: np.ndarray,
@@ -383,12 +529,33 @@ class StreetClipPredictor:
         vector = self.encode_image(image)
         return self.predict_from_vector(vector)
 
+    def analyze_region(self, payload: bytes) -> dict[str, Any]:
+        """Return bounded scene hypotheses for one decoded region image.
+
+        The service normally orchestrates the image decode and shared
+        prediction lock. This convenience method exposes the same single-image
+        path for direct callers without creating a nested lock.
+        """
+        if not self._ready or self._model is None:
+            raise SceneAnalysisUnavailableError("model is not loaded")
+        from .schema import compute_image_sha256, decode_image_bytes
+
+        image = decode_image_bytes(payload)
+        vector = self.encode_image(image)
+        groups = self.scene_text_scores(vector)
+        return build_scene_analysis(
+            image_sha256=compute_image_sha256(payload),
+            scene_groups=groups,
+        ).as_dict()
+
     def close(self) -> None:
         self._ready = False
         self._model = None
         self._processor = None
         self._text_embeddings = None
         self._device = "unloaded"
+        with self._scene_cache_lock:
+            self._scene_text_cache = None
         with self._city_cache_lock:
             self._city_cache.clear()
             self._city_locks.clear()
@@ -401,6 +568,7 @@ class StreetClipPredictor:
 __all__ = [
     "Predictor",
     "PredictorUnavailableError",
+    "SceneAnalysisUnavailableError",
     "StreetClipPredictor",
 ]
 

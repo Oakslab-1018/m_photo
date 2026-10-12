@@ -43,6 +43,35 @@ PROMPTS = ["a photo from {country}", "a street-level photo taken in {country}",
 
 MAX_CROPS = 8
 MAX_CROP_REGION_SIDE = 100_000
+MAX_SCENE_GROUPS = 6
+MAX_SCENE_CANDIDATES = 2
+MAX_SCENE_LABEL_LENGTH = 120
+SCENE_GROUP_VALUES = {
+    "road": frozenset({
+        "arterial_road", "local_street", "residential_lane", "highway",
+        "unpaved_road", "pedestrian_way",
+    }),
+    "building": frozenset({
+        "high_rise", "mid_rise", "low_rise", "historic_masonry",
+        "commercial_storefront", "industrial_warehouse",
+    }),
+    "vegetation": frozenset({
+        "street_trees", "dense_green", "sparse_green", "grass_lawn",
+        "flowering_plants", "dry_vegetation",
+    }),
+    "terrain": frozenset({
+        "flat_ground", "sloped_ground", "hilly", "mountainous", "valley",
+        "coastal_lowland",
+    }),
+    "water": frozenset({
+        "no_visible_water", "river", "lake", "sea_ocean", "canal", "pond_fountain",
+    }),
+    "vehicle": frozenset({
+        "cars", "motorcycles_scooters", "bicycles", "buses", "trucks",
+        "no_visible_vehicles",
+    }),
+}
+SCENE_DIMENSIONS = frozenset(SCENE_GROUP_VALUES)
 # The city contract mirrors the inference service: at most CITY_TOP_N rows are
 # returned, and the reference sidecar is bounded at 10 matches / 20 region rows.
 MAX_CITY_ROWS = 10
@@ -56,6 +85,8 @@ REFERENCE_AGGREGATIONS = {"max", "top2mean"}
 COORDINATE_TOLERANCE = 1e-4
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _REFERENCE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_REGION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
+_SCENE_VALUE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 logger = logging.getLogger(__name__)
 
 
@@ -110,8 +141,27 @@ def clean_image(path: str | Path) -> bytes:
         return output.getvalue()
 
 
-def _region_key(region: dict) -> tuple[float, float, int]:
-    return (round(float(region["x"]), 6), round(float(region["y"]), 6), int(region["size"]))
+def _region_key(region: dict):
+    """Stable crop-region identity with legacy click-region compatibility."""
+    region_id = region.get("region_id")
+    if isinstance(region_id, str) and region_id:
+        return ("region_id", region_id)
+    bbox = region.get("bbox_norm")
+    if isinstance(bbox, dict):
+        return (
+            "bbox_norm",
+            round(float(bbox["x"]), 6),
+            round(float(bbox["y"]), 6),
+            round(float(bbox["w"]), 6),
+            round(float(bbox["h"]), 6),
+            str(region.get("purpose") or ""),
+        )
+    return (
+        "legacy_click",
+        round(float(region["x"]), 6),
+        round(float(region["y"]), 6),
+        int(region["size"]),
+    )
 
 
 class StreetClipGateway:
@@ -193,6 +243,117 @@ class StreetClipGateway:
             logger.warning("StreetCLIP city ranking unavailable; none (%s)", type(exc).__name__)
             return None
 
+    def describe_region(self, png: bytes) -> dict:
+        """Call the optional StreetCLIP scene-region endpoint.
+
+        Scene hypotheses are display-only diagnostics. Missing endpoint,
+        provider outage or malformed output all degrade to an explicit
+        ``unavailable`` result so local OCR/quality analysis still succeeds.
+        """
+        base = {
+            "provider": "streetclip",
+            "model_revision": MODEL_REVISION,
+            "enabled": bool(self.settings.streetclip_enabled),
+            "available": False,
+            "scene_groups": [],
+        }
+        if not self.settings.streetclip_enabled:
+            return {**base, "state": "disabled"}
+        if not isinstance(png, (bytes, bytearray)) or not png:
+            return {**base, "state": "unavailable"}
+        payload = bytes(png)
+        if len(payload) > 16 * 1024 * 1024:
+            return {**base, "state": "unavailable"}
+        try:
+            url, timeout = self._endpoint()
+            with httpx.Client(
+                transport=self.transport,
+                timeout=httpx.Timeout(timeout, connect=min(timeout, 3)),
+                follow_redirects=False,
+                trust_env=False,
+            ) as client:
+                response = client.post(
+                    url + "/analyze-region",
+                    headers=self._headers(),
+                    files={"file": ("region.png", payload, "image/png")},
+                )
+                response.raise_for_status()
+                validated = self.validate_scene_region(
+                    response.json(), hashlib.sha256(payload).hexdigest()
+                )
+            return {**base, **validated, "available": True, "state": "ok"}
+        except Exception as exc:
+            logger.warning("StreetCLIP scene region unavailable (%s)", type(exc).__name__)
+            return {**base, "state": "unavailable"}
+
+    def validate_scene_region(self, data: object, image_sha256: str) -> dict:
+        """Validate the bounded scene-region response contract."""
+        expected_hash = self._validate_sha256(image_sha256)
+        if not isinstance(data, dict) or data.get("status") != "ok":
+            raise ValueError("invalid scene response")
+        if data.get("model_revision") != MODEL_REVISION:
+            raise ValueError("scene model mismatch")
+        if data.get("image_sha256") != expected_hash:
+            raise ValueError("scene image mismatch")
+        raw_groups = data.get("scene_groups")
+        if not isinstance(raw_groups, list) or len(raw_groups) != len(SCENE_DIMENSIONS):
+            raise ValueError("invalid scene groups")
+
+        groups = []
+        seen_dimensions = set()
+        for raw in raw_groups:
+            if not isinstance(raw, dict):
+                raise ValueError("invalid scene group")
+            dimension = _required_text(raw.get("dimension"), "scene dimension").lower()
+            if dimension not in SCENE_DIMENSIONS or dimension in seen_dimensions:
+                raise ValueError("invalid scene dimension")
+            seen_dimensions.add(dimension)
+            raw_candidates = raw.get("candidates")
+            if not isinstance(raw_candidates, list) or not 1 <= len(raw_candidates) <= MAX_SCENE_CANDIDATES:
+                raise ValueError("invalid scene candidates")
+            candidates = []
+            seen_values = set()
+            for candidate in raw_candidates:
+                if not isinstance(candidate, dict):
+                    raise ValueError("invalid scene candidate")
+                value = _required_text(candidate.get("value"), "scene value")
+                if (
+                    not _SCENE_VALUE_RE.match(value)
+                    or value not in SCENE_GROUP_VALUES.get(dimension, frozenset())
+                    or value in seen_values
+                ):
+                    raise ValueError("invalid scene value")
+                seen_values.add(value)
+                label = _required_text(candidate.get("label"), "scene label")
+                if len(label) > MAX_SCENE_LABEL_LENGTH:
+                    raise ValueError("invalid scene label")
+                candidates.append({
+                    "value": value,
+                    "label": label,
+                    "raw_cosine": _finite_cosine(candidate.get("raw_cosine"), "scene cosine"),
+                })
+            candidates.sort(key=lambda row: (-row["raw_cosine"], row["value"]))
+            margin = raw.get("margin")
+            if isinstance(margin, bool) or not isinstance(margin, (int, float)):
+                raise ValueError("invalid scene margin")
+            margin = float(margin)
+            if not math.isfinite(margin) or margin < 0.0 or margin > 2.0:
+                raise ValueError("invalid scene margin")
+            uncertain = raw.get("uncertain")
+            if type(uncertain) is not bool:
+                raise ValueError("invalid scene uncertainty")
+            groups.append({
+                "dimension": dimension,
+                "candidates": candidates,
+                "margin": margin,
+                "uncertain": uncertain,
+            })
+        return {
+            "model_revision": MODEL_REVISION,
+            "image_sha256": expected_hash,
+            "scene_groups": groups,
+        }
+
     # ---- contract validation -------------------------------------------------
     def _validate_rankings(self, data: object) -> dict:
         countries = self._catalog().countries()
@@ -244,7 +405,54 @@ class StreetClipGateway:
             raise ValueError("invalid crop region")
         if isinstance(size, bool) or not isinstance(size, int) or not 1 <= size <= MAX_CROP_REGION_SIDE:
             raise ValueError("invalid crop region")
-        return {"x": float(x), "y": float(y), "size": int(size)}
+        validated = {"x": float(x), "y": float(y), "size": int(size)}
+
+        region_id = region.get("region_id")
+        if region_id is not None:
+            region_id = _required_text(region_id, "crop region id")
+            if not _REGION_ID_RE.match(region_id):
+                raise ValueError("invalid crop region id")
+            validated["region_id"] = region_id
+
+        purpose = region.get("purpose")
+        if purpose is not None:
+            if purpose not in {"auto", "ocr", "scene"}:
+                raise ValueError("invalid crop purpose")
+            validated["purpose"] = purpose
+
+        bbox = region.get("bbox_norm")
+        if bbox is not None:
+            if not isinstance(bbox, dict):
+                raise ValueError("invalid crop bbox")
+            bx, by, bw, bh = (bbox.get("x"), bbox.get("y"), bbox.get("w"), bbox.get("h"))
+            if any(
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                for value in (bx, by, bw, bh)
+            ):
+                raise ValueError("invalid crop bbox")
+            bx, by, bw, bh = float(bx), float(by), float(bw), float(bh)
+            if bx < 0.0 or by < 0.0 or bw <= 0.0 or bh <= 0.0:
+                raise ValueError("invalid crop bbox")
+            if bx + bw > 1.0 + 1e-9 or by + bh > 1.0 + 1e-9:
+                raise ValueError("invalid crop bbox")
+            rounded_x, rounded_y = round(bx, 6), round(by, 6)
+            rounded_w = min(max(1e-6, round(bw, 6)), max(1e-6, round(1.0 - rounded_x, 6)))
+            rounded_h = min(max(1e-6, round(bh, 6)), max(1e-6, round(1.0 - rounded_y, 6)))
+            validated["bbox_norm"] = {
+                "x": rounded_x,
+                "y": rounded_y,
+                "w": rounded_w,
+                "h": rounded_h,
+            }
+
+        ranking_applied = region.get("ranking_applied")
+        if ranking_applied is not None:
+            if type(ranking_applied) is not bool:
+                raise ValueError("invalid crop ranking flag")
+            validated["ranking_applied"] = ranking_applied
+        return validated
 
     @staticmethod
     def _validate_sha256(value: object) -> str:
@@ -280,10 +488,18 @@ class StreetClipGateway:
                 if digest is not None:
                     crop["image_sha256"] = self._validate_sha256(digest)
                 key = _region_key(crop["region"])
-                if key in regions or (crop.get("image_sha256") and crop["image_sha256"] in digests):
+                region_identity = bool(
+                    crop["region"].get("region_id") or crop["region"].get("bbox_norm")
+                )
+                duplicate_digest = bool(
+                    not region_identity
+                    and crop.get("image_sha256")
+                    and crop["image_sha256"] in digests
+                )
+                if key in regions or duplicate_digest:
                     raise ValueError("duplicate crop evidence")
                 regions.add(key)
-                if crop.get("image_sha256"):
+                if crop.get("image_sha256") and not region_identity:
                     digests.add(crop["image_sha256"])
                 crops.append(crop)
             base["crops"] = crops
@@ -538,10 +754,12 @@ class StreetClipGateway:
     def with_crop(self, evidence: dict, crop: dict) -> dict | None:
         """Return a new evidence payload with ``crop`` appended.
 
-        Duplicate clicks (same region) and repeated imagery (same cleaned-image
-        hash) are ignored, and the crop list is bounded by :data:`MAX_CROPS`.
-        Returns ``None`` when the crop adds no new evidence. The input payload
-        (including the immutable full-image ``rankings``) is never mutated.
+        Legacy click crops deduplicate repeated regions and imagery. Region-id
+        crops keep explicit ROI provenance and replace an older crop for the
+        same ROI when a fresh provider result is available. The crop list is
+        bounded by :data:`MAX_CROPS`. Returns ``None`` when the crop adds no
+        new evidence. The input payload (including the immutable full-image
+        ``rankings``) is never mutated.
         """
         if not isinstance(evidence, dict) or not isinstance(crop, dict):
             return None
@@ -552,13 +770,28 @@ class StreetClipGateway:
             return None
         key = _region_key(crop["region"])
         digest = crop.get("image_sha256")
-        for existing in crops:
+        region_identity = bool(
+            crop["region"].get("region_id") or crop["region"].get("bbox_norm")
+        )
+        replace_index = None
+        for index, existing in enumerate(crops):
             if not isinstance(existing, dict) or "region" not in existing:
                 return None
             if _region_key(existing["region"]) == key:
+                existing_region_identity = bool(
+                    existing["region"].get("region_id") or existing["region"].get("bbox_norm")
+                )
+                if region_identity and existing_region_identity:
+                    replace_index = index
+                    break
                 return None
-            if digest and digest == existing.get("image_sha256"):
+            if not region_identity and digest and digest == existing.get("image_sha256"):
                 return None
         updated = copy.deepcopy(evidence)
-        updated["crops"] = crops + [copy.deepcopy(crop)]
+        if replace_index is None:
+            updated["crops"] = crops + [copy.deepcopy(crop)]
+        else:
+            updated["crops"] = (
+                crops[:replace_index] + [copy.deepcopy(crop)] + crops[replace_index + 1:]
+            )
         return updated

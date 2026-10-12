@@ -1,4 +1,5 @@
 import { boundsForPoints, type LngLatBoundsLike } from '@/utils/geoPoints'
+import type { GuidedLocationLevel, LocationTarget } from '@/types'
 
 /**
  * Minimal structural types for the MapLibre API surface this app uses. Keeping
@@ -29,16 +30,40 @@ export interface MapLibreNamespace {
 
 export interface MapPoint {
   key: string
-  kind: 'country' | 'city'
+  kind: GuidedLocationLevel
   iso: string
   name: string
+  label?: string
   lat: number
   lng: number
   cosine?: number | null
-  scoreType?: string
+  scoreType?: string | null
   confirmed?: boolean
   /** Optional region scope evidence (中国台湾/中国香港/中国澳门) for tooltips. */
   subregion?: string | null
+  /** Guided target backing this marker. Absent for legacy country/city rows. */
+  target?: LocationTarget
+  level?: GuidedLocationLevel
+  score?: number | null
+  coordinateSource?: string | null
+  coordinateQuality?: string | null
+  isCurrentCandidate?: boolean
+  resolved?: boolean
+  derivedCoordinate?: boolean
+}
+
+export interface FitToPointsOptions {
+  padding?: number
+  maxZoom?: number
+  /** Zoom used for a single point; singlePointZoom is an accepted alias. */
+  singleZoom?: number
+  singlePointZoom?: number
+  duration?: number
+}
+
+export interface FocusPointOptions {
+  zoom?: number
+  duration?: number
 }
 
 export interface MapLifecycleOptions {
@@ -52,7 +77,8 @@ export interface MapLifecycleOptions {
 export interface MapLifecycle {
   map: MapLike
   renderMarkers(points: readonly MapPoint[]): void
-  fitToPoints(points: readonly MapPoint[]): void
+  fitToPoints(points: readonly MapPoint[], options?: FitToPointsOptions): void
+  focusPoint(point: MapPoint, options?: FocusPointOptions): void
   markers(): readonly MarkerLike[]
   dispose(): void
 }
@@ -92,12 +118,16 @@ export function createMapLifecycle(
     )
   }
 
-  function fitToPoints(points: readonly MapPoint[]): void {
+  function fitToPoints(points: readonly MapPoint[], options: FitToPointsOptions = {}): void {
     if (disposed) return
     const bounds: LngLatBoundsLike | null = boundsForPoints(points)
     if (!bounds) return
+    const padding = options.padding ?? 48
+    const maxZoom = options.maxZoom ?? 6
+    const duration = options.duration ?? 0
     if (bounds.west === bounds.east && bounds.south === bounds.north) {
-      map.easeTo({ center: [bounds.west, bounds.south], zoom: 3, duration: 0 })
+      const zoom = options.singlePointZoom ?? options.singleZoom ?? 3
+      map.easeTo({ center: [bounds.west, bounds.south], zoom, duration })
       return
     }
     map.fitBounds(
@@ -105,14 +135,24 @@ export function createMapLifecycle(
         [bounds.west, bounds.south],
         [bounds.east, bounds.north],
       ],
-      { padding: 48, maxZoom: 6, duration: 0 },
+      { padding, maxZoom, duration },
     )
+  }
+
+  function focusPoint(point: MapPoint, options: FocusPointOptions = {}): void {
+    if (disposed) return
+    map.easeTo({
+      center: [point.lng, point.lat],
+      zoom: options.zoom ?? 3,
+      duration: options.duration ?? 0,
+    })
   }
 
   return {
     map,
     renderMarkers,
     fitToPoints,
+    focusPoint,
     markers: () => active,
     dispose(): void {
       if (disposed) return

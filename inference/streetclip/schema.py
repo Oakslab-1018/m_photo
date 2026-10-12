@@ -1,17 +1,20 @@
 """Request validation and ranking schema helpers.
 
-This module intentionally imports only the standard library plus Pillow.
-Importing ``schema`` must never require torch, transformers or CUDA so unit
-tests and contract reviews can run on a CPU-only checkout.
+This module imports only the standard library, Pillow and Pydantic. Importing
+``schema`` must never require torch, transformers or CUDA so unit tests and
+contract reviews can run on a CPU-only checkout.
 """
 
 from __future__ import annotations
 
+import hashlib
 import io
 import math
 from dataclasses import dataclass
+from typing import Literal, Sequence
 
 from PIL import Image, ImageOps, UnidentifiedImageError
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .config import (
     CITY_REFERENCE_FUSION_WEIGHT,
@@ -20,12 +23,27 @@ from .config import (
     MODEL_REVISION,
     UNCERTAIN_MARGIN_THRESHOLD,
 )
+from .scene import (
+    SCENE_DIMENSIONS,
+    SCENE_MAX_CANDIDATES,
+    SCENE_UNCERTAIN_MARGIN_THRESHOLD,
+)
 
 CITY_TEXT_ONLY_SCORE_TYPE = "city_text_cosine"
 CITY_HYBRID_SCORE_TYPE = "city_reference_hybrid"
 CITY_STATUS_OK = "ok"
 CITY_STATUS_NO_CITIES = "no_cities"
 CITY_TOP_N = 10
+SCENE_STATUS_OK = "ok"
+
+SceneDimension = Literal[
+    "road",
+    "building",
+    "vegetation",
+    "terrain",
+    "water",
+    "vehicle",
+]
 
 
 class ImageValidationError(ValueError):
@@ -50,6 +68,56 @@ class ExifGpsPresentError(ImageValidationError):
 
 class InvalidCountryError(ValueError):
     """The requested ISO code is not a supported 2-letter candidate."""
+
+
+class SceneCandidate(BaseModel):
+    """One fixed zero-shot scene concept with a bounded cosine score."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    value: str = Field(min_length=1, max_length=64)
+    label: str = Field(min_length=1, max_length=64)
+    raw_cosine: float = Field(ge=-1.0, le=1.0, allow_inf_nan=False)
+
+
+class SceneGroup(BaseModel):
+    """One known scene dimension with at most its two best candidates."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    dimension: SceneDimension
+    candidates: list[SceneCandidate] = Field(
+        min_length=1,
+        max_length=SCENE_MAX_CANDIDATES,
+    )
+    margin: float = Field(ge=0.0, le=2.0, allow_inf_nan=False)
+    uncertain: bool
+
+
+class SceneAnalysisResponse(BaseModel):
+    """Strict public response for ``POST /analyze-region``."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    model_revision: str = Field(default=MODEL_REVISION, min_length=1, max_length=128)
+    image_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    status: Literal["ok"] = SCENE_STATUS_OK
+    scene_groups: list[SceneGroup] = Field(
+        min_length=len(SCENE_DIMENSIONS),
+        max_length=len(SCENE_DIMENSIONS),
+    )
+
+    @model_validator(mode="after")
+    def _validate_known_dimensions(self) -> "SceneAnalysisResponse":
+        dimensions = [group.dimension for group in self.scene_groups]
+        if len(set(dimensions)) != len(SCENE_DIMENSIONS):
+            raise ValueError("scene_groups must contain each known dimension once")
+        if set(dimensions) != set(SCENE_DIMENSIONS):
+            raise ValueError("scene_groups contains an unknown or missing dimension")
+        return self
+
+    def as_dict(self) -> dict[str, object]:
+        return self.model_dump(mode="json")
 
 
 @dataclass(frozen=True)
@@ -180,6 +248,78 @@ def _finite_cosine(value: object, *, label: str) -> float:
     if parsed < -1.0000001 or parsed > 1.0000001:
         raise ValueError(f"{label} is outside [-1, 1]: {parsed}")
     return min(1.0, max(-1.0, parsed))
+
+
+def compute_image_sha256(payload: bytes) -> str:
+    """Return the SHA-256 identity of the original uploaded bytes."""
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _coerce_scene_group(raw: SceneGroup | dict[str, object]) -> SceneGroup:
+    """Normalize a raw predictor group and derive display-safe metadata."""
+    if isinstance(raw, SceneGroup):
+        candidates = list(raw.candidates)
+    else:
+        if not isinstance(raw, dict):
+            raise ValueError("scene group must be a mapping or SceneGroup")
+        candidate_rows = raw.get("candidates")
+        if not isinstance(candidate_rows, (list, tuple)):
+            raise ValueError("scene group candidates must be a list")
+        candidates = [
+            candidate
+            if isinstance(candidate, SceneCandidate)
+            else SceneCandidate.model_validate(candidate)
+            for candidate in candidate_rows
+        ]
+    if not candidates:
+        raise ValueError("scene group must have at least one candidate")
+    candidates.sort(key=lambda item: (-item.raw_cosine, item.value))
+    top = candidates[:SCENE_MAX_CANDIDATES]
+    margin = top[0].raw_cosine - top[1].raw_cosine if len(top) >= 2 else 0.0
+    dimension = raw.dimension if isinstance(raw, SceneGroup) else raw.get("dimension")
+    return SceneGroup.model_validate(
+        {
+            "dimension": dimension,
+            "candidates": top,
+            "margin": max(0.0, float(margin)),
+            "uncertain": bool(margin < SCENE_UNCERTAIN_MARGIN_THRESHOLD),
+        }
+    )
+
+
+def build_scene_analysis(
+    *,
+    image_sha256: str,
+    scene_groups: Sequence[SceneGroup | dict[str, object]],
+    model_revision: str = MODEL_REVISION,
+) -> SceneAnalysisResponse:
+    """Validate and normalize the six-group zero-shot scene response.
+
+    Candidate order and margins are recomputed from the bounded cosine values,
+    so a predictor cannot return more than two candidates or an inconsistent
+    top1-top2 margin. The returned labels are whatever the fixed predictor
+    vocabulary supplied; this function performs no extra model work.
+    """
+    normalized: dict[str, SceneGroup] = {}
+    for raw in scene_groups:
+        group = _coerce_scene_group(raw)
+        if group.dimension in normalized:
+            raise ValueError(f"duplicate scene dimension: {group.dimension}")
+        normalized[group.dimension] = group
+
+    missing = [dimension for dimension in SCENE_DIMENSIONS if dimension not in normalized]
+    if missing:
+        raise ValueError("missing scene dimensions: " + ", ".join(missing))
+    extra = [dimension for dimension in normalized if dimension not in SCENE_DIMENSIONS]
+    if extra:
+        raise ValueError("unknown scene dimensions: " + ", ".join(extra))
+
+    return SceneAnalysisResponse(
+        model_revision=model_revision,
+        image_sha256=image_sha256,
+        status=SCENE_STATUS_OK,
+        scene_groups=[normalized[dimension] for dimension in SCENE_DIMENSIONS],
+    )
 
 
 def _bounded_unit(value: float) -> float:
@@ -357,8 +497,14 @@ __all__ = [
     "InvalidCountryError",
     "Prediction",
     "Ranking",
+    "SCENE_STATUS_OK",
+    "SceneAnalysisResponse",
+    "SceneCandidate",
+    "SceneGroup",
     "build_city_prediction",
     "build_prediction",
+    "build_scene_analysis",
+    "compute_image_sha256",
     "decode_image_bytes",
     "validate_image_bytes",
 ]

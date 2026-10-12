@@ -112,9 +112,29 @@ class ChatService(LegacyChatService):
         self._set_prior(session_id)
         return self._finish(super().handle_feedback(session_id, feedback), session_id)
 
-    def reason_only(self, session_id, new_clues=None, click_pos=None):
+    def reason_only(
+        self,
+        session_id,
+        new_clues=None,
+        click_pos=None,
+        point_analysis=None,
+        point_analysis_input=None,
+        point_analysis_cacheable=None,
+        point_analysis_provider_signature=None,
+    ):
         self._set_prior(session_id)
-        return self._finish(super().reason_only(session_id, new_clues, click_pos), session_id)
+        return self._finish(
+            super().reason_only(
+                session_id,
+                new_clues,
+                click_pos,
+                point_analysis=point_analysis,
+                point_analysis_input=point_analysis_input,
+                point_analysis_cacheable=point_analysis_cacheable,
+                point_analysis_provider_signature=point_analysis_provider_signature,
+            ),
+            session_id,
+        )
 
     def _prepare(self, snapshot, history, method, *, feedback=None, new_clues=None, click_pos=None):
         self._prepared = None

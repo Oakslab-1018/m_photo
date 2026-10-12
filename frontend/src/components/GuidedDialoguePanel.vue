@@ -17,6 +17,7 @@ import {
   guidedQuestionTitle,
   guidedStageTitle,
   guidedStepState,
+  guidedTargetKey,
   locationLevelLabel,
   pendingQuestionClue,
   reviewedClueStatusLabel,
@@ -37,6 +38,8 @@ const props = withDefaults(
     conflict?: string | null
     canRetry?: boolean
     receipt?: GuidedEventReceipt | null
+    selectedGuidedTargetKey?: string | null
+    suggestedFreeText?: string | null
   }>(),
   {
     loading: false,
@@ -46,10 +49,13 @@ const props = withDefaults(
     conflict: null,
     canRetry: false,
     receipt: null,
+    selectedGuidedTargetKey: null,
+    suggestedFreeText: null,
   },
 )
 
 const emit = defineEmits<{
+  'select-location': [target: LocationTarget]
   'confirm-location': [target: LocationTarget]
   'reject-location': [target: LocationTarget]
   'confirm-clue': [clueId: string]
@@ -169,13 +175,38 @@ function requestRetry(): void {
   emit('retry')
 }
 
+function selectCandidate(target: LocationTarget): void {
+  if (busy.value) return
+  emit('select-location', target)
+}
+
+function isCandidateSelected(target: LocationTarget): boolean {
+  const key = guidedTargetKey(target)
+  return key !== null && key === props.selectedGuidedTargetKey
+}
+
+function candidateTargetKey(target: LocationTarget): string {
+  return guidedTargetKey(target) ?? target.id
+}
+
 watch(
   () => props.dialogue?.revision,
   () => {
-    searchText.value = ''
+    searchText.value = props.suggestedFreeText?.trim() ?? ''
     backtrackPrompt.value = null
     showAllClues.value = false
   },
+)
+
+watch(
+  () => props.suggestedFreeText,
+  (value, previous) => {
+    const suggested = value?.trim() ?? ''
+    const previousSuggested = previous?.trim() ?? ''
+    if (suggested) searchText.value = suggested
+    else if (previousSuggested && searchText.value === previousSuggested) searchText.value = ''
+  },
+  { immediate: true },
 )
 </script>
 
@@ -293,16 +324,29 @@ watch(
           <span class="guided-section-title">{{ candidateTitle }}</span>
           <span class="guided-section-note">服务器返回的目标</span>
         </div>
-        <p class="guided-section-hint">确认或排除都只作用于后端返回的具体目标；排序分不是概率。</p>
+        <p class="guided-section-hint">单击候选卡片或地图标记只在图上高亮定位；确认或排除只作用于后端返回的具体目标，排序分不是概率。</p>
         <div v-if="!candidates.length" class="guided-empty">
           暂无候选。可通过下方文字检索目录，搜索不会自动确认地点。
         </div>
-        <article v-for="candidate in candidates" :key="candidate.target.id" class="guided-candidate-card">
+        <article
+          v-for="candidate in candidates"
+          :key="candidateTargetKey(candidate.target)"
+          class="guided-candidate-card"
+          :class="{ selected: isCandidateSelected(candidate.target) }"
+          :tabindex="busy ? -1 : 0"
+          :aria-current="isCandidateSelected(candidate.target) ? 'true' : undefined"
+          @click="selectCandidate(candidate.target)"
+          @keydown.enter.prevent="selectCandidate(candidate.target)"
+          @keydown.space.prevent="selectCandidate(candidate.target)"
+        >
           <div class="guided-candidate-main">
             <strong>{{ targetLabel(candidate.target) }}</strong>
             <span class="guided-candidate-meta">{{ candidateScoreLabel(candidate) }}</span>
             <span v-if="candidatePointLabel(candidate.target)" class="guided-candidate-point">
               {{ candidatePointLabel(candidate.target) }}
+            </span>
+            <span v-else class="guided-candidate-point missing">
+              此候选无坐标，地图不放置候选标记；选中时仅聚焦已确认父级范围
             </span>
             <p v-if="candidate.reason" class="guided-candidate-reason">{{ candidate.reason }}</p>
           </div>
@@ -311,7 +355,7 @@ watch(
               type="button"
               class="mini-btn confirm"
               :disabled="busy"
-              @click="emit('confirm-location', candidate.target)"
+              @click.stop="emit('confirm-location', candidate.target)"
             >
               确认{{ locationLevelLabel(candidate.target.level) }}
             </button>
@@ -319,7 +363,7 @@ watch(
               type="button"
               class="mini-btn reject"
               :disabled="busy"
-              @click="emit('reject-location', candidate.target)"
+              @click.stop="emit('reject-location', candidate.target)"
             >
               排除{{ locationLevelLabel(candidate.target.level) }}
             </button>

@@ -204,7 +204,11 @@ export interface AnalyzePointResponse {
   messages?: ChatMessage[]
   exclusions?: string[]
   new_clues?: Clue[]
-  crop_info?: { x: number; y: number; size: number }
+  crop_info?: CropInfo
+  focus_region?: RegionReport | null
+  model_status?: RegionModelStatus | null
+  ocr_status?: RegionOcrStatus | null
+  applied?: boolean
 }
 
 export interface MessagesResponse {
@@ -250,6 +254,143 @@ export interface PendingChatMessage {
 export interface Point {
   x: number
   y: number
+}
+
+export type AnalyzePurpose = 'auto' | 'ocr' | 'scene'
+
+export interface ImageRegion {
+  x: number
+  y: number
+  w: number
+  h: number
+}
+
+export interface AnalyzePointRequest extends Point {
+  scale?: number
+  image_region?: ImageRegion | null
+  purpose?: AnalyzePurpose
+  client_request_id?: string | null
+}
+
+export interface RegionBBox {
+  x: number
+  y: number
+  w: number
+  h: number
+}
+
+export type RegionObservationKind =
+  | 'ocr_text'
+  | 'semantic'
+  | 'pixel_signal'
+  | 'scene_hypothesis'
+  | 'crop_ranking'
+
+export type RegionTrustLevel = 'high' | 'medium' | 'low'
+
+export interface RegionTrust {
+  level: RegionTrustLevel
+  reliable: boolean
+  validated: boolean
+  affects_ranking: boolean
+  confidence_kind?: string | null
+  confidence?: number | null
+  raw_cosine?: number | null
+  uncertain?: boolean | null
+}
+
+export interface RegionObservation {
+  id: string
+  kind: RegionObservationKind
+  dimension: string
+  value: string
+  text?: string | null
+  label: string
+  evidence: string
+  source: string
+  provider?: string | null
+  bbox_norm?: RegionBBox | null
+  quad_norm?: RegionBBox | null
+  trust: RegionTrust
+}
+
+export interface RegionQuestion {
+  id: string
+  text: string
+  reason: string
+  basis_observation_ids: string[]
+}
+
+export interface RegionQuality {
+  issues: string[]
+  metrics: Record<string, unknown>
+}
+
+export interface RegionImage {
+  width: number
+  height: number
+  orientation_applied: boolean
+  detail_width: number
+  detail_height: number
+  ocr_scale: number
+}
+
+export interface RegionOcrStatus {
+  provider: string
+  enabled: boolean
+  available: boolean
+  state: string
+  line_count: number
+}
+
+export interface RegionModelStatus {
+  provider: string
+  enabled: boolean
+  available: boolean
+  state: string
+  ranking_applied: boolean
+  margin?: number | null
+  uncertain?: boolean | null
+  scene_available?: boolean | null
+  scene_state?: string | null
+  ranking_note?: string | null
+}
+
+export type RegionDedupe = 'new' | 'duplicate_region' | 'duplicate_request' | 'no_new_evidence'
+
+export interface RegionReport {
+  id: string
+  purpose: AnalyzePurpose
+  scale: number
+  bbox_px: number[]
+  bbox_norm: RegionBBox
+  context_bbox_norm?: RegionBBox | null
+  image: RegionImage
+  quality: RegionQuality
+  ocr: RegionOcrStatus
+  model: RegionModelStatus
+  observations: RegionObservation[]
+  question_suggestions: RegionQuestion[]
+  summary: string
+  dedupe: RegionDedupe
+}
+
+export interface CropInfo extends Point {
+  size: number
+  region_id?: string | null
+  bbox_px?: number[] | null
+  bbox_norm?: RegionBBox | null
+  scale?: number | null
+  purpose?: AnalyzePurpose | null
+}
+
+export interface RegionAnalysisRecord {
+  id: string
+  request: AnalyzePointRequest
+  status: 'pending' | 'failed'
+  error?: string | null
+  sessionId: number
+  epoch: number
 }
 /* ------------------------------------------------------------------ */
 /* Guided dialogue contract (see docs/guided-dialogue.md)             */

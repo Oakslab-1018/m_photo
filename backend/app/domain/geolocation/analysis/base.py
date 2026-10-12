@@ -5,7 +5,7 @@ import os
 from abc import ABC, abstractmethod
 from typing import List, Tuple
 
-from PIL import Image
+from PIL import Image, ImageOps
 
 from ..clue import Clue
 
@@ -25,7 +25,8 @@ class BaseAnalyzer(ABC):
     def load_image(image_path: str) -> Image.Image:
         if not os.path.exists(image_path):
             raise FileNotFoundError(image_path)
-        return Image.open(image_path).convert("RGB")
+        with Image.open(image_path) as image:
+            return ImageOps.exif_transpose(image).convert("RGB")
 
     @staticmethod
     def dominant_color(image_path: str) -> Tuple[int, int, int]:

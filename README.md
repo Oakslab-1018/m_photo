@@ -9,7 +9,9 @@
 - 选定国家后在该国城市目录（`data/geo_catalog.sqlite3`，34156 个城市）内检索城市候选；引导流程按已确认行政区筛选完整目录，并支持名称检索。
 - 国家、省级行政区、城市统一保存在 `data/geo_catalog.sqlite3`，支持 SQLite 索引查询及按范围分页的 GeoJSON 点输出；后端首次启动将快照导入运行库，后续启动不再解析目录 JSON。
 - 多维线索卡涵盖文字、地名、文化、行驶方向及道路、地形、水体等观察；可靠地名证据参与国家和城市候选排序。
-- 对话工作区支持补充、否定和纠正线索，发送后显示处理状态、理解结果和候选变化，失败可重试；点击图片分析局部区域。
+- 对话工作区支持补充、否定和纠正线索，发送后显示处理状态、理解结果和候选变化，失败可重试。
+- 地图随国家 → 省级行政区 → 城市的候选选择、确认和回退动态聚焦，坐标缺失时只回退到真实父级代表点。
+- 局部分析支持点选或框选、调整范围与文字/场景侧重，返回文字框、识别证据、画质提示、场景候选和核实建议。
 - 可配置 PP-OCRv5 server 完整检测、文字方向分类和识别模型；真实 OCR 安装与验证见 `docs/ocr.md`。
 - 会话、图片和完整模型排名持久化，重启后可继续。
 - 模型不可用时回落到规则，对话接口不可用时回落到模板。
@@ -54,6 +56,11 @@ docker compose up -d --build --wait
 
 访问 **http://127.0.0.1:8080**。不使用 GPU 时保持 `STREETCLIP_ENABLED=false`，跳过模型安装和启动即可。
 
+> 依赖按清华 TUNA 镜像源锁定（`uv.lock` 记录下载地址，`--frozen` 不再解析）：本网络直连
+> `files.pythonhosted.org` 会被限速到约 118KB/s 并出现 `tls handshake eof`，镜像构建取
+> 58MiB 的 `opencv-python-headless` 反复失败。换回官方源需重新锁定并同步改
+> `Dockerfile.backend` 的 `UV_DEFAULT_INDEX`：`uv lock --default-index https://pypi.org/simple`。
+
 修改 `.env` 后重新加载容器配置：
 
 ```powershell
@@ -72,4 +79,4 @@ docker compose up -d --no-build --force-recreate --wait
 - 带标注的参考街景索引是可选的：未配置时后端不下发相关字段；配置后命中结果只作检索诊断展示，不参与排序。
 - StreetCLIP 按非商业许可使用。DeepSeek 仅接收脱敏文字上下文，不发送图片；可辅助理解用户文字，提取结果经校验后参与推理，接口不可用时使用本地解析和模板。道路、地形、水体等缺少目录特征的观察会标明仅供参考，不单独改变排序。
 
-详细说明：[后端文档](backend/README.md) · [引导对话协议](docs/guided-dialogue.md) · [目录入库与 GeoJSON](docs/geo-catalog.md) · [模型接入说明](docs/streetclip-deployment-plan.md)
+详细说明：[后端文档](backend/README.md) · [引导对话协议](docs/guided-dialogue.md) · [目录入库与 GeoJSON](docs/geo-catalog.md) · [地图与局部分析](docs/interaction-analysis.md) · [模型接入说明](docs/streetclip-deployment-plan.md)

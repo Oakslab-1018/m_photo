@@ -3,6 +3,7 @@ import type {
   GuidedLocationLevel,
   GuidedQuestion,
   GuidedStage,
+  GuidedTargetRef,
   LocationCandidate,
   LocationTarget,
   ReviewedClue,
@@ -70,6 +71,22 @@ export function safeGuidedReceipt(text: string | null | undefined): string {
 
 export function locationLevelLabel(level: GuidedLocationLevel): string {
   return LEVEL_LABELS[level]
+}
+
+/** Stable key shared by candidate cards, App selection state, and map markers. */
+export function guidedTargetKey(target: GuidedTargetRef | null | undefined): string | null {
+  if (!target) return null
+  const id = typeof target.id === 'string' ? target.id.trim() : ''
+  if (!id) return null
+  return target.level + ':' + id
+}
+
+export function sameGuidedTarget(
+  left: GuidedTargetRef | null | undefined,
+  right: GuidedTargetRef | null | undefined,
+): boolean {
+  const leftKey = guidedTargetKey(left)
+  return leftKey !== null && leftKey === guidedTargetKey(right)
 }
 
 export function guidedStepState(
@@ -169,12 +186,28 @@ export function candidateScoreLabel(candidate: LocationCandidate): string {
 }
 
 export function candidatePointLabel(target: LocationTarget): string {
+  const lat = target.lat
+  const lng = target.lng
   const hasPoint =
-    typeof target.lat === 'number' &&
-    Number.isFinite(target.lat) &&
-    typeof target.lng === 'number' &&
-    Number.isFinite(target.lng)
-  return hasPoint ? '坐标为代表点，非照片 GPS' : ''
+    typeof lat === 'number' &&
+    Number.isFinite(lat) &&
+    lat >= -90 &&
+    lat <= 90 &&
+    typeof lng === 'number' &&
+    Number.isFinite(lng) &&
+    lng >= -180 &&
+    lng <= 180 &&
+    !(Math.abs(lat) < 1e-9 && Math.abs(lng) < 1e-9)
+  if (!hasPoint) return ''
+  if (target.level === 'admin1') {
+    const derived =
+      target.coordinate_source === 'admin1-largest-city-v1' ||
+      target.coordinate_quality === 'derived'
+    return derived
+      ? '省级代表点由目录最大城市坐标派生，非行政区多边形，非照片 GPS'
+      : '省级目录代表点，非行政区多边形，非照片 GPS'
+  }
+  return '坐标为代表点，非照片 GPS'
 }
 
 export function pendingQuestionClue(dialogue: GuidedDialogue): ReviewedClue | null {

@@ -427,17 +427,161 @@ class CitiesResponse(BaseModel):
         return data
 
 
+class ImageRegionModel(BaseModel):
+    """Normalized top-left crop rectangle in the EXIF-oriented image."""
+
+    x: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
+    y: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
+    w: float = Field(gt=0.0, le=1.0, allow_inf_nan=False)
+    h: float = Field(gt=0.0, le=1.0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def _inside_image(self) -> "ImageRegionModel":
+        if self.x + self.w > 1.0 + 1e-9 or self.y + self.h > 1.0 + 1e-9:
+            raise ValueError("image_region must fit inside the normalized image")
+        return self
+
+
 class AnalyzePointRequest(BaseModel):
     # allow_inf_nan=False keeps NaN/inf out: they would otherwise slip through
     # the ge/le comparisons on some platforms.
     x: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
     y: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
+    scale: float = Field(default=0.25, ge=0.08, le=0.8, allow_inf_nan=False)
+    image_region: ImageRegionModel | None = None
+    purpose: Literal["auto", "ocr", "scene"] = "auto"
+    client_request_id: str | None = Field(default=None, max_length=128)
+
+    @field_validator("client_request_id")
+    @classmethod
+    def _normalise_request_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        text = value.strip()
+        return text or None
+
+
+class RegionBBoxModel(BaseModel):
+    x: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
+    y: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
+    w: float = Field(gt=0.0, le=1.0, allow_inf_nan=False)
+    h: float = Field(gt=0.0, le=1.0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def _inside_image(self) -> "RegionBBoxModel":
+        if self.x + self.w > 1.0 + 1e-9 or self.y + self.h > 1.0 + 1e-9:
+            raise ValueError("bbox must fit inside the normalized image")
+        return self
 
 
 class CropInfoModel(BaseModel):
     x: float
     y: float
     size: int
+    region_id: str | None = None
+    bbox_px: list[int] | None = None
+    bbox_norm: RegionBBoxModel | None = None
+    scale: float | None = None
+    purpose: Literal["auto", "ocr", "scene"] | None = None
+
+    @model_serializer(mode="wrap")
+    def _drop_absent_region_fields(self, handler):
+        data = handler(self)
+        for key in ("region_id", "bbox_px", "bbox_norm", "scale", "purpose"):
+            if data.get(key) is None:
+                data.pop(key, None)
+        return data
+
+
+class RegionTrustModel(BaseModel):
+    level: Literal["high", "medium", "low"]
+    reliable: bool
+    validated: bool
+    affects_ranking: bool
+    confidence_kind: str | None = None
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0, allow_inf_nan=False)
+    raw_cosine: float | None = Field(default=None, ge=-1.0, le=1.0, allow_inf_nan=False)
+    uncertain: bool | None = None
+
+
+class RegionObservationModel(BaseModel):
+    id: str
+    kind: Literal["ocr_text", "semantic", "pixel_signal", "scene_hypothesis", "crop_ranking"]
+    dimension: str
+    value: str
+    text: str | None = None
+    label: str
+    evidence: str
+    source: str
+    provider: str | None = None
+    bbox_norm: RegionBBoxModel | None = None
+    quad_norm: RegionBBoxModel | None = None
+    trust: RegionTrustModel
+
+
+class RegionQuestionModel(BaseModel):
+    id: str
+    text: str
+    reason: str
+    basis_observation_ids: list[str] = Field(default_factory=list)
+
+
+class RegionQualityModel(BaseModel):
+    issues: list[str] = Field(default_factory=list)
+    metrics: dict[str, Any] = Field(default_factory=dict)
+
+
+class RegionImageModel(BaseModel):
+    width: int = Field(gt=0)
+    height: int = Field(gt=0)
+    orientation_applied: bool
+    detail_width: int = Field(gt=0)
+    detail_height: int = Field(gt=0)
+    ocr_scale: float = Field(gt=0.0, le=3.0, allow_inf_nan=False)
+
+
+class RegionOcrModel(BaseModel):
+    provider: str
+    enabled: bool
+    available: bool
+    state: str
+    line_count: int = Field(ge=0)
+
+
+class RegionModelModel(BaseModel):
+    provider: str
+    enabled: bool
+    available: bool
+    state: str
+    ranking_applied: bool
+    margin: float | None = Field(default=None, allow_inf_nan=False)
+    uncertain: bool | None = None
+    scene_available: bool | None = None
+    scene_state: str | None = None
+    ranking_note: str | None = None
+
+
+class RegionReportModel(BaseModel):
+    id: str
+    purpose: Literal["auto", "ocr", "scene"]
+    scale: float = Field(ge=0.08, le=0.8, allow_inf_nan=False)
+    bbox_px: list[int]
+    bbox_norm: RegionBBoxModel
+    context_bbox_norm: RegionBBoxModel | None = None
+    image: RegionImageModel
+    quality: RegionQualityModel
+    ocr: RegionOcrModel
+    model: RegionModelModel
+    observations: list[RegionObservationModel] = Field(default_factory=list)
+    question_suggestions: list[RegionQuestionModel] = Field(default_factory=list)
+    summary: str
+    dedupe: Literal["new", "duplicate_region", "duplicate_request", "no_new_evidence"]
+
+    @model_validator(mode="after")
+    def _validate_bbox_length(self) -> "RegionReportModel":
+        if len(self.bbox_px) != 4:
+            raise ValueError("bbox_px must contain left, top, right, bottom")
+        return self
 
 
 class AnalyzePointResponse(BaseModel):
@@ -448,6 +592,10 @@ class AnalyzePointResponse(BaseModel):
     clues: list[ClueModel] = Field(default_factory=list)
     exclusions: list[str] = Field(default_factory=list)
     crop_info: CropInfoModel
+    focus_region: RegionReportModel | None = None
+    model_status: RegionModelModel | None = None
+    ocr_status: RegionOcrModel | None = None
+    applied: bool = True
 
 
 class ErrorResponse(BaseModel):
@@ -485,6 +633,16 @@ __all__ = [
     "HealthResponse",
     "MatchedClueModel",
     "MessagesResponse",
+    "ImageRegionModel",
+    "RegionBBoxModel",
+    "RegionImageModel",
+    "RegionModelModel",
+    "RegionObservationModel",
+    "RegionOcrModel",
+    "RegionQualityModel",
+    "RegionQuestionModel",
+    "RegionReportModel",
+    "RegionTrustModel",
     "ReviewedClueModel",
     "UploadResponse",
 ]

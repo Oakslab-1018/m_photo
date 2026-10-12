@@ -6,12 +6,20 @@ FROM ghcr.io/astral-sh/uv:0.12.23 AS uv
 # 固定 Python 3.12 slim 运行时；uv.lock 的 requires-python 为 ==3.12.*。
 FROM python:3.12-slim-bookworm AS runtime
 
+# 包索引：uv.lock 已按 TUNA 镜像源锁定，--frozen 直接使用锁文件中的下载地址。
+# 直连 files.pythonhosted.org 在本网络下被限速到约 118KB/s 且会 tls handshake eof，
+# 58MiB 的 opencv-python-headless 反复重试仍失败（一次构建耗 23 分钟）。
+# 该参数只在重新解析依赖时生效；换回官方源须同时重新锁定：
+#   uv lock --default-index https://pypi.org/simple
+ARG UV_DEFAULT_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
     UV_PROJECT_ENVIRONMENT=/opt/venv \
     UV_CACHE_DIR=/tmp/uv-cache \
+    UV_DEFAULT_INDEX=${UV_DEFAULT_INDEX} \
     UV_PYTHON_DOWNLOADS=never \
     HOME=/tmp \
     PATH="/opt/venv/bin:$PATH" \
@@ -27,7 +35,10 @@ WORKDIR /app
 # --no-dev 只安装运行依赖，pytest 等开发依赖不进入镜像。
 COPY pyproject.toml uv.lock ./
 COPY backend/README.md ./backend/README.md
-RUN uv sync --frozen --no-dev --no-install-project
+# uv 下载缓存挂在 BuildKit 缓存卷上：约 200MiB 的 wheel 只在首次构建下载，
+# 后续重试或改代码重建无需重下，缓存本身也不写入镜像层。
+RUN --mount=type=cache,target=/tmp/uv-cache \
+    uv sync --frozen --no-dev --no-install-project
 
 # 新 FastAPI 后端及其根目录依赖模块；旧 Flask 代码不进入镜像。
 # .dockerignore 已排除 backend/.venv、backend/tests、storage/uploads、数据库等非运行文件。

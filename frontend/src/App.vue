@@ -3,19 +3,31 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { api } from '@/api'
 import { normalizeApiError } from '@/api/errors'
 import type {
+  AnalyzePointRequest,
   GuidedDialogueResponse,
   Country,
   CountryScore,
   FeedbackPayload,
   FeedbackResponse,
+  LocationTarget,
   PendingChatMessage,
+  RegionAnalysisRecord,
+  RegionQuestion,
+  RegionReport,
 } from '@/types'
 import { useGeoSession } from '@/composables/useGeoSession'
 import { useGuidedDialogue } from '@/composables/useGuidedDialogue'
 import { clueValueLabel, countGroupedClues, dimensionLabel } from '@/utils/clues'
 import { isQuestionAction } from '@/utils/dialogue'
-import { guidedStageTitle, targetLabel } from '@/utils/guided'
+import { guidedStageTitle, guidedTargetKey, targetLabel } from '@/utils/guided'
 import { feedbackReceipt, receiptText, type FeedbackReceiptTone } from '@/utils/feedback'
+import {
+  mergeRegionReports,
+  newRegionRequestId,
+  normalizeAnalyzePointRequest,
+  normalizeRegionReport,
+  regionReportsFromMessages,
+} from '@/utils/regionAnalysis'
 import {
   CHINA_REGION_LABELS,
   catalogCountryLabel,
@@ -59,13 +71,14 @@ const cityBusy = ref(false)
 const errorMessage = ref<string | null>(null)
 const uploadNotice = ref<string | null>(null)
 const cityNotice = ref<string | null>(null)
-const pointStatus = ref('点击图片任意位置，AI 将分析该区域的文字、颜色、植被等线索。')
+const pointStatus = ref('点选或框选区域后，点击“分析选定区域”；分析结果只作为线索。')
 const pointStatusKind = ref<'idle' | 'loading' | 'success' | 'error'>('idle')
 const viewerOpen = ref(false)
 const insightsOpen = ref(true)
 const clickPoints = ref<Array<{ x: number; y: number }>>([])
 const confirmCandidate = ref<(typeof session.scores.value)[number] | null>(null)
 const selectedIso = ref<string | null>(null)
+const selectedGuidedTargetKey = ref<string | null>(null)
 const countryDirectory = ref<Country[]>([])
 const feedbackDraft = ref('')
 const pendingMessages = ref<PendingChatMessage[]>([])
@@ -73,12 +86,21 @@ const lastOutcome = ref<{ tone: FeedbackReceiptTone | 'info'; text: string } | n
 const citySourceIso = ref<string | null>(null)
 const citySourceLabel = ref<string | null>(null)
 const knownCountryNames = ref<Record<string, string>>({})
+const regionRequests = ref<RegionAnalysisRecord[]>([])
+const immediateRegionReports = ref<RegionReport[]>([])
+const selectedRegionReportId = ref<string | null>(null)
+const guidedDraftText = ref<string | null>(null)
 
 /** Monotonic session generation: stale responses can never overwrite newer state. */
 const sessionEpoch = ref(0)
 /** Monotonic city-request nonce: older city responses must not replace newer country picks. */
 let cityRequestNonce = 0
 let pendingNonce = 0
+let regionRequestNonce = 0
+
+const regionReports = computed(() =>
+  mergeRegionReports(regionReportsFromMessages(session.messages.value), immediateRegionReports.value),
+)
 
 const busy = computed(
   () =>
@@ -214,11 +236,13 @@ function resetTransientUi(): void {
   confirmCandidate.value = null
   clickPoints.value = []
   selectedIso.value = null
+  selectedGuidedTargetKey.value = null
   cityNotice.value = null
   citySourceIso.value = null
   citySourceLabel.value = null
-  pointStatus.value = '点击图片任意位置，AI 将分析该区域的文字、颜色、植被等线索。'
+  pointStatus.value = '点选或框选区域后，点击“分析选定区域”；分析结果只作为线索。'
   pointStatusKind.value = 'idle'
+  resetRegionAnalysisState()
 }
 
 function cancelInFlightUi(): void {
@@ -569,19 +593,92 @@ function dismissPending(pending: PendingChatMessage): void {
   }
 }
 
+/** Resolve an explicit UI action to the exact server candidate, never a rebuilt target. */
+function currentGuidedCandidateTarget(target: LocationTarget): LocationTarget | null {
+  if (!guided.active.value) return null
+  const stage = guided.dialogue.value?.stage
+  if (!stage || stage === 'resolved' || target.level !== stage) return null
+  const candidate = guided.candidates.value.find(
+    (item) => item.target.level === target.level && item.target.id === target.id,
+  )
+  return candidate?.target ?? null
+}
+
+function guidedCountryTargetForIso(iso: string | null | undefined): LocationTarget | null {
+  if (guided.dialogue.value?.stage !== 'country') return null
+  const code = normalizeIsoCode(iso ?? '')
+  if (!code) return null
+  const candidate = guided.candidates.value.find((item) => {
+    if (item.target.level !== 'country') return false
+    return [item.target.id, item.target.country_iso, item.target.source_iso].some(
+      (value) => normalizeIsoCode(value ?? '') === code,
+    )
+  })
+  return candidate?.target ?? null
+}
+
+function selectGuidedTarget(target: LocationTarget): void {
+  if (busy.value) return
+  const candidate = currentGuidedCandidateTarget(target)
+  const key = candidate ? guidedTargetKey(candidate) : null
+  if (key) selectedGuidedTargetKey.value = key
+}
+
+function confirmGuidedTarget(target: LocationTarget): void {
+  if (busy.value) return
+  const candidate = currentGuidedCandidateTarget(target)
+  const key = candidate ? guidedTargetKey(candidate) : null
+  if (!candidate || !key) return
+  selectedGuidedTargetKey.value = key
+  void guided.confirmLocation(candidate)
+}
+
+function rejectGuidedTarget(target: LocationTarget): void {
+  if (busy.value) return
+  const candidate = currentGuidedCandidateTarget(target)
+  const key = candidate ? guidedTargetKey(candidate) : null
+  if (!candidate || !key) return
+  if (selectedGuidedTargetKey.value === key) selectedGuidedTargetKey.value = null
+  void guided.rejectLocation(candidate)
+}
+
+watch(
+  [guided.active, guided.dialogue, guided.candidates],
+  () => {
+    const key = selectedGuidedTargetKey.value
+    if (!key) return
+    const stage = guided.dialogue.value?.stage
+    if (!guided.active.value || !stage || stage === 'resolved') {
+      selectedGuidedTargetKey.value = null
+      return
+    }
+    const stillCurrent = guided.candidates.value.some(
+      (candidate) => candidate.target.level === stage && guidedTargetKey(candidate.target) === key,
+    )
+    if (!stillCurrent) selectedGuidedTargetKey.value = null
+  },
+  { flush: 'sync' },
+)
+
 /** Chat/feedback buttons requesting confirmation must go through the dialog. */
 function routeGuidedFeedback(payload: FeedbackPayload): boolean {
   if (!guided.active.value) return false
-  if (guided.loading.value || guided.applying.value) return true
+  if (busy.value) return true
   switch (payload.type) {
     case 'free_text':
       if (payload.text?.trim()) void guided.freeText(payload.text)
       break
     case 'confirm':
-      if (payload.iso) void guided.confirmCountry(payload.iso)
+      if (payload.iso) {
+        const target = guidedCountryTargetForIso(payload.iso)
+        if (target) confirmGuidedTarget(target)
+      }
       break
     case 'reject':
-      if (payload.iso) void guided.rejectCountry(payload.iso)
+      if (payload.iso) {
+        const target = guidedCountryTargetForIso(payload.iso)
+        if (target) rejectGuidedTarget(target)
+      }
       break
     case 'answer':
       void guided.answer(payload.value ?? '')
@@ -616,9 +713,8 @@ function doConfirm(): void {
   if (!candidate) return
   confirmCandidate.value = null
   if (guided.active.value) {
-    // Resolve the exact backend target inside the guided composable; never
-    // reconstruct a target from the legacy country score.
-    void guided.confirmCountry(candidate.iso)
+    const target = guidedCountryTargetForIso(candidate.iso)
+    if (target) confirmGuidedTarget(target)
     return
   }
   const payload: FeedbackPayload = { type: 'confirm', iso: candidate.iso }
@@ -626,66 +722,179 @@ function doConfirm(): void {
 }
 
 function onCountryConfirm(score: CountryScore): void {
-  if (guided.active.value && (guided.loading.value || guided.applying.value)) return
-  if (guided.active.value && guided.dialogue.value?.stage !== 'country') {
-    void guided.confirmCountry(score.iso)
+  if (guided.active.value) {
+    if (busy.value) return
+    const target = guidedCountryTargetForIso(score.iso)
+    if (target) confirmGuidedTarget(target)
     return
   }
   confirmCandidate.value = score
 }
 
 function onCountryReject(score: CountryScore): void {
-  if (guided.active.value && (guided.loading.value || guided.applying.value)) return
   if (guided.active.value) {
-    void guided.rejectCountry(score.iso)
+    if (busy.value) return
+    const target = guidedCountryTargetForIso(score.iso)
+    if (target) rejectGuidedTarget(target)
     return
   }
   onFeedback({ type: 'reject', iso: score.iso })
 }
 
-async function analyzePoint(point: { x: number; y: number }): Promise<void> {
+function resetRegionAnalysisState(): void {
+  regionRequestNonce += 1
+  regionRequests.value = []
+  immediateRegionReports.value = []
+  selectedRegionReportId.value = null
+  guidedDraftText.value = null
+}
+
+function markRegionRequest(
+  requestId: string,
+  patch: Partial<Omit<RegionAnalysisRecord, 'id' | 'request' | 'sessionId' | 'epoch'>>,
+): void {
+  regionRequests.value = regionRequests.value.map((record): RegionAnalysisRecord =>
+    record.id === requestId ? { ...record, ...patch } : record,
+  )
+}
+
+function removeRegionRequest(requestId: string): void {
+  regionRequests.value = regionRequests.value.filter((record) => record.id !== requestId)
+}
+
+function onRegionSelectionChange(): void {
+  // A new ROI supersedes any prior in-flight payload; late responses are ignored.
+  regionRequestNonce += 1
+  regionRequests.value = regionRequests.value.map((record): RegionAnalysisRecord =>
+    record.status === 'pending'
+      ? { ...record, status: 'failed', error: '请求已被新的区域选择取代，未采用。' }
+      : record,
+  )
+  pointStatus.value = '已选择新的区域，点击“分析选定区域”后再提交。'
+  pointStatusKind.value = 'idle'
+}
+
+async function analyzeRegionRequest(request: AnalyzePointRequest): Promise<void> {
   const id = session.sessionId.value
-  if (id === null || pointBusy.value || guided.loading.value || guided.applying.value) return
+  const normalized = normalizeAnalyzePointRequest(request)
+  if (id === null || normalized === null || pointBusy.value || guided.loading.value || guided.applying.value) {
+    return
+  }
+  const requestId = normalized.client_request_id || newRegionRequestId()
+  normalized.client_request_id = requestId
+  const existing = regionRequests.value.find((record) => record.id === requestId)
+  if (existing && (existing.sessionId !== id || existing.epoch !== sessionEpoch.value)) {
+    markRegionRequest(requestId, { status: 'failed', error: '原会话已变更，请在当前图片上重新选择区域。' })
+    return
+  }
+
   const epoch = sessionEpoch.value
+  const requestNonce = ++regionRequestNonce
   const snapshot = captureCandidateSnapshot()
+  const pendingRecord: RegionAnalysisRecord = {
+    id: requestId,
+    request: normalized,
+    status: 'pending',
+    error: null,
+    sessionId: id,
+    epoch,
+  }
+  regionRequests.value = [
+    pendingRecord,
+    ...regionRequests.value.filter((record) => record.id !== requestId),
+  ]
   pointBusy.value = true
-  pointStatus.value = '正在分析该区域…'
+  pointStatus.value = '正在分析所选区域…'
   pointStatusKind.value = 'loading'
   errorMessage.value = null
+
+  const stale = (): boolean => epoch !== sessionEpoch.value || requestNonce !== regionRequestNonce
   try {
-    const response = await api.analyzePoint(id, point)
-    if (epoch !== sessionEpoch.value) return
+    const response = await api.analyzePoint(id, normalized)
+    if (stale()) {
+      markRegionRequest(requestId, { status: 'failed', error: '请求已被新的区域选择取代，未采用。' })
+      return
+    }
+
     session.applyPointAnalysis(response)
-    clickPoints.value = [...clickPoints.value, point]
+    clickPoints.value = [...clickPoints.value, { x: normalized.x, y: normalized.y }]
     handleCityStaleness(snapshot)
     const newClueCount = response.new_clues?.length ?? 0
+    const report =
+      normalizeRegionReport(response.focus_region)
+      ?? regionReportsFromMessages(response.messages ?? []).at(-1)
+      ?? null
+    if (report) {
+      immediateRegionReports.value = mergeRegionReports(immediateRegionReports.value, [report])
+      selectedRegionReportId.value = report.id
+    } else {
+      selectedRegionReportId.value = null
+    }
 
-    // Point analysis mutates evidence in the same session. Wait for the
-    // authoritative guided snapshot before releasing pointBusy so an older
-    // dialogue response cannot re-enable controls against stale evidence.
+    const applied = response.applied !== false
+    let completionText: string
+    if (!report) {
+      completionText = newClueCount
+        ? `分析完成，发现 ${newClueCount} 条新线索；该响应没有区域报告，沿用原有线索。`
+        : '分析完成，没有新增线索；该响应没有区域报告，沿用原有线索。'
+    } else if (report.dedupe === 'duplicate_request' || report.dedupe === 'duplicate_region') {
+      completionText = `分析完成：${report.summary || '该区域已有报告'}（未重复写入证据）`
+    } else if (!applied) {
+      completionText = `分析完成：${report.summary || '未发现新增证据'}（报告已保留）`
+    } else {
+      completionText = `分析完成：${report.summary || `发现 ${newClueCount} 条新线索`}`
+    }
+
+    // Evidence mutates in the same session; keep global busy true until the
+    // authoritative guided snapshot has been reloaded.
     if (guided.active.value) {
       const reloaded = await guided.reload()
-      if (epoch !== sessionEpoch.value) return
-      if (!reloaded) {
-        pointStatus.value = `分析完成，发现 ${newClueCount} 条新线索，但引导状态同步失败：${guided.error.value ?? '请重试'}`
-        pointStatusKind.value = 'error'
-      } else {
-        pointStatus.value = `分析完成，发现 ${newClueCount} 条新线索，引导状态已同步。`
-        pointStatusKind.value = 'success'
+      if (stale()) {
+        markRegionRequest(requestId, { status: 'failed', error: '请求已被新的区域选择取代，未采用。' })
+        return
       }
-    } else {
-      pointStatus.value = `分析完成，发现 ${newClueCount} 条新线索，候选国家评分已更新。`
-      pointStatusKind.value = 'success'
+      if (!reloaded) {
+        const syncError = `区域分析已返回，但引导状态同步失败：${guided.error.value ?? '请重试'}`
+        markRegionRequest(requestId, { status: 'failed', error: syncError })
+        pointStatus.value = syncError
+        pointStatusKind.value = 'error'
+        return
+      }
     }
+
+    removeRegionRequest(requestId)
+    pointStatus.value = completionText
+    pointStatusKind.value = 'success'
   } catch (caught) {
-    if (epoch !== sessionEpoch.value) return
+    if (stale()) {
+      markRegionRequest(requestId, { status: 'failed', error: '请求已被新的区域选择取代，未采用。' })
+      return
+    }
     const message = normalizeApiError(caught, undefined, '局部区域分析失败').message
+    markRegionRequest(requestId, { status: 'failed', error: message })
     pointStatus.value = `分析失败：${message}`
     pointStatusKind.value = 'error'
     setError(caught, '局部区域分析失败')
   } finally {
     if (epoch === sessionEpoch.value) pointBusy.value = false
   }
+}
+
+function retryRegionRequest(request: AnalyzePointRequest): void {
+  if (pointBusy.value || guided.loading.value || guided.applying.value) return
+  void analyzeRegionRequest(request)
+}
+
+function useRegionQuestion(question: RegionQuestion): void {
+  const text = question.text.trim()
+  if (!text) return
+  guidedDraftText.value = text
+  if (!guided.active.value) feedbackDraft.value = text
+}
+
+async function onGuidedFreeText(text: string): Promise<void> {
+  const applied = await guided.freeText(text)
+  if (applied) guidedDraftText.value = null
 }
 
 async function requestCities(iso: string, sourceIso?: string | null): Promise<void> {
@@ -816,8 +1025,11 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
               :conflict="guided.conflict.value"
               :can-retry="guided.canRetry.value"
               :receipt="guided.receipt.value"
-              @confirm-location="guided.confirmLocation"
-              @reject-location="guided.rejectLocation"
+              :selected-guided-target-key="selectedGuidedTargetKey"
+              :suggested-free-text="guidedDraftText"
+              @select-location="selectGuidedTarget"
+              @confirm-location="confirmGuidedTarget"
+              @reject-location="rejectGuidedTarget"
               @confirm-clue="guided.confirmClue"
               @reject-clue="guided.rejectClue"
               @answer="(payload) => guided.answer(payload.value)"
@@ -825,7 +1037,7 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
               @retract-target="guided.retractTarget"
               @retract-clue="guided.retractClue"
               @backtrack="guided.backtrack"
-              @free-text="guided.freeText"
+              @free-text="onGuidedFreeText"
               @retry="guided.retry"
             />
             <ChatLog
@@ -891,8 +1103,16 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
                 :city-scores="session.cityScores.value"
                 :city-country-iso="session.cityCountryIso.value"
                 :selected-iso="selectedIso"
+                :guided="guided.active.value"
+                :guided-stage="guided.dialogue.value?.stage ?? null"
+                :guided-candidates="guided.candidates.value"
+                :guided-confirmed="guided.dialogue.value?.confirmed ?? null"
+                :selected-guided-target-key="selectedGuidedTargetKey"
+                :busy="busy"
                 @confirm="onCountryConfirm"
                 @select-country="selectedIso = $event"
+                @select-guided-target="selectGuidedTarget"
+                @confirm-guided-target="confirmGuidedTarget"
               />
             </template>
           </CandidatePanel>
@@ -923,8 +1143,15 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
       :analyzing="pointBusy"
       :status="pointStatus"
       :status-kind="pointStatusKind"
-      :disabled="!hasSession || guided.loading.value || guided.applying.value"
-      @analyze="analyzePoint"
+      :region-reports="regionReports"
+      :selected-region-report-id="selectedRegionReportId"
+      :region-requests="regionRequests"
+      :disabled="!hasSession || busy"
+      @analyze="analyzeRegionRequest"
+      @select-region="selectedRegionReportId = $event"
+      @retry-region="retryRegionRequest"
+      @ask-question="useRegionQuestion"
+      @selection-change="onRegionSelectionChange"
       @close="viewerOpen = false"
     />
   </div>

@@ -13,7 +13,11 @@ from starlette.concurrency import run_in_threadpool
 
 from .catalog import CatalogError, Country, compute_catalog_revision
 from .config import MODEL_ID, MODEL_REVISION, Settings, load_settings
-from .predictor import Predictor, PredictorUnavailableError
+from .predictor import (
+    Predictor,
+    PredictorUnavailableError,
+    SceneAnalysisUnavailableError,
+)
 from .schema import (
     DecodeError,
     EmptyImageError,
@@ -187,6 +191,43 @@ def create_app(
             raise HTTPException(status_code=503, detail="model unavailable") from exc
         except Exception:  # pragma: no cover - defensive sanitization
             logger.exception("unhandled city prediction failure")
+            raise HTTPException(status_code=500, detail="internal inference error") from None
+        return JSONResponse(status_code=200, content=result)
+
+    @application.post("/analyze-region")
+    async def analyze_region(
+        _auth: None = Depends(api_key_dependency),
+        file: UploadFile = File(..., description="single street-level image"),
+    ) -> JSONResponse:
+        service_impl: StreetClipService = application.state.service
+        try:
+            payload = await file.read(resolved.max_upload_bytes + 1)
+        except Exception as exc:  # pragma: no cover - Starlette read errors
+            raise HTTPException(status_code=400, detail="unable to read upload") from exc
+        finally:
+            await file.close()
+
+        try:
+            result = await run_in_threadpool(service_impl.analyze_region, payload)
+        except SceneAnalysisUnavailableError as exc:
+            logger.warning("scene analysis unavailable: %s", exc)
+            raise HTTPException(
+                status_code=503,
+                detail="scene analysis capability unavailable",
+            ) from exc
+        except ImageTooLargeError as exc:
+            raise HTTPException(status_code=413, detail=_sanitize_error_detail(str(exc))) from exc
+        except EmptyImageError as exc:
+            raise HTTPException(status_code=400, detail=_sanitize_error_detail(str(exc))) from exc
+        except ExifGpsPresentError as exc:
+            raise HTTPException(status_code=422, detail=_sanitize_error_detail(str(exc))) from exc
+        except (DecodeError, ImageValidationError) as exc:
+            raise HTTPException(status_code=400, detail=_sanitize_error_detail(str(exc))) from exc
+        except PredictorUnavailableError as exc:
+            logger.warning("scene analysis capability failed: %s", exc)
+            raise HTTPException(status_code=503, detail="scene analysis capability unavailable") from exc
+        except Exception:  # pragma: no cover - defensive sanitization
+            logger.exception("unhandled region analysis failure")
             raise HTTPException(status_code=500, detail="internal inference error") from None
         return JSONResponse(status_code=200, content=result)
 
