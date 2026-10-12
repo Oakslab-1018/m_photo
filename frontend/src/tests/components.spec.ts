@@ -5,6 +5,7 @@ import ChatLog from '@/components/ChatLog.vue'
 import ClueList from '@/components/ClueList.vue'
 import FeedbackBar from '@/components/FeedbackBar.vue'
 import type { Clue } from '@/types'
+import { clueIdentity } from '@/utils/clues'
 
 function render(component: Component, props: Record<string, unknown>): Promise<string> {
   return renderToString(createSSRApp(component, props))
@@ -64,6 +65,33 @@ describe('ClueList rendering (SSR)', () => {
   it('shows the empty hint when no clues arrive', async () => {
     const html = await render(ClueList, { clues: [] })
     expect(html).toContain('也可在对话中手动补充')
+    expect(html).not.toContain('展开其余')
+  })
+
+  it('auto-expands and marks a newly appended tail clue in an existing 5+ group', async () => {
+    const clues: Clue[] = Array.from({ length: 5 }, (_, index) => ({
+      dimension: 'signage',
+      value: `原始观察 ${index + 1}`,
+      confidence: 0.9 - index * 0.1,
+      evidence: `原始证据 ${index + 1}`,
+      source: 'ocr',
+    }))
+    const appended: Clue = {
+      dimension: 'signage',
+      value: '尾部新增观察',
+      confidence: 0.1,
+      evidence: '对话追加的新证据',
+      source: 'user',
+    }
+    const html = await render(ClueList, {
+      clues: [...clues, appended],
+      recentClueKeys: [clueIdentity(appended.dimension, appended.value)],
+    })
+
+    expect(html).toContain('尾部新增观察')
+    expect(html).toContain('对话追加的新证据')
+    expect(html).toContain('新线索')
+    expect(html).toMatch(/class="[^"]*is-new[^"]*"/)
     expect(html).not.toContain('展开其余')
   })
 })

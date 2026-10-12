@@ -17,9 +17,16 @@ import type {
 } from '@/types'
 import { useGeoSession } from '@/composables/useGeoSession'
 import { useGuidedDialogue } from '@/composables/useGuidedDialogue'
-import { clueValueLabel, countGroupedClues, dimensionLabel } from '@/utils/clues'
+import { clueIdentity, clueValueLabel, countGroupedClues, dimensionLabel } from '@/utils/clues'
 import { isQuestionAction } from '@/utils/dialogue'
-import { guidedStageTitle, guidedTargetKey, targetLabel } from '@/utils/guided'
+import {
+  guidedQuestionMessage,
+  guidedStageTitle,
+  guidedTargetKey,
+  pendingQuestionClue,
+  safeGuidedText,
+  targetLabel,
+} from '@/utils/guided'
 import { feedbackReceipt, receiptText, type FeedbackReceiptTone } from '@/utils/feedback'
 import {
   mergeRegionReports,
@@ -115,11 +122,18 @@ const hasSession = computed(() => session.sessionId.value !== null)
 const previewUrl = computed(() => localPreviewUrl.value ?? session.imageUrl.value)
 /** Card count after grouping/dedupe, matching what the clue panel actually renders. */
 const clueCount = computed(() => countGroupedClues(session.clues.value))
-const questionPending = computed(() =>
-  guided.active.value
-    ? guided.pendingQuestion.value !== null
-    : isQuestionAction(session.action.value),
-)
+const recentClueKeys = computed(() => {
+  const recent = new Set(guided.recentClueIds.value)
+  return (guided.dialogue.value?.clues ?? [])
+    .filter((clue) => recent.has(clue.id))
+    .map((clue) => clueIdentity(clue.dimension, clue.value))
+})
+const questionPending = computed(() => {
+  if (!guided.active.value) return isQuestionAction(session.action.value)
+  const question = guided.pendingQuestion.value
+  if (!question) return false
+  return guided.rankingsUnlocked.value || question.kind === 'review_clue'
+})
 const confirmSubregion = computed(() =>
   confirmCandidate.value ? regionScopeLabel(confirmCandidate.value) : null,
 )
@@ -127,6 +141,38 @@ const confirmSubregion = computed(() =>
 /** Region-aware exclusion chips: raw TW/HK/MO never render as 中国 excluded. */
 const exclusionChips = computed(() =>
   session.exclusions.value.map((iso) => ({ iso: normalizeIsoCode(iso), label: exclusionLabel(iso) })),
+)
+
+const guidedRankingsUnlocked = computed(() => guided.rankingsUnlocked.value)
+const guidedConfirmationReady = computed(() => guided.locationConfirmationReady.value)
+const guidedDataReady = computed(() => guided.dialogue.value !== null)
+const guidedMapStage = computed(() => {
+  if (!guided.active.value || !guided.dialogue.value) return null
+  return guidedRankingsUnlocked.value ? guided.dialogue.value.stage : null
+})
+const guidedPendingQuestionText = computed(() => {
+  const dialogue = guided.dialogue.value
+  const question = guided.pendingQuestion.value
+  if (!dialogue || !question) return ''
+  return guidedQuestionMessage(
+    question,
+    pendingQuestionClue(dialogue),
+    guidedRankingsUnlocked.value,
+  )
+})
+/** Never fall back to legacy score rows while guided data is loading or locked. */
+const guidedCountryScores = computed(() => {
+  if (!guided.active.value) return session.scores.value
+  if (!guidedDataReady.value || !guidedRankingsUnlocked.value) return []
+  const visible = new Set(
+    guided.topCandidates.value
+      .filter((candidate) => candidate.target.level === 'country')
+      .map((candidate) => normalizeIsoCode(candidate.target.id)),
+  )
+  return session.scores.value.filter((score) => visible.has(normalizeIsoCode(score.iso)))
+})
+const visibleCityScores = computed(() =>
+  guided.active.value && !guidedRankingsUnlocked.value ? [] : session.cityScores.value,
 )
 
 const countryOptions = computed(() => {
@@ -155,7 +201,13 @@ const sessionStatus = computed(() => {
     if (current.stage === 'resolved') {
       return `已完成：${targetLabel(current.confirmed.city)}`
     }
-    return `${guidedStageTitle(current.stage)} · 候选 ${guided.candidates.value.length} 个`
+    if (!guidedRankingsUnlocked.value) {
+      return `先核对观察 · 待处理 ${guided.pendingClueCount.value} 条`
+    }
+    if (!guidedConfirmationReady.value) {
+      return `${guidedStageTitle(current.stage)} · 候选已解锁 · 新增观察待核对`
+    }
+    return `${guidedStageTitle(current.stage)} · 候选 ${guided.topCandidates.value.length} 个`
   }
   if (session.confirmedIso.value) {
     const country = session.scores.value.find((item) => item.iso === session.confirmedIso.value)
@@ -170,8 +222,8 @@ const sessionStatus = computed(() => {
 const liveStatus = computed<{ tone: FeedbackReceiptTone | 'info'; text: string }>(() => {
   const failed = pendingMessages.value.find((item) => item.status === 'failed')
   if (failed) return { tone: 'warn', text: `发送失败：${failed.error ?? '未知错误'} · 可在对话中重试或删除` }
-  if (guided.conflict.value) return { tone: 'warn', text: guided.conflict.value }
-  if (guided.error.value) return { tone: 'warn', text: guided.error.value }
+  if (guided.conflict.value) return { tone: 'warn', text: safeGuidedText(guided.conflict.value) }
+  if (guided.error.value) return { tone: 'warn', text: safeGuidedText(guided.error.value) }
   if (guided.applying.value) return { tone: 'info', text: '正在提交引导操作，等待服务器确认…' }
   if (guided.loading.value) return { tone: 'info', text: '正在同步引导状态…' }
   if (feedbackBusy.value) return { tone: 'info', text: '正在提交反馈，等待服务器回执…' }
@@ -181,7 +233,15 @@ const liveStatus = computed<{ tone: FeedbackReceiptTone | 'info'; text: string }
     const current = guided.dialogue.value
     if (!current) return { tone: 'muted', text: '等待引导状态' }
     if (current.stage === 'resolved') return { tone: 'ok', text: `已确认城市：${targetLabel(current.confirmed.city)}` }
-    if (current.pending_question) return { tone: 'info', text: current.pending_question.message }
+    if (current.pending_question) {
+      return { tone: 'info', text: guidedPendingQuestionText.value || '请继续完成观察核对。' }
+    }
+    if (!guidedRankingsUnlocked.value) {
+      return { tone: 'muted', text: `请先核对观察 · 待处理 ${guided.pendingClueCount.value} 条` }
+    }
+    if (!guidedConfirmationReady.value) {
+      return { tone: 'muted', text: '新增观察待核对，暂不能确认地点' }
+    }
     return { tone: 'muted', text: `${guidedStageTitle(current.stage)} · 请确认或排除候选` }
   }
   if (hasSession.value) {
@@ -598,7 +658,7 @@ function currentGuidedCandidateTarget(target: LocationTarget): LocationTarget | 
   if (!guided.active.value) return null
   const stage = guided.dialogue.value?.stage
   if (!stage || stage === 'resolved' || target.level !== stage) return null
-  const candidate = guided.candidates.value.find(
+  const candidate = guided.topCandidates.value.find(
     (item) => item.target.level === target.level && item.target.id === target.id,
   )
   return candidate?.target ?? null
@@ -608,7 +668,7 @@ function guidedCountryTargetForIso(iso: string | null | undefined): LocationTarg
   if (guided.dialogue.value?.stage !== 'country') return null
   const code = normalizeIsoCode(iso ?? '')
   if (!code) return null
-  const candidate = guided.candidates.value.find((item) => {
+  const candidate = guided.topCandidates.value.find((item) => {
     if (item.target.level !== 'country') return false
     return [item.target.id, item.target.country_iso, item.target.source_iso].some(
       (value) => normalizeIsoCode(value ?? '') === code,
@@ -625,7 +685,7 @@ function selectGuidedTarget(target: LocationTarget): void {
 }
 
 function confirmGuidedTarget(target: LocationTarget): void {
-  if (busy.value) return
+  if (busy.value || !guidedConfirmationReady.value) return
   const candidate = currentGuidedCandidateTarget(target)
   const key = candidate ? guidedTargetKey(candidate) : null
   if (!candidate || !key) return
@@ -634,7 +694,7 @@ function confirmGuidedTarget(target: LocationTarget): void {
 }
 
 function rejectGuidedTarget(target: LocationTarget): void {
-  if (busy.value) return
+  if (busy.value || !guidedConfirmationReady.value) return
   const candidate = currentGuidedCandidateTarget(target)
   const key = candidate ? guidedTargetKey(candidate) : null
   if (!candidate || !key) return
@@ -652,7 +712,7 @@ watch(
       selectedGuidedTargetKey.value = null
       return
     }
-    const stillCurrent = guided.candidates.value.some(
+    const stillCurrent = guided.topCandidates.value.some(
       (candidate) => candidate.target.level === stage && guidedTargetKey(candidate.target) === key,
     )
     if (!stillCurrent) selectedGuidedTargetKey.value = null
@@ -723,7 +783,7 @@ function doConfirm(): void {
 
 function onCountryConfirm(score: CountryScore): void {
   if (guided.active.value) {
-    if (busy.value) return
+    if (busy.value || !guidedConfirmationReady.value) return
     const target = guidedCountryTargetForIso(score.iso)
     if (target) confirmGuidedTarget(target)
     return
@@ -733,7 +793,7 @@ function onCountryConfirm(score: CountryScore): void {
 
 function onCountryReject(score: CountryScore): void {
   if (guided.active.value) {
-    if (busy.value) return
+    if (busy.value || !guidedConfirmationReady.value) return
     const target = guidedCountryTargetForIso(score.iso)
     if (target) rejectGuidedTarget(target)
     return
@@ -995,7 +1055,11 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
             </svg>
             线索卡 <span class="count">{{ clueCount }}</span>
           </div>
-          <ClueList :clues="session.clues.value" :loading="uploading" />
+          <ClueList
+            :clues="session.clues.value"
+            :loading="uploading"
+            :recent-clue-keys="recentClueKeys"
+          />
         </section>
       </aside>
 
@@ -1017,7 +1081,7 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
             <GuidedDialoguePanel
               v-if="guided.active.value"
               :dialogue="guided.dialogue.value"
-              :candidates="guided.candidates.value"
+              :candidates="guided.topCandidates.value"
               :loading="guided.loading.value"
               :applying="guided.applying.value"
               :external-busy="uploading || feedbackBusy || pointBusy || cityBusy"
@@ -1027,6 +1091,9 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
               :receipt="guided.receipt.value"
               :selected-guided-target-key="selectedGuidedTargetKey"
               :suggested-free-text="guidedDraftText"
+              :candidates-unlocked="guidedRankingsUnlocked"
+              :location-confirmation-ready="guidedConfirmationReady"
+              :recent-clue-ids="guided.recentClueIds.value"
               @select-location="selectGuidedTarget"
               @confirm-location="confirmGuidedTarget"
               @reject-location="rejectGuidedTarget"
@@ -1056,7 +1123,7 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
               :disabled="!hasSession"
               @feedback="onFeedback"
             />
-            <details v-else class="guided-history">
+            <details v-else-if="guidedRankingsUnlocked" class="guided-history">
               <summary>查看推理记录（{{ session.messages.value.length }} 条）</summary>
               <ChatLog
                 :messages="session.messages.value"
@@ -1066,6 +1133,9 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
                 @dismiss="dismissPending"
               />
             </details>
+            <div v-else class="guided-history-locked">
+              观察核对完成后显示推理记录，避免提前展示可能包含地点名的内容。
+            </div>
           </div>
         </section>
 
@@ -1074,14 +1144,19 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
             embedded
             collapsible
             :collapsed="!insightsOpen"
-            :scores="session.scores.value"
+            :scores="guidedCountryScores"
             :confirmed-iso="session.confirmedIso.value"
             :selected-iso="selectedIso"
             :exclusions="exclusionChips"
             :busy="busy"
             :guided-mode="guided.active.value"
             :guided-country-allowed="!guided.active.value || guided.dialogue.value?.stage === 'country'"
-            :city-scores="session.cityScores.value"
+            :guided-candidates="guided.topCandidates.value"
+            :guided-candidates-unlocked="guidedRankingsUnlocked"
+            :guided-confirmation-ready="guidedConfirmationReady"
+            :guided-data-ready="guidedDataReady"
+            :guided-stage="guided.dialogue.value?.stage ?? null"
+            :city-scores="visibleCityScores"
             :city-country-iso="session.cityCountryIso.value"
             :cities-status="session.citiesStatus.value"
             :country-options="countryOptions"
@@ -1094,20 +1169,24 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
             @confirm="onCountryConfirm"
             @reject="onCountryReject"
             @select-country="selectedIso = $event"
+            @select-guided-target="selectGuidedTarget"
+            @confirm-guided-target="confirmGuidedTarget"
+            @reject-guided-target="rejectGuidedTarget"
             @request-cities="requestCities"
           >
             <template #map>
               <GeoMap
-                :scores="session.scores.value"
+                :scores="guidedCountryScores"
                 :confirmed-iso="session.confirmedIso.value"
-                :city-scores="session.cityScores.value"
+                :city-scores="visibleCityScores"
                 :city-country-iso="session.cityCountryIso.value"
                 :selected-iso="selectedIso"
                 :guided="guided.active.value"
-                :guided-stage="guided.dialogue.value?.stage ?? null"
-                :guided-candidates="guided.candidates.value"
+                :guided-stage="guidedMapStage"
+                :guided-candidates="guided.topCandidates.value"
                 :guided-confirmed="guided.dialogue.value?.confirmed ?? null"
                 :selected-guided-target-key="selectedGuidedTargetKey"
+                :guided-confirmation-ready="guidedConfirmationReady"
                 :busy="busy"
                 @confirm="onCountryConfirm"
                 @select-country="selectedIso = $event"

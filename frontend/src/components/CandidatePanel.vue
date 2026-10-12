@@ -1,7 +1,19 @@
 <script setup lang="ts">
 import { computed, ref, useSlots, watch } from 'vue'
-import type { CityScore, CountryScore } from '@/types'
+import type {
+  CityScore,
+  CountryScore,
+  GuidedStage,
+  LocationCandidate,
+  LocationTarget,
+} from '@/types'
 import { cityMatchedClueCount, cityScoreLabel } from '@/utils/city'
+import {
+  candidateScoreLabel,
+  locationLevelLabel,
+  selectTopGuidedCandidates,
+  targetLabel,
+} from '@/utils/guided'
 import { scoreLabel } from '@/utils/map'
 import {
   CHINA_REGION_LABELS,
@@ -38,12 +50,24 @@ const props = defineProps<{
   guidedMode?: boolean
   /** Country actions can be sent only while the guided stage is country. */
   guidedCountryAllowed?: boolean
+  /** Guided server candidates, already limited to the current stage. */
+  guidedCandidates?: LocationCandidate[]
+  /** False while pending observations still hide the country/region rankings. */
+  guidedCandidatesUnlocked?: boolean
+  /** False when a newly appended observation still needs review. */
+  guidedConfirmationReady?: boolean
+  guidedDataReady?: boolean
+  /** Current server-guided level used to keep the candidate tab label accurate. */
+  guidedStage?: GuidedStage | null
 }>()
 
 const emit = defineEmits<{
   confirm: [score: CountryScore]
   reject: [score: CountryScore]
   'select-country': [iso: string]
+  'select-guided-target': [target: LocationTarget]
+  'confirm-guided-target': [target: LocationTarget]
+  'reject-guided-target': [target: LocationTarget]
   'request-cities': [iso: string, sourceIso: string | null]
   'toggle-collapse': []
   expand: []
@@ -59,8 +83,41 @@ const ALL_TABS: Array<{ key: CandidateTab; label: string }> = [
 ]
 
 const slots = useSlots()
-const tabs = computed(() => (slots.map ? ALL_TABS : ALL_TABS.filter((tab) => tab.key !== 'map')))
-const activeTab = ref<CandidateTab>('map')
+const guidedTabLabel = computed(() => {
+  switch (props.guidedStage) {
+    case 'country':
+      return '国家 / 地区'
+    case 'admin1':
+      return '省份 / 地区'
+    case 'city':
+      return '城市候选'
+    default:
+      return '地点候选'
+  }
+})
+const tabs = computed(() => {
+  let available = slots.map ? ALL_TABS : ALL_TABS.filter((tab) => tab.key !== 'map')
+  // In guided mode the server-ranked Top-5 is the only candidate source; the
+  // legacy directory city tab would bypass that contract.
+  if (props.guidedMode) available = available.filter((tab) => tab.key !== 'city')
+  return available.map((tab) =>
+    tab.key === 'country' && props.guidedMode
+      ? { ...tab, label: guidedTabLabel.value }
+      : tab,
+  )
+})
+const activeTab = ref<CandidateTab>(slots.map ? 'map' : 'country')
+
+const guidedTopCandidates = computed(() =>
+  props.guidedMode ? selectTopGuidedCandidates(props.guidedCandidates ?? []) : [],
+)
+const countryCount = computed(() =>
+  props.guidedMode
+    ? props.guidedCandidatesUnlocked
+      ? guidedTopCandidates.value.length
+      : 0
+    : props.scores.length,
+)
 
 watch(tabs, (current) => {
   if (!current.some((tab) => tab.key === activeTab.value)) activeTab.value = 'country'
@@ -158,7 +215,7 @@ function isForeignCitySelection(): boolean {
         @click="selectTab(tab.key)"
       >
         {{ tab.label }}
-        <span v-if="tab.key === 'country'" class="tab-count">{{ scores.length }}</span>
+        <span v-if="tab.key === 'country' && countryCount" class="tab-count">{{ countryCount }}</span>
         <span v-else-if="tab.key === 'city' && cityCount" class="tab-count">{{ cityCount }}</span>
         <span v-else-if="tab.key === 'reference' && referenceCount" class="tab-count">{{ referenceCount }}</span>
       </button>
@@ -182,69 +239,134 @@ function isForeignCitySelection(): boolean {
     </div>
 
     <div v-show="activeTab === 'country' && !collapsed" class="candidate-body">
-      <div v-if="!scores.length" class="candidate-empty">
-        暂无候选国家
-        <span class="next">先上传照片并完成推理</span>
-      </div>
-      <template v-else>
-        <div class="panel-hint">
-          {{
-            guidedMode
-              ? (guidedCountryAllowed
-                ? '引导模式：这里的确认 / 排除会提交引导协议事件'
-                : '引导进行中：国家候选仅供浏览，请在主引导面板完成当前步骤')
-              : '按序候选 · 代表点不是照片 GPS；确认需二次确认'
-          }}
+      <template v-if="guidedMode">
+        <div v-if="guidedDataReady === false" class="candidate-empty">
+          正在读取服务器保存的引导状态…
+          <span class="next">加载完成前不会显示旧的国家 / 地区候选</span>
         </div>
-        <article
-          v-for="(candidate, index) in scores"
-          :key="candidate.iso"
-          class="candidate-card"
-          :class="{ selected: selectedIso === candidate.iso, confirmed: confirmedIso === candidate.iso }"
-          role="button"
-          tabindex="0"
-          :aria-pressed="selectedIso === candidate.iso"
-          @click="emit('select-country', candidate.iso)"
-          @keydown.enter.prevent="emit('select-country', candidate.iso)"
-          @keydown.space.prevent="emit('select-country', candidate.iso)"
-        >
-          <div class="candidate-main">
-            <span class="candidate-rank">{{ index + 1 }}</span>
-            <div>
-              <div class="candidate-name">
-                {{ displayCountryName(candidate) }}
-                <span v-if="regionScopeLabel(candidate)" class="tag region">
-                  区域命中 · {{ regionScopeLabel(candidate) }}
-                </span>
-                <span v-if="confirmedIso === candidate.iso" class="tag">已确认国家</span>
-              </div>
-              <div class="candidate-score">{{ scoreLabel(candidate) }}</div>
+        <div v-else-if="!guidedCandidatesUnlocked" class="candidate-empty candidate-locked">
+          先核对观察，再查看地点候选
+          <span class="next">处理完待核对观察后，这里会按排序分显示前五。</span>
+        </div>
+        <template v-else>
+          <div v-if="!guidedTopCandidates.length" class="candidate-empty">
+            暂无当前层级的地点候选
+            <span class="next">可通过主引导面板补充线索或检索目录</span>
+          </div>
+          <template v-else>
+            <div class="panel-hint">
+              {{
+                guidedConfirmationReady
+                  ? '候选可信度前五 · 排序分仅供参考，不代表概率'
+                  : '新增观察待核对，排名仍可查看，但暂不能确认或排除地点。'
+              }}
             </div>
-          </div>
-          <div class="candidate-actions">
-            <button
-              type="button"
-              class="mini-btn confirm"
-              :disabled="busy || (guidedMode && !guidedCountryAllowed)"
-              @click.stop="emit('confirm', candidate)"
-            >确认</button>
-            <button
-              type="button"
-              class="mini-btn reject"
-              :disabled="busy || (guidedMode && !guidedCountryAllowed)"
-              @click.stop="emit('reject', candidate)"
-            >排除</button>
-          </div>
-        </article>
-        <div v-if="exclusions.length" class="exclusion-note">
-          <span class="exclusion-prefix">已排除</span>
-          <span v-for="item in exclusions" :key="item.iso" class="exclusion-chip">{{ item.label }}</span>
-          <span class="exclusion-hint">区域排除仅影响该地区</span>
+            <article
+              v-for="(candidate, index) in guidedTopCandidates"
+              :key="`${candidate.target.level}:${candidate.target.id}`"
+              class="candidate-card"
+              role="button"
+              tabindex="0"
+              @click="emit('select-guided-target', candidate.target)"
+              @keydown.enter.prevent="emit('select-guided-target', candidate.target)"
+              @keydown.space.prevent="emit('select-guided-target', candidate.target)"
+            >
+              <div class="candidate-main">
+                <span class="candidate-rank">{{ index + 1 }}</span>
+                <div>
+                  <div class="candidate-name">
+                    {{ targetLabel(candidate.target) }}
+                  </div>
+                  <div class="candidate-score">{{ candidateScoreLabel(candidate) }}</div>
+                </div>
+              </div>
+              <div class="candidate-actions">
+                <button
+                  type="button"
+                  class="mini-btn confirm"
+                  :disabled="busy || !guidedConfirmationReady"
+                  @click.stop="emit('confirm-guided-target', candidate.target)"
+                >确认{{ locationLevelLabel(candidate.target.level) }}</button>
+                <button
+                  type="button"
+                  class="mini-btn reject"
+                  :disabled="busy || !guidedConfirmationReady"
+                  @click.stop="emit('reject-guided-target', candidate.target)"
+                >排除{{ locationLevelLabel(candidate.target.level) }}</button>
+              </div>
+            </article>
+          </template>
+        </template>
+      </template>
+
+      <template v-else>
+        <div v-if="!scores.length" class="candidate-empty">
+          暂无候选国家
+          <span class="next">先上传照片并完成推理</span>
         </div>
+        <template v-else>
+          <div class="panel-hint">
+            按序候选 · 代表点不是照片 GPS；确认需二次确认
+          </div>
+          <article
+            v-for="(candidate, index) in scores"
+            :key="candidate.iso"
+            class="candidate-card"
+            :class="{ selected: selectedIso === candidate.iso, confirmed: confirmedIso === candidate.iso }"
+            role="button"
+            tabindex="0"
+            :aria-pressed="selectedIso === candidate.iso"
+            @click="emit('select-country', candidate.iso)"
+            @keydown.enter.prevent="emit('select-country', candidate.iso)"
+            @keydown.space.prevent="emit('select-country', candidate.iso)"
+          >
+            <div class="candidate-main">
+              <span class="candidate-rank">{{ index + 1 }}</span>
+              <div>
+                <div class="candidate-name">
+                  {{ displayCountryName(candidate) }}
+                  <span v-if="regionScopeLabel(candidate)" class="tag region">
+                    区域命中 · {{ regionScopeLabel(candidate) }}
+                  </span>
+                  <span v-if="confirmedIso === candidate.iso" class="tag">已确认国家</span>
+                </div>
+                <div class="candidate-score">{{ scoreLabel(candidate) }}</div>
+              </div>
+            </div>
+            <div class="candidate-actions">
+              <button
+                type="button"
+                class="mini-btn confirm"
+                :disabled="busy"
+                @click.stop="emit('confirm', candidate)"
+              >确认</button>
+              <button
+                type="button"
+                class="mini-btn reject"
+                :disabled="busy"
+                @click.stop="emit('reject', candidate)"
+              >排除</button>
+            </div>
+          </article>
+          <div v-if="exclusions.length" class="exclusion-note">
+            <span class="exclusion-prefix">已排除</span>
+            <span v-for="item in exclusions" :key="item.iso" class="exclusion-chip">{{ item.label }}</span>
+            <span class="exclusion-hint">区域排除仅影响该地区</span>
+          </div>
+        </template>
       </template>
     </div>
 
-    <div v-show="activeTab === 'city' && !collapsed" class="candidate-body">
+    <div v-if="!guidedMode" v-show="activeTab === 'city' && !collapsed" class="candidate-body">
+      <div v-if="guidedMode && guidedDataReady === false" class="candidate-empty">
+        正在读取服务器保存的引导状态…
+        <span class="next">加载完成前不会显示旧的城市候选</span>
+      </div>
+      <div v-else-if="guidedMode && !guidedCandidatesUnlocked" class="candidate-empty candidate-locked">
+        先核对观察，再查看城市候选
+        <span class="next">国家 / 地区与城市候选会在观察核对完成后显示。</span>
+      </div>
+      <template v-else>
       <div class="city-toolbar">
         <label>
           选择国家/地区
@@ -301,10 +423,18 @@ function isForeignCitySelection(): boolean {
           </div>
         </article>
       </template>
+      </template>
     </div>
 
     <div v-show="activeTab === 'reference' && !collapsed" class="candidate-body reference-tab">
-      <ReferenceMatches :scores="scores" />
+      <div v-if="guidedMode && guidedDataReady === false" class="candidate-empty">
+        正在读取服务器保存的引导状态…
+      </div>
+      <div v-else-if="guidedMode && !guidedCandidatesUnlocked" class="candidate-empty candidate-locked">
+        先核对观察，再查看参考街景诊断
+        <span class="next">锁定期间的参考候选不会提前显示。</span>
+      </div>
+      <ReferenceMatches v-else :scores="scores" />
     </div>
   </section>
 </template>

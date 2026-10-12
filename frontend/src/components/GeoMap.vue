@@ -45,6 +45,7 @@ const props = withDefaults(
     guidedCandidates?: LocationCandidate[]
     guidedConfirmed?: GuidedConfirmedPath | null
     selectedGuidedTargetKey?: string | null
+    guidedConfirmationReady?: boolean
     busy?: boolean
   }>(),
   {
@@ -56,6 +57,7 @@ const props = withDefaults(
     guidedCandidates: () => [],
     guidedConfirmed: null,
     selectedGuidedTargetKey: null,
+    guidedConfirmationReady: true,
     busy: false,
   },
 )
@@ -208,6 +210,9 @@ function guidedPointTooltip(point: MapPoint): string {
     }
     return parentPrefix + levelLabel + ' ' + point.name + ' · 用户确认路径；坐标为代表点，不是照片 GPS' + score
   }
+  const actionHint = props.guidedConfirmationReady
+    ? '双击确认'
+    : '完成新增观察核对后可双击确认'
   if (level === 'admin1') {
     return (
       '候选省份 / 地区 ' +
@@ -215,18 +220,22 @@ function guidedPointTooltip(point: MapPoint): string {
       ' · ' +
       admin1Provenance +
       score +
-      ' · 单击选中，双击确认省份 / 地区'
+      ' · 单击选中，' +
+      actionHint +
+      '省份 / 地区'
     )
   }
   if (level === 'city') {
-    return '候选城市 ' + point.name + ' · 城市目录代表点，不是照片 GPS' + score + ' · 单击选中，双击确认城市'
+    return '候选城市 ' + point.name + ' · 城市目录代表点，不是照片 GPS' + score + ' · 单击选中，' + actionHint + '城市'
   }
   return (
     '候选国家 / 地区 ' +
     point.name +
     ' · 目录代表点，不是照片 GPS' +
     score +
-    ' · 单击选中，双击确认国家 / 地区'
+    ' · 单击选中，' +
+    actionHint +
+    '国家 / 地区'
   )
 }
 
@@ -272,7 +281,14 @@ function markerElement(point: MapPoint): HTMLElement {
         el.addEventListener('dblclick', (event) => {
           event.preventDefault()
           event.stopPropagation()
-          if (props.busy || !point.isCurrentCandidate || target.level !== props.guidedStage) return
+          if (
+            props.busy ||
+            !props.guidedConfirmationReady ||
+            !point.isCurrentCandidate ||
+            target.level !== props.guidedStage
+          ) {
+            return
+          }
           cancelPendingMarkerClick()
           emit('confirm-guided-target', target)
         })
@@ -483,6 +499,13 @@ watch(guidedMarkerSignature, () => {
 })
 
 watch(
+  () => props.guidedConfirmationReady,
+  () => {
+    if (guidedMode.value) renderMarkers()
+  },
+)
+
+watch(
   () => [props.scores, props.cityScores],
   () => {
     if (!guidedMode.value) {
@@ -544,7 +567,11 @@ onBeforeUnmount(() => {
         <span><i class="legend-dot confirmed" />用户已确认国家</span>
       </div>
       <span class="map-hint">
-        {{ guidedMode ? '单击选中候选 · 双击确认当前层级 · 省级代表点非行政区多边形，所有坐标非照片 GPS' : '单击选中国家 · 双击确认国家 · 标记均为代表点，不是照片 GPS' }}
+        {{ guidedMode
+          ? (guidedConfirmationReady
+            ? '单击选中候选 · 双击确认当前层级 · 省级代表点非行政区多边形，所有坐标非照片 GPS'
+            : '单击选中候选 · 新增观察待核对，暂不能确认地点 · 所有坐标非照片 GPS')
+          : '单击选中国家 · 双击确认国家 · 标记均为代表点，不是照片 GPS' }}
       </span>
       <div class="focus-group">
         <template v-if="guidedMode">

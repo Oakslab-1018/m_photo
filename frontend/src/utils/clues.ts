@@ -3,11 +3,11 @@ import type { Clue } from '@/types'
 export const DIMENSION_LABELS: Record<string, string> = {
   language: '文字语言',
   signage: '招牌文字',
-  place_name: '地名文字',
-  road: '道路特征',
-  driving_side: '行驶方向',
-  terrain: '地形地貌',
-  waterbody: '水体特征',
+  place_name: '地名证据',
+  road: '道路词汇',
+  driving_side: '通行方向',
+  terrain: '地形词汇',
+  waterbody: '水体词汇',
   vegetation: '植被类型',
   building: '建筑风格',
   vehicle: '车辆特征',
@@ -31,7 +31,7 @@ export const VALUE_LABELS: Record<string, string> = {
   colonial: '殖民风格',
   gothic: '哥特式',
   modern_glass: '现代玻璃幕墙',
-  generic: '通用/不明显',
+  generic: '普通 / 不明显',
   mediterranean_sunny: '地中海晴朗气候',
   temperate_maritime: '温带海洋性气候',
   cold_polar: '寒冷气候',
@@ -209,6 +209,11 @@ export function dimensionLabel(dimension: string): string {
 
 export function clueValueLabel(value: string): string {
   return VALUE_LABELS[value] ?? value
+}
+
+/** Stable identity shared by guided snapshots and the left clue list. */
+export function clueIdentity(dimension: string, value: string): string {
+  return JSON.stringify([dimension, value])
 }
 
 export function confidencePercent(confidence: number): string {

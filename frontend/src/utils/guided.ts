@@ -22,6 +22,9 @@ export const GUIDED_STEPS: GuidedStep[] = [
   { level: 'city', label: '城市' },
 ]
 
+/** Guided cards intentionally expose only the strongest five location options. */
+export const GUIDED_CANDIDATE_LIMIT = 5
+
 const LEVEL_LABELS: Record<GuidedLocationLevel, string> = {
   country: '国家 / 地区',
   admin1: '省份 / 地区',
@@ -34,6 +37,23 @@ const STAGE_TITLES: Record<GuidedStage, string> = {
   city: '确认城市',
   resolved: '已确认城市',
 }
+
+const LOCALIZED_DIMENSION_PATTERN = Object.values({
+  language: '文字语言',
+  signage: '招牌文字',
+  place_name: '地名证据',
+  road: '道路词汇',
+  driving_side: '通行方向',
+  terrain: '地形词汇',
+  waterbody: '水体词汇',
+  vegetation: '植被类型',
+  building: '建筑风格',
+  vehicle: '车辆特征',
+  climate: '气候特征',
+  culture: '文化符号',
+  infrastructure: '基础设施',
+  other: '其他线索',
+}).join('|')
 
 const QUESTION_TITLES: Record<GuidedQuestion['kind'], string> = {
   review_clue: '核对一条观察',
@@ -53,12 +73,24 @@ function levelText(level: string): string {
   return '国家 / 地区'
 }
 
-/** Sanitize known backend audit phrases without rewriting user free text. */
+/** Sanitize known backend enum/audit phrases without exposing raw contract tokens. */
 export function safeGuidedText(text: string | null | undefined): string {
-  return (text ?? '').replace(
-    /(回退到|当前)\s*(admin1|country|city)\s*阶段/gi,
-    (_match, prefix: string, level: string) => `${prefix}${levelText(level)}阶段`,
-  )
+  return (text ?? '')
+    .replace(
+      /\b([a-z][a-z0-9_]*)\s*=\s*([a-z][a-z0-9_]*)\b/gi,
+      (_match, dimension: string, value: string) =>
+        `${dimensionLabel(dimension.toLowerCase())}=${clueValueLabel(value.toLowerCase())}`,
+    )
+    .replace(
+      new RegExp(`(${LOCALIZED_DIMENSION_PATTERN})\\s*=\\s*([a-z][a-z0-9_]*)`, 'gi'),
+      (_match, dimension: string, value: string) => `${dimension}=${clueValueLabel(value.toLowerCase())}`,
+    )
+    .replace(/\bgeneric\b/gi, '普通 / 不明显')
+    .replace(/通用\s*\/\s*不明显/g, '普通 / 不明显')
+    .replace(
+      /(回退到|当前)\s*(admin1|country|city)\s*阶段/gi,
+      (_match, prefix: string, level: string) => `${prefix}${levelText(level)}阶段`,
+    )
 }
 
 /** Receipt summaries may be short backend phrases; remove remaining internal tokens. */
@@ -136,7 +168,7 @@ export function guidedQuestionReason(question: GuidedQuestion): string {
   }
   switch (question.kind) {
     case 'review_clue':
-      return '这条观察会影响后续候选排序；确认观察不等于确认地点。'
+      return '请帮我们判断这条观察是否准确；确认观察不等于确认地点。'
     case 'ask':
       return '这项信息有助于区分当前候选，请选择最符合照片的答案。'
     case 'confirm_location':
@@ -151,16 +183,119 @@ export function reviewedClueStatusLabel(status: ReviewedClueStatus): string {
     case 'pending':
       return '待核对'
     case 'confirmed':
-      return '已确认证据'
+      return '观察准确'
     case 'rejected':
-      return '已排除证据'
+      return '已标记不准确'
     case 'uncertain':
-      return '不确定（不排除）'
+      return '暂不确定（未排除）'
   }
 }
 
 export function reviewedClueText(clue: ReviewedClue): string {
   return `${dimensionLabel(clue.dimension)} · ${clueValueLabel(clue.value)}`
+}
+
+/** All pending observations must be handled before a location can be confirmed. */
+export function hasPendingReviewedClues(dialogue: GuidedDialogue | null | undefined): boolean {
+  return Boolean(dialogue?.clues.some((clue) => clue.status === 'pending'))
+}
+
+function isUserReviewedClue(clue: ReviewedClue): boolean {
+  const source = clue.source.trim().toLowerCase()
+  return source === 'user' || source.startsWith('guided_user')
+}
+
+/**
+ * Bounded rebuild of the sticky ranking unlock after a reload.
+ *
+ * All-pending snapshots stay locked. Pending machine evidence also stays
+ * locked because a refresh cannot distinguish initial model observations from
+ * newly appended machine evidence. If every pending row is user-originated and
+ * the snapshot already contains a handled observation or confirmed path, the
+ * initial machine review must have completed; rankings may reopen while the
+ * user rows still block location confirmation.
+ */
+export function canUnlockReviewedRankings(dialogue: GuidedDialogue | null | undefined): boolean {
+  if (!dialogue) return false
+  const pending = dialogue.clues.filter((clue) => clue.status === 'pending')
+  if (!pending.length) return true
+  const pendingOnlyUser = pending.every(isUserReviewedClue)
+  const hasHandledObservation = dialogue.clues.some((clue) => clue.status !== 'pending')
+  const hasConfirmedPath = Boolean(
+    dialogue.confirmed.country || dialogue.confirmed.admin1 || dialogue.confirmed.city,
+  )
+  return pendingOnlyUser && (hasHandledObservation || hasConfirmedPath)
+}
+
+/** Natural Chinese prompt built from the server clue, never the raw enum message. */
+export function guidedQuestionMessage(
+  question: GuidedQuestion,
+  clue?: ReviewedClue | null,
+  locationCandidatesVisible = true,
+): string {
+  if (!locationCandidatesVisible && question.kind !== 'review_clue') {
+    return '请先完成上方观察核对，地点候选会在核对完成后显示。'
+  }
+  if (question.kind !== 'review_clue' || !clue) return safeGuidedText(question.message)
+  const dimension = clue.dimension || question.dimension || ''
+  const value = clueValueLabel(clue.value)
+  if (dimension === 'building') {
+    return `我们初步判断这是‘${value}’的建筑风格，您觉得准确吗？`
+  }
+  if (dimension === 'language') {
+    return `我们初步判断画面中的文字语言是‘${value}’，您觉得准确吗？`
+  }
+  if (dimension === 'signage' || dimension === 'place_name') {
+    return `我们初步判断画面中出现了‘${value}’，这项观察准确吗？`
+  }
+  if (dimension === 'driving_side') {
+    return `我们初步判断这里可能是‘${value}’，您觉得准确吗？`
+  }
+  return `我们初步判断这是‘${value}’的${dimensionLabel(dimension)}，您觉得准确吗？`
+}
+
+/**
+ * Deduplicate and rank guided candidates by a real finite score. Catalog-only
+ * rows never receive a synthetic score; they only fill remaining Top-5 slots.
+ */
+export function selectTopGuidedCandidates(
+  candidates: readonly LocationCandidate[],
+  stage?: GuidedLocationLevel | null,
+): LocationCandidate[] {
+  const uniqueByKey = new Map<string, { candidate: LocationCandidate; index: number; score: number | null }>()
+  for (const [index, candidate] of candidates.entries()) {
+    if (!candidate || (stage && candidate.target.level !== stage)) continue
+    const key = guidedTargetKey(candidate.target)
+    if (!key) continue
+    const score =
+      typeof candidate.score === 'number' && Number.isFinite(candidate.score)
+        ? candidate.score
+        : null
+    const current = uniqueByKey.get(key)
+    if (!current) {
+      uniqueByKey.set(key, { candidate, index, score })
+      continue
+    }
+    if (score !== null && (current.score === null || score > current.score)) {
+      uniqueByKey.set(key, {
+        candidate,
+        index: Math.min(index, current.index),
+        score,
+      })
+    }
+  }
+  const unique = [...uniqueByKey.values()].sort((left, right) => left.index - right.index)
+
+  const scored = unique
+    .filter((entry): entry is { candidate: LocationCandidate; index: number; score: number } => entry.score !== null)
+    .sort((left, right) => right.score - left.score || left.index - right.index)
+  const catalogOnly = unique.filter((entry) => entry.score === null)
+  const slots = Math.max(0, GUIDED_CANDIDATE_LIMIT - scored.length)
+
+  return [
+    ...scored.slice(0, GUIDED_CANDIDATE_LIMIT).map(({ candidate }) => candidate),
+    ...catalogOnly.slice(0, slots).map(({ candidate }) => candidate),
+  ]
 }
 
 function scoreTypeLabel(scoreType: string | null | undefined): string {

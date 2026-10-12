@@ -13,6 +13,7 @@ import type {
   LocationTarget,
 } from '@/types'
 import { normalizeIsoCode } from '@/utils/geo'
+import { canUnlockReviewedRankings, selectTopGuidedCandidates } from '@/utils/guided'
 
 export interface GuidedDialogueApi {
   dialogueStart(sessionId: number): Promise<GuidedDialogueResponse>
@@ -124,11 +125,42 @@ export function useGuidedDialogue(
   const failedQuestion = ref<GuidedQuestion | null>(null)
   const retryable = ref(false)
   const activeSessionId = ref<number | null>(null)
+  /**
+   * Once a stage's review round has completed, rankings stay visible even if a
+   * later dialogue turn adds new pending observations. Location confirmation
+   * still waits for every current observation to be handled.
+   */
+  const unlockedStages = ref<Set<GuidedLocationLevel>>(new Set())
+  const recentClueIds = ref<string[]>([])
 
   const pendingQuestion = computed<GuidedQuestion | null>(
     () => dialogue.value?.pending_question ?? null,
   )
   const canRetry = computed(() => retryable.value && failedEvent.value !== null)
+  const pendingClueCount = computed(
+    () => dialogue.value?.clues.filter((clue) => clue.status === 'pending').length ?? 0,
+  )
+  const hasPendingClues = computed(() => pendingClueCount.value > 0)
+  const rankingsUnlocked = computed(() => {
+    const current = dialogue.value
+    if (!current) return false
+    if (current.stage === 'resolved') return true
+    return unlockedStages.value.has(current.stage)
+  })
+  const locationConfirmationReady = computed(
+    () =>
+      active.value &&
+      dialogue.value !== null &&
+      dialogue.value.stage !== 'resolved' &&
+      rankingsUnlocked.value &&
+      !hasPendingClues.value,
+  )
+  /** Only the five visible server candidates can be selected or confirmed. */
+  const topCandidates = computed(() => {
+    const current = dialogue.value
+    if (!current || current.stage === 'resolved' || !rankingsUnlocked.value) return []
+    return selectTopGuidedCandidates(candidates.value, current.stage)
+  })
 
   let generation = 0
 
@@ -149,6 +181,23 @@ export function useGuidedDialogue(
     failedQuestion.value = null
     retryable.value = false
     activeSessionId.value = null
+    unlockedStages.value = new Set()
+    recentClueIds.value = []
+  }
+
+  function unlockCompletedStages(value: GuidedDialogue): void {
+    if (!canUnlockReviewedRankings(value)) return
+    const next = new Set(unlockedStages.value)
+    if (value.stage === 'resolved') {
+      next.add('country')
+      next.add('admin1')
+      next.add('city')
+    } else {
+      next.add('country')
+      if (value.stage === 'admin1' || value.stage === 'city') next.add('admin1')
+      if (value.stage === 'city') next.add('city')
+    }
+    unlockedStages.value = next
   }
 
   function clear(): void {
@@ -168,8 +217,16 @@ export function useGuidedDialogue(
     if (!response?.dialogue || typeof response.dialogue.revision !== 'number') {
       throw new ApiError({ message: '后端返回的引导状态不完整，请重试' })
     }
+    const previous = dialogue.value
+    const previousIds = new Set(previous?.clues.map((clue) => clue.id) ?? [])
     dialogue.value = response.dialogue
     candidates.value = [...(response.candidates ?? [])]
+    recentClueIds.value = previous
+      ? response.dialogue.clues
+          .filter((clue) => !previousIds.has(clue.id))
+          .map((clue) => clue.id)
+      : []
+    unlockCompletedStages(response.dialogue)
     receipt.value = response.receipt ?? null
     options.onSnapshot?.(response)
   }
@@ -194,6 +251,8 @@ export function useGuidedDialogue(
     failedEvent.value = null
     failedQuestion.value = null
     retryable.value = false
+    unlockedStages.value = new Set()
+    recentClueIds.value = []
 
     try {
       const response = await client.dialogueStart(target)
@@ -372,6 +431,22 @@ export function useGuidedDialogue(
       return Promise.resolve(false)
     }
 
+    if (input.type === 'confirm_location' || input.type === 'reject_location') {
+      if (!locationConfirmationReady.value) {
+        error.value = hasPendingClues.value
+          ? `请先处理上方 ${pendingClueCount.value} 条待核对观察，再选择地点。`
+          : '地点候选尚未就绪，请先重新加载引导状态。'
+        return Promise.resolve(false)
+      }
+      if (
+        input.target &&
+        !topCandidates.value.some((candidate) => sameTarget(candidate.target, input.target as GuidedTargetRef))
+      ) {
+        error.value = '该地点不在当前前五候选中，请从页面显示的候选重新选择。'
+        return Promise.resolve(false)
+      }
+    }
+
     const invalid = validateEvent(input)
     if (invalid) {
       error.value = invalid
@@ -390,9 +465,10 @@ export function useGuidedDialogue(
     return question.id
   }
 
-  function locationQuestionId(): string | undefined {
+  function locationQuestionId(target: LocationTarget): string | undefined {
     const question = dialogue.value?.pending_question
-    return question?.kind === 'confirm_location' ? question.id : undefined
+    if (question?.kind !== 'confirm_location' || !question.target) return undefined
+    return sameTarget(question.target, target) ? question.id : undefined
   }
 
   function targetRef(target: LocationTarget): GuidedTargetRef {
@@ -403,7 +479,7 @@ export function useGuidedDialogue(
     return send({
       type: 'confirm_location',
       target: targetRef(target),
-      question_id: locationQuestionId(),
+      question_id: locationQuestionId(target),
     })
   }
 
@@ -411,14 +487,14 @@ export function useGuidedDialogue(
     return send({
       type: 'reject_location',
       target: targetRef(target),
-      question_id: locationQuestionId(),
+      question_id: locationQuestionId(target),
     })
   }
 
   function targetForCountry(iso: string): LocationTarget | null {
     const code = normalizeIsoCode(iso)
     if (!code) return null
-    const candidate = candidates.value.find((item) => {
+    const candidate = topCandidates.value.find((item) => {
       if (item.target.level !== 'country') return false
       return [item.target.id, item.target.country_iso, item.target.source_iso]
         .some((value) => normalizeIsoCode(value ?? '') === code)
@@ -538,6 +614,12 @@ export function useGuidedDialogue(
     candidates,
     receipt,
     pendingQuestion,
+    pendingClueCount,
+    hasPendingClues,
+    rankingsUnlocked,
+    locationConfirmationReady,
+    topCandidates,
+    recentClueIds,
     canRetry,
     start,
     reload,

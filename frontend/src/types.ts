@@ -453,6 +453,8 @@ export interface GuidedQuestion {
   message: string
   dimension?: string | null
   clue_id?: string | null
+  /** Present for confirm_location; optional for older/adjacent backend payloads. */
+  target?: LocationTarget | null
   options?: GuidedQuestionOption[] | null
 }
 

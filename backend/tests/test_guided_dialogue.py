@@ -12,7 +12,6 @@ from fastapi.testclient import TestClient
 
 from backend.app.database import GeoSession, GuidedDialogue, GuidedEvent
 from backend.app.main import create_app
-from backend.app.services.admin1_catalog import Admin1CatalogError
 from backend.app.services.city_catalog import load_city_index
 from backend.app.services.model_gateway import StreetClipGateway
 from backend.app.services.pipeline import PipelineService
@@ -67,6 +66,32 @@ def event(client: TestClient, session_id: int, payload: dict) -> dict:
     return response
 
 
+def review_pending_clues(
+    client: TestClient,
+    session_id: int,
+    body: dict,
+    *,
+    decision: str = "confirmed",
+    tag: str = "review",
+) -> dict:
+    """Answer every pending review_clue question through the normal flow."""
+    index = 0
+    while True:
+        question = body["dialogue"]["pending_question"]
+        if not isinstance(question, dict) or question.get("kind") != "review_clue":
+            return body
+        response = event(client, session_id, {
+            "type": "confirm_clue" if decision == "confirmed" else "reject_clue",
+            "event_id": f"{tag}-{index}",
+            "expected_revision": body["dialogue"]["revision"],
+            "question_id": question["id"],
+            "clue_id": question["clue_id"],
+        })
+        assert response.status_code == 200, response.text
+        body = response.json()
+        index += 1
+
+
 def confirm_country(
     client: TestClient,
     session_id: int,
@@ -74,6 +99,7 @@ def confirm_country(
     event_id: str = "country",
     iso: str = "JP",
 ) -> dict:
+    body = review_pending_clues(client, session_id, body, tag=f"{event_id}-review")
     response = event(client, session_id, {
         "type": "confirm_location",
         "event_id": event_id,
@@ -85,6 +111,7 @@ def confirm_country(
 
 
 def confirm_admin1(client: TestClient, session_id: int, body: dict, event_id: str = "admin1") -> dict:
+    body = review_pending_clues(client, session_id, body, tag=f"{event_id}-review")
     response = event(client, session_id, {
         "type": "confirm_location",
         "event_id": event_id,
@@ -202,6 +229,100 @@ def test_unknown_requires_question_and_does_not_advance(api):
     assert stale_question.status_code == 409
 
 
+def test_unknown_then_retract_requeues_review_before_location_confirmation(api):
+    client, _, _ = api
+    session_id = upload(client)
+    body = start(client, session_id)
+    question = body["dialogue"]["pending_question"]
+    assert question is not None and question["kind"] == "review_clue"
+    clue_id = question["clue_id"]
+
+    unknown = event(client, session_id, {
+        "type": "unknown",
+        "event_id": "unknown-review",
+        "expected_revision": body["dialogue"]["revision"],
+        "question_id": question["id"],
+    })
+    assert unknown.status_code == 200, unknown.text
+    body = unknown.json()
+    assert next(
+        item for item in body["dialogue"]["clues"] if item["id"] == clue_id
+    )["status"] == "uncertain"
+
+    restored = event(client, session_id, {
+        "type": "retract",
+        "event_id": "retract-unknown-review",
+        "expected_revision": body["dialogue"]["revision"],
+        "clue_id": clue_id,
+    })
+    assert restored.status_code == 200, restored.text
+    body = restored.json()
+    restored_question = body["dialogue"]["pending_question"]
+    assert restored_question is not None
+    assert restored_question["kind"] == "review_clue"
+    assert restored_question["clue_id"] == clue_id
+
+    reviewed = review_pending_clues(
+        client, session_id, body, tag="unknown-retract-review"
+    )
+    assert reviewed["dialogue"]["pending_question"]["kind"] == "confirm_location"
+    confirmed = event(client, session_id, {
+        "type": "confirm_location",
+        "event_id": "confirm-after-unknown-retract",
+        "expected_revision": reviewed["dialogue"]["revision"],
+        "target": {"level": "country", "id": "JP"},
+    })
+    assert confirmed.status_code == 200, confirmed.text
+    assert confirmed.json()["dialogue"]["stage"] == "admin1"
+
+
+def test_get_repairs_persisted_pending_clue_with_stale_asked_review(api):
+    client, _, app = api
+    session_id = upload(client)
+    initial = start(client, session_id)
+    question = initial["dialogue"]["pending_question"]
+    assert question is not None and question["kind"] == "review_clue"
+    clue_id = question["clue_id"]
+
+    with app.state.session_factory() as db:
+        row = db.get(GuidedDialogue, session_id)
+        state = row.state
+        for item in state["clues"]:
+            if isinstance(item, dict):
+                item["status"] = "pending" if item.get("id") == clue_id else "confirmed"
+        state["asked_question_ids"] = [f"review:{clue_id}"]
+        state["pending_question"] = {
+            "id": "confirm:country:JP",
+            "kind": "confirm_location",
+            "message": "stale confirm question",
+            "target": {"level": "country", "id": "JP"},
+        }
+        row.state = state
+        db.commit()
+
+    repaired = client.get(f"/api/geo/{session_id}/dialogue")
+    assert repaired.status_code == 200, repaired.text
+    body = repaired.json()
+    assert body["dialogue"]["revision"] == initial["dialogue"]["revision"] + 1
+    repaired_question = body["dialogue"]["pending_question"]
+    assert repaired_question is not None
+    assert repaired_question["kind"] == "review_clue"
+    assert repaired_question["clue_id"] == clue_id
+    assert body["messages"] == initial["messages"]
+
+    with app.state.session_factory() as db:
+        row = db.get(GuidedDialogue, session_id)
+        assert row.revision == body["dialogue"]["revision"]
+        assert f"review:{clue_id}" not in row.state["asked_question_ids"]
+        assert row.state["pending_question"]["kind"] == "review_clue"
+
+    repeated = client.get(f"/api/geo/{session_id}/dialogue")
+    assert repeated.status_code == 200, repeated.text
+    repeated_body = repeated.json()
+    assert repeated_body["dialogue"]["revision"] == body["dialogue"]["revision"]
+    assert repeated_body["messages"] == body["messages"]
+
+
 def test_scoped_exclusion_filters_only_its_scope_and_retract_restores(api):
     client, _, _ = api
     session_id = upload(client)
@@ -255,7 +376,7 @@ def test_backtrack_clears_children_but_keeps_exclusions(api):
 def test_duplicate_event_id_replays_receipt_and_stale_revision_conflicts(api):
     client, _, _ = api
     session_id = upload(client)
-    body = start(client, session_id)
+    body = review_pending_clues(client, session_id, start(client, session_id), tag="idempotent-review")
     payload = {
         "type": "confirm_location",
         "event_id": "idempotent-country",
@@ -309,10 +430,11 @@ def test_free_text_proposes_city_outside_national_top10_without_confirming(api):
     assert any(item["target"]["id"] == str(omitted.city_id) for item in result["candidates"])
     assert result["dialogue"]["confirmed"]["city"] is None
 
+    reviewed = review_pending_clues(client, session_id, result, tag="omitted-city-review")
     confirmed = event(client, session_id, {
         "type": "confirm_location",
         "event_id": "confirm-omitted-city",
-        "expected_revision": result["dialogue"]["revision"],
+        "expected_revision": reviewed["dialogue"]["revision"],
         "target": {"level": "city", "id": str(omitted.city_id)},
     })
     assert confirmed.status_code == 200, confirmed.text
@@ -437,15 +559,15 @@ def test_missing_admin1_catalog_is_explicit_unavailable(api, monkeypatch):
     session_id = upload(client)
     confirm_country(client, session_id, start(client, session_id))
 
-    import backend.app.services.guided_dialogue as guided_module
+    import backend.app.services.geo_catalog_store as store_module
 
-    def missing():
-        raise Admin1CatalogError("missing catalog")
+    def missing(self, source_iso):
+        raise RuntimeError("missing catalog")
 
-    monkeypatch.setattr(guided_module, "load_admin1_index", missing)
+    monkeypatch.setattr(store_module.GeoCatalogStore, "admin1_rows", missing)
     response = client.get(f"/api/geo/{session_id}/dialogue")
     assert response.status_code == 503
-    assert response.json()["error"] == "一级行政区目录不可用"
+    assert response.json()["error"] == "地理目录数据库不可用"
 
 
 def test_guided_state_survives_restart(tmp_path, monkeypatch):
@@ -465,10 +587,188 @@ def test_guided_state_survives_restart(tmp_path, monkeypatch):
         assert body["dialogue"]["stage"] == "admin1"
 
 
-def test_rollback_when_strict_serialization_fails(api, monkeypatch):
+def test_confirm_location_cannot_skip_pending_clue_review(api):
     client, _, app = api
     session_id = upload(client)
     body = start(client, session_id)
+    question = body["dialogue"]["pending_question"]
+    assert question is not None and question["kind"] == "review_clue"
+
+    blocked = event(client, session_id, {
+        "type": "confirm_location",
+        "event_id": "skip-clue-review",
+        "expected_revision": body["dialogue"]["revision"],
+        "target": {"level": "country", "id": "JP"},
+    })
+    assert blocked.status_code == 409, blocked.text
+
+    current = client.get(f"/api/geo/{session_id}/dialogue").json()
+    assert current["dialogue"]["revision"] == body["dialogue"]["revision"]
+    assert current["dialogue"]["stage"] == "country"
+    assert current["dialogue"]["confirmed"]["country"] is None
+    assert current["dialogue"]["pending_question"]["id"] == question["id"]
+    with app.state.session_factory() as db:
+        assert db.query(GuidedEvent).filter_by(
+            session_id=session_id, event_id="skip-clue-review"
+        ).first() is None
+
+    reviewed = review_pending_clues(client, session_id, current, tag="skip-review")
+    confirmed = event(client, session_id, {
+        "type": "confirm_location",
+        "event_id": "confirm-after-review",
+        "expected_revision": reviewed["dialogue"]["revision"],
+        "target": {"level": "country", "id": "JP"},
+    })
+    assert confirmed.status_code == 200, confirmed.text
+    assert confirmed.json()["dialogue"]["stage"] == "admin1"
+
+
+def test_free_text_proposal_cannot_confirm_past_pending_review(api):
+    client, _, _ = api
+    session_id = upload(client)
+    proposed = event(client, session_id, {
+        "type": "free_text",
+        "event_id": "free-text-proposal",
+        "expected_revision": start(client, session_id)["dialogue"]["revision"],
+        "text": "这是日本",
+    })
+    assert proposed.status_code == 200, proposed.text
+    body = proposed.json()
+    question = body["dialogue"]["pending_question"]
+    assert question is not None and question["kind"] == "review_clue"
+
+    blocked = event(client, session_id, {
+        "type": "confirm_location",
+        "event_id": "free-text-skip-review",
+        "expected_revision": body["dialogue"]["revision"],
+        "target": {"level": "country", "id": "JP"},
+    })
+    assert blocked.status_code == 409, blocked.text
+    current = client.get(f"/api/geo/{session_id}/dialogue").json()
+    assert current["dialogue"]["confirmed"]["country"] is None
+    assert current["dialogue"]["revision"] == body["dialogue"]["revision"]
+
+
+def test_confirm_location_blocked_while_correction_ask_has_pending_clues(api):
+    client, _, _ = api
+    session_id = upload(client)
+    body = start(client, session_id)
+    corrected = event(client, session_id, {
+        "type": "free_text",
+        "event_id": "correction-ask",
+        "expected_revision": body["dialogue"]["revision"],
+        "text": "不是日本",
+    })
+    assert corrected.status_code == 200, corrected.text
+    body = corrected.json()
+    question = body["dialogue"]["pending_question"]
+    assert question is not None and question["kind"] == "ask"
+    assert any(item["status"] == "pending" for item in body["dialogue"]["clues"])
+
+    blocked = event(client, session_id, {
+        "type": "confirm_location",
+        "event_id": "confirm-during-correction",
+        "expected_revision": body["dialogue"]["revision"],
+        "target": {"level": "country", "id": "JP"},
+    })
+    assert blocked.status_code == 409, blocked.text
+    current = client.get(f"/api/geo/{session_id}/dialogue").json()
+    assert current["dialogue"]["stage"] == "country"
+    assert current["dialogue"]["confirmed"]["country"] is None
+    assert current["dialogue"]["revision"] == body["dialogue"]["revision"]
+    assert current["dialogue"]["pending_question"]["id"] == question["id"]
+
+    resolved = event(client, session_id, {
+        "type": "answer",
+        "event_id": "keep-correction",
+        "expected_revision": current["dialogue"]["revision"],
+        "question_id": question["id"],
+        "value": "keep",
+    })
+    assert resolved.status_code == 200, resolved.text
+    reviewed = review_pending_clues(client, session_id, resolved.json(), tag="post-correction")
+    confirmed = event(client, session_id, {
+        "type": "confirm_location",
+        "event_id": "confirm-after-correction",
+        "expected_revision": reviewed["dialogue"]["revision"],
+        "target": {"level": "country", "id": "JP"},
+    })
+    assert confirmed.status_code == 200, confirmed.text
+    assert confirmed.json()["dialogue"]["stage"] == "admin1"
+
+
+def test_confirm_location_blocked_while_conflict_ask_has_pending_clues(api):
+    client, _, _ = api
+    session_id = upload(client)
+    body = confirm_country(client, session_id, start(client, session_id))
+    body = confirm_admin1(client, session_id, body)
+    conflicted = event(client, session_id, {
+        "type": "free_text",
+        "event_id": "conflict-ask",
+        "expected_revision": body["dialogue"]["revision"],
+        "text": "这是Osaka",
+    })
+    assert conflicted.status_code == 200, conflicted.text
+    body = conflicted.json()
+    question = body["dialogue"]["pending_question"]
+    assert question is not None and question["kind"] == "ask"
+    assert any(item["status"] == "pending" for item in body["dialogue"]["clues"])
+
+    blocked = event(client, session_id, {
+        "type": "confirm_location",
+        "event_id": "confirm-during-conflict",
+        "expected_revision": body["dialogue"]["revision"],
+        "target": {"level": "city", "id": "1853909"},
+    })
+    assert blocked.status_code == 409, blocked.text
+    current = client.get(f"/api/geo/{session_id}/dialogue").json()
+    assert current["dialogue"]["stage"] == "city"
+    assert current["dialogue"]["confirmed"]["city"] is None
+    assert current["dialogue"]["revision"] == body["dialogue"]["revision"]
+
+    resolved = event(client, session_id, {
+        "type": "answer",
+        "event_id": "resolve-conflict",
+        "expected_revision": current["dialogue"]["revision"],
+        "question_id": question["id"],
+        "value": "东京",
+    })
+    assert resolved.status_code == 200, resolved.text
+    reviewed = review_pending_clues(client, session_id, resolved.json(), tag="post-conflict")
+    confirmed = event(client, session_id, {
+        "type": "confirm_location",
+        "event_id": "confirm-after-conflict",
+        "expected_revision": reviewed["dialogue"]["revision"],
+        "target": {"level": "city", "id": "1850147"},
+    })
+    assert confirmed.status_code == 200, confirmed.text
+    assert confirmed.json()["dialogue"]["stage"] == "resolved"
+
+
+def test_review_question_uses_natural_chinese_labels(api, monkeypatch):
+    monkeypatch.setattr(PipelineService, "analyze", lambda self, path: [{
+        "dimension": "building",
+        "value": "generic",
+        "confidence": 0.9,
+        "evidence": "test",
+        "source": "building",
+    }])
+    client, _, _ = api
+    session_id = upload(client)
+    body = start(client, session_id)
+    question = body["dialogue"]["pending_question"]
+    assert question is not None and question["kind"] == "review_clue"
+    assert "建筑风格" in question["message"]
+    assert "普通 / 不明显" in question["message"]
+    assert "您觉得准确吗" in question["message"]
+    assert "generic" not in question["message"]
+    assert "building" not in question["message"]
+
+
+def test_rollback_when_strict_serialization_fails(api, monkeypatch):
+    client, _, app = api
+    session_id = upload(client)
+    body = review_pending_clues(client, session_id, start(client, session_id), tag="rollback-review")
     revision = body["dialogue"]["revision"]
 
     import backend.app.services.guided_dialogue as guided_module
@@ -487,6 +787,8 @@ def test_rollback_when_strict_serialization_fails(api, monkeypatch):
     with app.state.session_factory() as db:
         row = db.get(GuidedDialogue, session_id)
         assert row.revision == revision
-        assert db.get(GuidedEvent, 1) is None
+        assert db.query(GuidedEvent).filter_by(
+            session_id=session_id, event_id="rollback-country"
+        ).first() is None
         session = db.get(GeoSession, session_id)
         assert (session.confirmed_iso, session.status) == (None, "active")

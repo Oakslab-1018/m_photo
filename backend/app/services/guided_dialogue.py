@@ -27,7 +27,7 @@ from services.chat import ChineseFreeTextParser, PendingQuestion
 
 from ..config import Settings
 from ..database import GeoSession, GuidedDialogue, GuidedEvent
-from ..domain.geolocation.clue import Clue, DIM_LABELS, dicts_to_clues
+from ..domain.geolocation.clue import Clue, DIM_LABELS, VALUE_LABELS, dicts_to_clues
 from ..domain.geolocation.country_policy import (
     canonical_country_iso,
     country_members,
@@ -80,6 +80,15 @@ _CLUE_PRIORITY = {
     "vehicle": 7,
 }
 _LEVEL_LABELS = {"country": "国家", "admin1": "一级行政区", "city": "城市"}
+
+# 面向用户的复核文案复用共享中文取值标签；个别展示口径在此覆盖。
+_VALUE_LABEL_OVERRIDES = {"generic": "普通 / 不明显"}
+
+
+def _value_label(value: object) -> str:
+    raw = str(value or "").strip()
+    return _VALUE_LABEL_OVERRIDES.get(raw) or VALUE_LABELS.get(raw) or raw
+
 
 # Explicit, catalog-validated Chinese aliases for guided city proposals. The
 # legacy parser's alias map is country-level and intentionally not reused as a
@@ -346,6 +355,7 @@ class GuidedDialogueService:
                 response = self._response(session_id, prepared, revision=row.revision, receipt=None)
                 self._strict_response(response)
                 return response
+            new_revision = row.revision + 1
             try:
                 with self.geo.transaction():
                     result = self.geo.session.execute(
@@ -355,7 +365,7 @@ class GuidedDialogueService:
                             GuidedDialogue.revision == row.revision,
                         )
                         .values(
-                            revision=row.revision + 1,
+                            revision=new_revision,
                             stage=prepared.stage,
                             state_json=json.dumps(prepared.state, ensure_ascii=False, allow_nan=False),
                             updated_at=datetime.utcnow(),
@@ -363,7 +373,7 @@ class GuidedDialogueService:
                     )
                     if result.rowcount != 1:
                         raise _ReconcileRetry
-                    response = self._response(session_id, prepared, revision=row.revision + 1, receipt=None)
+                    response = self._response(session_id, prepared, revision=new_revision, receipt=None)
                     self._strict_response(response)
                 return response
             except _ReconcileRetry:
@@ -904,12 +914,28 @@ class GuidedDialogueService:
             and str(record.get("_origin") or "") != "session"
         ]
         clues = [*reconciled_session, *guided_only]
+        pending_clue_ids = {
+            str(record.get("id"))
+            for record in clues
+            if isinstance(record, Mapping)
+            and record.get("id")
+            and str(record.get("status") or "pending") == "pending"
+        }
+        stale_review_ids = {f"review:{clue_id}" for clue_id in pending_clue_ids}
+        asked_question_ids = list(state.get("asked_question_ids") or [])
+        pruned_asked_question_ids = [
+            item for item in asked_question_ids if str(item) not in stale_review_ids
+        ]
+        asked_reviews_changed = pruned_asked_question_ids != asked_question_ids
         changed = (
             str(state.get("session_evidence_fingerprint") or "") != fingerprint
             or list(state.get("clues") or []) != clues
+            or asked_reviews_changed
         )
         state["clues"] = clues
         state["session_evidence_fingerprint"] = fingerprint
+        if asked_reviews_changed:
+            state["asked_question_ids"] = pruned_asked_question_ids
         if changed:
             state["pending_question"] = None
         return state, changed
@@ -1351,14 +1377,16 @@ class GuidedDialogueService:
     def _question_is_valid(self, state: Mapping[str, Any], question: Mapping[str, Any]) -> bool:
         kind = str(question.get("kind") or "")
         question_id = str(question.get("id") or "")
-        asked = {str(item) for item in state.get("asked_question_ids") or []}
-        if not question_id or question_id in asked:
+        if not question_id:
             return False
         if kind == "review_clue":
             clue_id = str(question.get("clue_id") or "")
             for record in state.get("clues") or []:
                 if isinstance(record, Mapping) and str(record.get("id")) == clue_id:
                     return str(record.get("status") or "") == "pending"
+            return False
+        asked = {str(item) for item in state.get("asked_question_ids") or []}
+        if question_id in asked:
             return False
         if kind == "confirm_location":
             target = question.get("target")
@@ -1396,10 +1424,14 @@ class GuidedDialogueService:
         if clear_exclusions:
             parts.append("撤回排除：" + "、".join(str(item) for item in clear_exclusions))
         if replace_dimensions:
-            parts.append("替换线索维度：" + "、".join(str(item) for item in replace_dimensions))
+            parts.append(
+                "替换线索维度："
+                + "、".join(DIM_LABELS.get(str(item), str(item)) for item in replace_dimensions)
+            )
         if remove_clue_values:
             parts.append("移除线索值：" + "、".join(
-                f"{item[0]}={item[1]}" for item in remove_clue_values
+                f"{DIM_LABELS.get(str(item[0]), str(item[0]))}「{_value_label(item[1])}」"
+                for item in remove_clue_values
                 if isinstance(item, (list, tuple)) and len(item) == 2
             ))
         detail = "；".join(parts) or "文本中的修正"
@@ -1464,14 +1496,17 @@ class GuidedDialogueService:
         ))
         for record in pending_clues:
             clue_id = str(record.get("id") or "")
-            if not clue_id or f"review:{clue_id}" in asked:
+            if not clue_id:
                 continue
             dimension = str(record.get("dimension") or "")
             value = str(record.get("value") or "")
             question = {
                 "id": f"review:{clue_id}",
                 "kind": "review_clue",
-                "message": f"请复核线索：{DIM_LABELS.get(dimension, dimension)}={value}。这条线索是否正确？",
+                "message": (
+                    f"我们初步判断这是「{_value_label(value)}」的"
+                    f"{DIM_LABELS.get(dimension, dimension)}，您觉得准确吗？"
+                ),
                 "dimension": dimension,
                 "clue_id": clue_id,
                 "options": [
@@ -1672,6 +1707,8 @@ class GuidedDialogueService:
             allowed_kinds={"confirm_location"},
             target={"level": event.target.level, "id": event.target.id},
         )
+        if self._has_pending_clue_review(state):
+            raise GuidedConflict("请先完成当前线索核对，再确认地点。")
         target = self._resolve_target(event.target)
         self._validate_confirmation(state, target)
         excluded = self._excluded_by_state(state, target)
@@ -1751,6 +1788,12 @@ class GuidedDialogueService:
                 state["clues"] = [
                     updated if isinstance(item, Mapping) and str(item.get("id")) == str(event.clue_id) else item
                     for item in state["clues"]
+                ]
+                review_question_id = f"review:{event.clue_id}"
+                state["asked_question_ids"] = [
+                    item
+                    for item in state.get("asked_question_ids") or []
+                    if str(item) != review_question_id
                 ]
                 state["pending_question"] = None
                 self._refresh_conflict(state)
@@ -2078,6 +2121,20 @@ class GuidedDialogueService:
             pending_target = pending.get("target")
             if not isinstance(pending_target, Mapping) or _target_key(pending_target) != _target_key(target):
                 raise GuidedConflict("question_id 与目标地点不匹配")
+
+    def _has_pending_clue_review(self, state: Mapping[str, Any]) -> bool:
+        """True while any observation clue still awaits review.
+
+        Covers both the current ``review_clue`` question and correction/conflict
+        asks that take precedence while unreviewed clues are queued.
+        """
+        pending = state.get("pending_question")
+        if isinstance(pending, Mapping) and str(pending.get("kind") or "") == "review_clue":
+            return True
+        for record in state.get("clues") or []:
+            if isinstance(record, Mapping) and str(record.get("status") or "pending") == "pending":
+                return True
+        return False
 
     def _require_question(self, state: Mapping[str, Any], event: GuidedEventRequest) -> dict[str, Any]:
         pending = state.get("pending_question")
