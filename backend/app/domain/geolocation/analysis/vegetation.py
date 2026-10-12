@@ -50,6 +50,6 @@ class VegetationAnalyzer(BaseAnalyzer):
                 confidence=round(confidence, 3),
                 evidence=evidence,
                 source=self.name,
-                extra={"green_ratio": round(green, 3), "dominant_rgb": [r, g, b]},
+                extra={"green_ratio": round(green, 3), "dominant_rgb": [r, g, b], "display_only": True, "affects_ranking": False, "reliable": False},
             )
         ]

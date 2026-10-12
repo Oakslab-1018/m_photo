@@ -200,8 +200,63 @@ export function hasPendingReviewedClues(dialogue: GuidedDialogue | null | undefi
   return Boolean(dialogue?.clues.some((clue) => clue.status === 'pending'))
 }
 
+/**
+ * Blocking questions (ask/correction/request_clue) must be answered in the
+ * review box before any location candidate may be shown. A confirm_location
+ * question is not a review blocker: it is answered later by an explicit
+ * candidate confirm, never by an `answer` chip.
+ */
+export function isBlockingGuidedQuestion(question: GuidedQuestion | null | undefined): boolean {
+  return Boolean(question && question.kind !== 'confirm_location')
+}
+
+/** Every observation handled and no unresolved ask/correction left. */
+export function guidedReviewReady(dialogue: GuidedDialogue | null | undefined): boolean {
+  if (!dialogue || dialogue.stage === 'resolved') return false
+  if (hasPendingReviewedClues(dialogue)) return false
+  return !isBlockingGuidedQuestion(dialogue.pending_question)
+}
+
+/** The single observation the server currently pins for review, if any. */
+export function guidedCurrentReviewClue(
+  dialogue: GuidedDialogue | null | undefined,
+): ReviewedClue | null {
+  const question = dialogue?.pending_question
+  if (!dialogue || !question || question.kind !== 'review_clue' || !question.clue_id) return null
+  return dialogue.clues.find((clue) => clue.id === question.clue_id) ?? null
+}
+
+/** Position of the server-pinned review clue inside the snapshot, e.g. 第2/8. */
+export function guidedReviewProgress(
+  dialogue: GuidedDialogue | null | undefined,
+): { current: number; total: number } | null {
+  const clue = guidedCurrentReviewClue(dialogue)
+  if (!clue || !dialogue) return null
+  const index = dialogue.clues.findIndex((item) => item.id === clue.id)
+  if (index < 0) return null
+  return { current: index + 1, total: dialogue.clues.length }
+}
+
+/** The level a prominent 返回上一步 button backtracks to, or null at country. */
+export function guidedPreviousLevel(
+  stage: GuidedStage | null | undefined,
+): GuidedLocationLevel | null {
+  switch (stage) {
+    case 'admin1':
+      return 'country'
+    case 'city':
+      return 'admin1'
+    case 'resolved':
+      return 'city'
+    default:
+      return null
+  }
+}
+
 function isUserReviewedClue(clue: ReviewedClue): boolean {
-  const source = clue.source.trim().toLowerCase()
+  // Snapshots from some deployments omit `source`; a missing provenance must
+  // never throw (it only means the row cannot be trusted as user evidence).
+  const source = (clue.source ?? '').trim().toLowerCase()
   return source === 'user' || source.startsWith('guided_user')
 }
 
@@ -233,8 +288,11 @@ export function guidedQuestionMessage(
   clue?: ReviewedClue | null,
   locationCandidatesVisible = true,
 ): string {
-  if (!locationCandidatesVisible && question.kind !== 'review_clue') {
-    return '请先完成上方观察核对，地点候选会在核对完成后显示。'
+  // Only the location-confirmation prompt may carry a place name that must stay
+  // hidden until the candidate phase; blocking ask/correction prompts stay
+  // readable in the review box so they can never be swallowed by the gate.
+  if (!locationCandidatesVisible && question.kind === 'confirm_location') {
+    return '下一步将展示地点候选，选择合适的地点后再确认。'
   }
   if (question.kind !== 'review_clue' || !clue) return safeGuidedText(question.message)
   const dimension = clue.dimension || question.dimension || ''
@@ -260,7 +318,7 @@ export function guidedQuestionMessage(
  */
 export function selectTopGuidedCandidates(
   candidates: readonly LocationCandidate[],
-  stage?: GuidedLocationLevel | null,
+  stage?: GuidedStage | null,
 ): LocationCandidate[] {
   const uniqueByKey = new Map<string, { candidate: LocationCandidate; index: number; score: number | null }>()
   for (const [index, candidate] of candidates.entries()) {

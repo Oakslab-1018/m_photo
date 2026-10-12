@@ -57,7 +57,7 @@ from ..schemas import (
 from .city_catalog import CityRow
 from .city_reasoning import CityClueReasoner
 from .geo_session import GeoSessionService
-from .model_gateway import StreetClipGateway
+from .model_gateway import StreetClipGateway, build_inference_notice
 
 DIALOGUE_VERSION = 1
 COUNTRY_CANDIDATE_LIMIT = 20
@@ -261,14 +261,38 @@ def _question_model(question: Mapping[str, Any] | None) -> GuidedQuestionModel |
             for item in raw_options
             if isinstance(item, Mapping) and item.get("value") and item.get("label")
         ] or None
+    raw_target = question.get("target")
+    target = GuidedLocationTarget(**dict(raw_target)) if isinstance(raw_target, Mapping) else None
     return GuidedQuestionModel(
         id=str(question.get("id") or ""),
         kind=str(question.get("kind") or "request_clue"),
         message=str(question.get("message") or "请进一步说明地点。"),
         dimension=str(question["dimension"]) if question.get("dimension") else None,
         clue_id=str(question["clue_id"]) if question.get("clue_id") else None,
+        target=target,
         options=options,
     )
+
+
+def _review_question(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Build the authoritative review question for one clue record."""
+    clue_id = str(record.get("id") or "")
+    dimension = str(record.get("dimension") or "")
+    value = str(record.get("value") or "")
+    return {
+        "id": f"review:{clue_id}",
+        "kind": "review_clue",
+        "message": (
+            f"我们初步判断这是「{_value_label(value)}」的"
+            f"{DIM_LABELS.get(dimension, dimension)}，您觉得准确吗？"
+        ),
+        "dimension": dimension,
+        "clue_id": clue_id,
+        "options": [
+            {"value": "confirmed", "label": "确认"},
+            {"value": "rejected", "label": "否定"},
+        ],
+    }
 
 
 @dataclass
@@ -280,6 +304,7 @@ class _Prepared:
     action: ActionModel
     legacy_confirmed_iso: str | None
     legacy_status: str
+    inference_notice: str | None = None
 
 
 class GuidedDialogueService:
@@ -957,20 +982,30 @@ class GuidedDialogueService:
         state: Mapping[str, Any],
         session: GeoSession,
         clues: Sequence[Clue],
-    ) -> list[Any]:
+    ) -> tuple[list[Any], str | None]:
         engine = ModelAwareEngine()
-        if session.model_evidence is not None:
+        evidence = session.model_evidence
+        validation_failed = False
+        if evidence is not None:
             try:
-                engine.evidence = self.gateway.validate(session.model_evidence)
+                engine.evidence = self.gateway.validate(evidence)
             except Exception:
                 engine.evidence = None
+                validation_failed = True
         guided_country_exclusions = [
             str(target.get("id"))
             for target in state.get("exclusions") or []
             if isinstance(target, Mapping) and target.get("level") == "country"
         ]
         exclusions = list(session.exclusions or []) + guided_country_exclusions
-        return engine.infer(clues, exclusions=exclusions, top_n=COUNTRY_CANDIDATE_LIMIT)
+        scores = engine.infer(clues, exclusions=exclusions, top_n=COUNTRY_CANDIDATE_LIMIT)
+        notice = build_inference_notice(
+            self.settings,
+            evidence,
+            validation_failed=validation_failed,
+            has_trusted_evidence=bool(scores),
+        )
+        return scores, notice
 
     # ------------------------------------------------------------- candidates
     @staticmethod
@@ -1006,6 +1041,7 @@ class GuidedDialogueService:
         scores: Sequence[Any],
         *,
         query: str | None,
+        allow_catalog_fallback: bool = True,
     ) -> list[dict[str, Any]]:
         query_key = normalize_place_text(query or "")
         result: list[dict[str, Any]] = []
@@ -1041,7 +1077,11 @@ class GuidedDialogueService:
 
         # Catalog-only fallback keeps no-provider operation usable and performs
         # query filtering over the complete country directory before any limit.
+        # A degraded model session with no trusted text evidence must instead
+        # produce an empty candidate list and request a usable clue.
         catalog: list[dict[str, Any]] = []
+        if not allow_catalog_fallback:
+            return self._merge_candidates(result, [])
         for country in self._country_records():
             iso = canonical_country_iso(country.get("iso"))
             if not iso or iso in seen or excluded(iso):
@@ -1334,10 +1374,15 @@ class GuidedDialogueService:
     ) -> _Prepared:
         state = _normalise_state(state)
         clues = self._ranking_clues(state)
-        scores = self._country_scores(state, session, clues)
+        scores, inference_notice = self._country_scores(state, session, clues)
         stage = self._stage_for_state(state)
         proposals = [dict(item) for item in state.get("proposals") or [] if isinstance(item, Mapping)]
-        country_candidates = self._country_candidates(state, scores, query=query)
+        country_candidates = self._country_candidates(
+            state,
+            scores,
+            query=query,
+            allow_catalog_fallback=bool(scores) or inference_notice is None,
+        )
         if stage == "country":
             proposed_countries = [
                 self._candidate(target, reason="自由文本提议")
@@ -1352,12 +1397,29 @@ class GuidedDialogueService:
             if stage in {"city", "resolved"}
             else []
         )
+        if inference_notice and not scores:
+            # Older rule-fallback sessions may have persisted a catalog-only
+            # confirm question. Do not keep presenting a location choice when
+            # this session has no usable model or trusted text evidence.
+            pending = state.get("pending_question")
+            if isinstance(pending, Mapping) and str(pending.get("kind") or "") == "confirm_location":
+                state["pending_question"] = None
+                state["asked_question_ids"] = [
+                    item
+                    for item in state.get("asked_question_ids") or []
+                    if not str(item).startswith(f"request:{stage}")
+                ]
+                ensure_question = True
         question = (
             self._ensure_question(state, country_candidates, admin1_candidates, city_candidates)
             if ensure_question
             else state.get("pending_question")
         )
         action = self._action_for_state(state, question)
+        if inference_notice:
+            action = action.model_copy(
+                update={"message": f"{inference_notice}\n{action.message}"}
+            )
         legacy_iso, legacy_status = self._legacy_fields(state)
         return _Prepared(
             state=state,
@@ -1371,6 +1433,7 @@ class GuidedDialogueService:
             action=action,
             legacy_confirmed_iso=legacy_iso,
             legacy_status=legacy_status,
+            inference_notice=inference_notice,
         )
 
     # -------------------------------------------------------------- questions
@@ -1498,22 +1561,7 @@ class GuidedDialogueService:
             clue_id = str(record.get("id") or "")
             if not clue_id:
                 continue
-            dimension = str(record.get("dimension") or "")
-            value = str(record.get("value") or "")
-            question = {
-                "id": f"review:{clue_id}",
-                "kind": "review_clue",
-                "message": (
-                    f"我们初步判断这是「{_value_label(value)}」的"
-                    f"{DIM_LABELS.get(dimension, dimension)}，您觉得准确吗？"
-                ),
-                "dimension": dimension,
-                "clue_id": clue_id,
-                "options": [
-                    {"value": "confirmed", "label": "确认"},
-                    {"value": "rejected", "label": "否定"},
-                ],
-            }
+            question = _review_question(record)
             state["pending_question"] = question
             return question
 
@@ -1701,6 +1749,9 @@ class GuidedDialogueService:
     ) -> dict[str, Any]:
         if event.target is None:
             raise GuidedValidationError("缺少目标地点")
+        pending = state.get("pending_question")
+        if isinstance(pending, Mapping) and str(pending.get("kind") or "") == "ask":
+            raise GuidedConflict("请先处理当前澄清问题，再确认地点。")
         self._check_question_reference(
             state,
             event,
@@ -1795,7 +1846,10 @@ class GuidedDialogueService:
                     for item in state.get("asked_question_ids") or []
                     if str(item) != review_question_id
                 ]
-                state["pending_question"] = None
+                # Pin the restored clue as the current review question. The
+                # generic priority scan could otherwise return a different
+                # pending clue while the correction/conflict remains queued.
+                state["pending_question"] = _review_question(updated)
                 self._refresh_conflict(state)
                 return self._outcome(state, True, "applied", "线索已恢复为待复核。")
             raise GuidedValidationError("未知线索 ID")
@@ -2457,6 +2511,7 @@ class GuidedDialogueService:
             clues=clue_models,
             exclusions=list(session.exclusions or []),
             receipt=receipt,
+            inference_notice=prepared.inference_notice,
         )
 
 

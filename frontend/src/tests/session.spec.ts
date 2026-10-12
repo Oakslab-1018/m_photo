@@ -172,6 +172,57 @@ describe('useGeoSession', () => {
     ])
   })
 
+  it('surfaces the degraded-inference notice and keeps it until a snapshot updates it', () => {
+    const session = useGeoSession()
+    session.applyUpload(upload({ inference_notice: '本次模型结果不可用，已回退到规则排序。' }))
+    expect(session.inferenceNotice.value).toContain('回退')
+
+    // Older guided payloads without the field must not erase a real notice.
+    session.applyGuidedResponse({
+      dialogue: {
+        version: 1,
+        revision: 2,
+        stage: 'country',
+        confirmed: { country: null, admin1: null, city: null },
+        exclusions: [],
+        clues: [],
+        pending_question: null,
+      },
+      candidates: [],
+      action: null,
+      messages: [],
+      scores: [],
+      clues: [],
+      exclusions: [],
+    })
+    expect(session.inferenceNotice.value).toContain('回退')
+
+    // A healthy snapshot (explicit null) clears it again.
+    session.applyGuidedResponse({
+      dialogue: {
+        version: 1,
+        revision: 3,
+        stage: 'country',
+        confirmed: { country: null, admin1: null, city: null },
+        exclusions: [],
+        clues: [],
+        pending_question: null,
+      },
+      candidates: [],
+      action: null,
+      messages: [],
+      scores: [],
+      clues: [],
+      exclusions: [],
+      inference_notice: null,
+    })
+    expect(session.inferenceNotice.value).toBeNull()
+
+    session.applyUpload(upload({ inference_notice: '回退提示' }))
+    session.reset()
+    expect(session.inferenceNotice.value).toBeNull()
+  })
+
   it('clears a stale action when point analysis omits one', () => {
     const session = useGeoSession()
     session.applyUpload(upload())

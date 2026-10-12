@@ -33,7 +33,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 from catalog_db import CatalogDatabase
 from config import MIN_CLUE_CONFIDENCE, TOP_N_HYPOTHESES
-from .clue import CATALOG_DIMENSIONS, Clue
+from .clue import CATALOG_DIMENSIONS, Clue, is_automated_heuristic_clue
 from . import knowledge_graph as kg
 from .country_policy import (
     canonical_country_iso,
@@ -586,9 +586,12 @@ class ReasoningEngine:
                 continue
             dim_weight = DIMENSION_WEIGHTS.get(dim, 1.0)
             extra = clue.extra if isinstance(clue.extra, dict) else {}
-            if extra.get("display_only") is True or extra.get("affects_ranking") is False:
-                # 观察型证据（road/terrain/waterbody/infrastructure/signage）
-                # 只展示，绝不参与任何评分。
+            if (
+                is_automated_heuristic_clue(clue)
+                or extra.get("display_only") is True
+                or extra.get("affects_ranking") is False
+            ):
+                # 颜色/亮度启发式以及观察型证据只展示，绝不参与任何评分。
                 continue
 
             matched_value: Optional[str] = None

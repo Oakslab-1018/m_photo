@@ -5,6 +5,7 @@ image model boundary is stubbed, so no network calls are made.
 """
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -12,8 +13,14 @@ from fastapi.testclient import TestClient
 
 from backend.app.database import GeoSession, GuidedDialogue, GuidedEvent
 from backend.app.main import create_app
+from backend.app.services.catalog_access import catalog_for_settings
 from backend.app.services.city_catalog import load_city_index
-from backend.app.services.model_gateway import StreetClipGateway
+from backend.app.services.model_gateway import (
+    MODEL_ID,
+    MODEL_REVISION,
+    StreetClipGateway,
+    catalog_revision,
+)
 from backend.app.services.pipeline import PipelineService
 from backend.tests.support import make_settings, make_test_image_bytes
 
@@ -44,6 +51,34 @@ def api(tmp_path, monkeypatch):
     app = create_app(settings)
     with TestClient(app, raise_server_exceptions=False) as client:
         yield client, settings, app
+
+
+@pytest.fixture
+def model_api(tmp_path, monkeypatch):
+    settings = replace(make_settings(tmp_path), streetclip_enabled=True)
+    monkeypatch.setattr(PipelineService, "analyze", lambda self, path: list(CLUES))
+    monkeypatch.setattr(StreetClipGateway, "rank_image", lambda self, path: None)
+    monkeypatch.setattr(StreetClipGateway, "rank_cities", lambda self, path, iso: None)
+    app = create_app(settings)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        yield client, settings, app
+
+
+def full_model_evidence(settings, leader: str = "FR") -> dict:
+    countries = catalog_for_settings(settings).countries()
+    rows = [
+        {"iso": country["iso"], "raw_cosine": 0.40 if country["iso"] == leader else 0.10}
+        for country in countries
+    ]
+    rows.sort(key=lambda row: (-row["raw_cosine"], row["iso"]))
+    return {
+        "model": MODEL_ID,
+        "model_revision": MODEL_REVISION,
+        "catalog_revision": catalog_revision(countries),
+        "rankings": rows,
+        "margin": round(rows[0]["raw_cosine"] - rows[1]["raw_cosine"], 6),
+        "uncertain": False,
+    }
 
 
 def upload(client: TestClient) -> int:
@@ -792,3 +827,391 @@ def test_rollback_when_strict_serialization_fails(api, monkeypatch):
         ).first() is None
         session = db.get(GeoSession, session_id)
         assert (session.confirmed_iso, session.status) == (None, "active")
+
+
+HEURISTIC_COLOR_CLUES = [
+    {
+        "dimension": "climate",
+        "value": "cold_polar",
+        "confidence": 0.45,
+        "evidence": "dark scene",
+        "source": "climate",
+    },
+    {
+        "dimension": "vegetation",
+        "value": "urban_sparse",
+        "confidence": 0.3,
+        "evidence": "sparse green",
+        "source": "vegetation",
+    },
+    {
+        "dimension": "vehicle",
+        "value": "dark_vehicle",
+        "confidence": 0.4,
+        "evidence": "dark vehicle-ish region",
+        "source": "vehicle",
+    },
+    {
+        "dimension": "building",
+        "value": "generic",
+        "confidence": 0.25,
+        "evidence": "no clear style",
+        "source": "building",
+    },
+]
+
+
+def test_color_heuristics_never_rank_even_when_confirmed(model_api, monkeypatch):
+    client, _, _ = model_api
+    monkeypatch.setattr(
+        PipelineService,
+        "analyze",
+        lambda self, path: [dict(item) for item in HEURISTIC_COLOR_CLUES],
+    )
+    response = client.post(
+        "/api/geo/upload",
+        files={"image": ("heuristic.png", make_test_image_bytes(), "image/png")},
+    )
+    assert response.status_code == 201, response.text
+    payload = response.json()
+    assert payload["scores"] == []
+    assert "暂无可确认的文字线索" in payload["inference_notice"]
+
+    session_id = int(payload["session_id"])
+    body = review_pending_clues(
+        client, session_id, start(client, session_id), tag="color-policy"
+    )
+    assert body["scores"] == []
+    assert body["candidates"] == []
+    assert "暂无可确认的文字线索" in body["inference_notice"]
+    question = body["dialogue"]["pending_question"]
+    assert question is not None and question["kind"] == "request_clue"
+
+
+def test_trusted_ocr_clue_still_rule_ranks_when_model_is_missing(model_api, monkeypatch):
+    client, _, _ = model_api
+    clue = {
+        "dimension": "language",
+        "value": "ja",
+        "confidence": 0.9,
+        "evidence": "recognized kana",
+        "source": "ocr",
+        "extra": {"origin_source": "ocr", "reliable": True},
+    }
+    monkeypatch.setattr(PipelineService, "analyze", lambda self, path: [dict(clue)])
+    response = client.post(
+        "/api/geo/upload",
+        files={"image": ("ocr.png", make_test_image_bytes(), "image/png")},
+    )
+    assert response.status_code == 201, response.text
+    payload = response.json()
+    assert "本会话未取得可用的本地模型结果" in payload["inference_notice"]
+    assert "暂无可确认的文字线索" not in payload["inference_notice"]
+    assert payload["scores"][0]["iso"] == "JP"
+    assert payload["scores"][0]["score_type"] == "rule_weight"
+
+
+def test_valid_model_evidence_survives_guided_review(model_api, monkeypatch):
+    client, settings, app = model_api
+    heuristic = {
+        "dimension": "climate",
+        "value": "temperate",
+        "confidence": 0.3,
+        "evidence": "display only",
+        "source": "climate",
+    }
+    monkeypatch.setattr(PipelineService, "analyze", lambda self, path: [dict(heuristic)])
+    monkeypatch.setattr(
+        StreetClipGateway,
+        "rank_image",
+        lambda self, path: full_model_evidence(settings, leader="FR"),
+    )
+    response = client.post(
+        "/api/geo/upload",
+        files={"image": ("model.png", make_test_image_bytes(), "image/png")},
+    )
+    assert response.status_code == 201, response.text
+    payload = response.json()
+    assert payload["inference_notice"] is None
+    assert payload["scores"][0]["iso"] == "FR"
+    assert payload["scores"][0]["score_type"] == "cosine"
+    assert payload["scores"][0]["raw_cosine"] == pytest.approx(0.40)
+
+    session_id = int(payload["session_id"])
+    body = start(client, session_id)
+    assert body["inference_notice"] is None
+    assert body["scores"][0]["iso"] == "FR"
+    body = review_pending_clues(client, session_id, body, tag="model-review")
+    assert body["inference_notice"] is None
+    assert body["scores"][0]["iso"] == "FR"
+    assert body["scores"][0]["raw_cosine"] == pytest.approx(0.40)
+
+    with app.state.session_factory() as db:
+        stored = db.get(GeoSession, session_id).model_evidence
+        assert isinstance(stored, dict)
+        assert len(stored["rankings"]) == 250
+        assert stored["rankings"][0]["iso"] == "FR"
+
+
+def test_invalid_persisted_model_evidence_is_explicit(model_api, monkeypatch):
+    client, settings, app = model_api
+    trusted = {
+        "dimension": "language",
+        "value": "ja",
+        "confidence": 0.9,
+        "evidence": "recognized kana",
+        "source": "user",
+    }
+    monkeypatch.setattr(PipelineService, "analyze", lambda self, path: [dict(trusted)])
+    monkeypatch.setattr(
+        StreetClipGateway,
+        "rank_image",
+        lambda self, path: full_model_evidence(settings, leader="FR"),
+    )
+    response = client.post(
+        "/api/geo/upload",
+        files={"image": ("invalid.png", make_test_image_bytes(), "image/png")},
+    )
+    assert response.status_code == 201, response.text
+    session_id = int(response.json()["session_id"])
+    body = start(client, session_id)
+    assert body["inference_notice"] is None
+    assert body["scores"][0]["iso"] == "FR"
+
+    with app.state.session_factory() as db:
+        row = db.get(GeoSession, session_id)
+        evidence = dict(row.model_evidence)
+        evidence["catalog_revision"] = "0" * 64
+        row.model_evidence = evidence
+        db.commit()
+
+    body = client.get(f"/api/geo/{session_id}/dialogue").json()
+    assert "无效或与当前地点目录不一致" in body["inference_notice"]
+    assert body["scores"][0]["iso"] == "JP"
+    assert body["scores"][0]["score_type"] == "rule_weight"
+    assert body["scores"][0]["raw_cosine"] is None
+    with app.state.session_factory() as db:
+        assert len(db.get(GeoSession, session_id).model_evidence["rankings"]) == 250
+
+
+def test_retract_pins_restored_clue_and_unknown_uses_current_question(api, monkeypatch):
+    client, _, _ = api
+    low_priority = {
+        "dimension": "vegetation",
+        "value": "urban_sparse",
+        "confidence": 0.3,
+        "evidence": "display only",
+        "source": "vegetation",
+    }
+    monkeypatch.setattr(PipelineService, "analyze", lambda self, path: [dict(low_priority)])
+    session_id = upload(client)
+    body = start(client, session_id)
+    question = body["dialogue"]["pending_question"]
+    assert question is not None and question["kind"] == "review_clue"
+    low_clue_id = question["clue_id"]
+
+    rejected = event(client, session_id, {
+        "type": "reject_clue",
+        "event_id": "reject-low",
+        "expected_revision": body["dialogue"]["revision"],
+        "question_id": question["id"],
+        "clue_id": low_clue_id,
+    })
+    assert rejected.status_code == 200, rejected.text
+    body = rejected.json()
+
+    proposed = event(client, session_id, {
+        "type": "free_text",
+        "event_id": "add-place",
+        "expected_revision": body["dialogue"]["revision"],
+        "text": "这是日本",
+    })
+    assert proposed.status_code == 200, proposed.text
+    body = proposed.json()
+    assert body["dialogue"]["pending_question"]["clue_id"] != low_clue_id
+
+    restored = event(client, session_id, {
+        "type": "retract",
+        "event_id": "restore-low",
+        "expected_revision": body["dialogue"]["revision"],
+        "clue_id": low_clue_id,
+    })
+    assert restored.status_code == 200, restored.text
+    body = restored.json()
+    pinned = body["dialogue"]["pending_question"]
+    assert pinned["kind"] == "review_clue"
+    assert pinned["clue_id"] == low_clue_id
+
+    unknown = event(client, session_id, {
+        "type": "unknown",
+        "event_id": "unknown-pinned",
+        "expected_revision": body["dialogue"]["revision"],
+        "question_id": pinned["id"],
+    })
+    assert unknown.status_code == 200, unknown.text
+    next_question = unknown.json()["dialogue"]["pending_question"]
+    assert next_question["kind"] == "review_clue"
+    assert next_question["clue_id"] != low_clue_id
+
+
+def test_confirm_location_blocked_by_unresolved_correction_without_pending_clues(api, monkeypatch):
+    client, _, _ = api
+    clue = {
+        "dimension": "place_name",
+        "value": "JP",
+        "confidence": 0.9,
+        "evidence": "user",
+        "source": "user",
+    }
+    monkeypatch.setattr(PipelineService, "analyze", lambda self, path: [dict(clue)])
+    session_id = upload(client)
+    body = review_pending_clues(client, session_id, start(client, session_id), tag="correction-clean")
+    assert body["dialogue"]["pending_question"]["kind"] == "confirm_location"
+
+    corrected = event(client, session_id, {
+        "type": "free_text",
+        "event_id": "correction-with-no-clues",
+        "expected_revision": body["dialogue"]["revision"],
+        "text": "不是日本",
+    })
+    assert corrected.status_code == 200, corrected.text
+    body = corrected.json()
+    assert body["dialogue"]["pending_question"]["kind"] == "ask"
+    assert all(clue["status"] != "pending" for clue in body["dialogue"]["clues"])
+
+    blocked = event(client, session_id, {
+        "type": "confirm_location",
+        "event_id": "confirm-during-correction",
+        "expected_revision": body["dialogue"]["revision"],
+        "target": {"level": "country", "id": "JP"},
+    })
+    assert blocked.status_code == 409, blocked.text
+    current = client.get(f"/api/geo/{session_id}/dialogue").json()
+    assert current["dialogue"]["pending_question"]["kind"] == "ask"
+    assert current["dialogue"]["confirmed"]["country"] is None
+
+
+def test_pending_question_exposes_target_and_confirm_without_qid_stays_valid(api):
+    client, _, _ = api
+    session_id = upload(client)
+    body = review_pending_clues(client, session_id, start(client, session_id), tag="target-field")
+    question = body["dialogue"]["pending_question"]
+    assert question["kind"] == "confirm_location"
+    assert question["target"]["level"] == "country"
+    target_id = question["target"]["id"]
+
+    confirmed = event(client, session_id, {
+        "type": "confirm_location",
+        "event_id": "target-no-qid",
+        "expected_revision": body["dialogue"]["revision"],
+        "target": {"level": "country", "id": target_id},
+    })
+    assert confirmed.status_code == 200, confirmed.text
+    assert confirmed.json()["dialogue"]["stage"] == "admin1"
+
+
+def test_degraded_session_drops_stale_confirm_question(model_api, monkeypatch):
+    client, _, app = model_api
+    heuristic = {
+        "dimension": "climate",
+        "value": "cold_polar",
+        "confidence": 0.45,
+        "evidence": "display only",
+        "source": "climate",
+        "extra": {"display_only": True, "affects_ranking": False, "reliable": False},
+    }
+    monkeypatch.setattr(PipelineService, "analyze", lambda self, path: [dict(heuristic)])
+    session_id = upload(client)
+    body = review_pending_clues(
+        client, session_id, start(client, session_id), decision="rejected", tag="stale-confirm"
+    )
+    assert body["dialogue"]["pending_question"]["kind"] == "request_clue"
+
+    with app.state.session_factory() as db:
+        row = db.get(GuidedDialogue, session_id)
+        state = dict(row.state)
+        state["pending_question"] = {
+            "id": "confirm:country:FR",
+            "kind": "confirm_location",
+            "message": "stale catalog-only confirmation",
+            "target": {
+                "level": "country",
+                "id": "FR",
+                "label": "法国",
+                "country_iso": "FR",
+            },
+        }
+        row.state = state
+        db.commit()
+
+    body = client.get(f"/api/geo/{session_id}/dialogue").json()
+    assert body["candidates"] == []
+    assert "本会话未取得可用的本地模型结果" in body["inference_notice"]
+    assert body["dialogue"]["pending_question"]["kind"] == "request_clue"
+
+
+def test_retract_pin_keeps_pending_correction_after_review(api, monkeypatch):
+    client, _, _ = api
+    low_priority = {
+        "dimension": "vegetation",
+        "value": "urban_sparse",
+        "confidence": 0.3,
+        "evidence": "display only",
+        "source": "vegetation",
+    }
+    monkeypatch.setattr(PipelineService, "analyze", lambda self, path: [dict(low_priority)])
+    session_id = upload(client)
+    body = start(client, session_id)
+    question = body["dialogue"]["pending_question"]
+    low_clue_id = question["clue_id"]
+
+    rejected = event(client, session_id, {
+        "type": "reject_clue",
+        "event_id": "correction-pin-reject",
+        "expected_revision": body["dialogue"]["revision"],
+        "question_id": question["id"],
+        "clue_id": low_clue_id,
+    })
+    assert rejected.status_code == 200, rejected.text
+    body = rejected.json()
+
+    added = event(client, session_id, {
+        "type": "free_text",
+        "event_id": "correction-pin-add",
+        "expected_revision": body["dialogue"]["revision"],
+        "text": "这是日本",
+    })
+    assert added.status_code == 200, added.text
+    body = added.json()
+
+    corrected = event(client, session_id, {
+        "type": "free_text",
+        "event_id": "correction-pin-plan",
+        "expected_revision": body["dialogue"]["revision"],
+        "text": "不是日本",
+    })
+    assert corrected.status_code == 200, corrected.text
+    body = corrected.json()
+    assert body["dialogue"]["pending_question"]["kind"] == "ask"
+
+    restored = event(client, session_id, {
+        "type": "retract",
+        "event_id": "correction-pin-restore",
+        "expected_revision": body["dialogue"]["revision"],
+        "clue_id": low_clue_id,
+    })
+    assert restored.status_code == 200, restored.text
+    body = restored.json()
+    pinned = body["dialogue"]["pending_question"]
+    assert pinned["kind"] == "review_clue"
+    assert pinned["clue_id"] == low_clue_id
+
+    resolved = event(client, session_id, {
+        "type": "unknown",
+        "event_id": "correction-pin-resolve",
+        "expected_revision": body["dialogue"]["revision"],
+        "question_id": pinned["id"],
+    })
+    assert resolved.status_code == 200, resolved.text
+    next_question = resolved.json()["dialogue"]["pending_question"]
+    assert next_question["kind"] == "ask"

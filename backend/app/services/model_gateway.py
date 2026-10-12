@@ -131,6 +131,41 @@ def catalog_revision(countries: list[dict]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def build_inference_notice(
+    settings: Settings,
+    evidence: object | None,
+    *,
+    validation_failed: bool = False,
+    has_trusted_evidence: bool = False,
+) -> str | None:
+    """Return a user-safe notice when this session has no usable model prior.
+
+    The wording is session-scoped on purpose: an old fallback session may be
+    opened after the local model has recovered, so it must not claim the
+    current service is still disconnected.
+    """
+    if not settings.streetclip_enabled:
+        return None
+    if evidence is not None and not validation_failed:
+        return None
+    if validation_failed:
+        notice = (
+            "本会话保存的本地模型结果无效或与当前地点目录不一致，已停止使用；"
+            "本次仅依据可确认的文字、地名等可信线索。"
+        )
+    else:
+        notice = (
+            "本会话未取得可用的本地模型结果，本次仅依据可确认的文字、地名等可信线索。"
+            "如需模型排序，请重新分析或重新上传图片。"
+        )
+    if not has_trusted_evidence:
+        notice += (
+            " 暂无可确认的文字线索，暂时无法给出候选；"
+            "建议重新分析图片或补充招牌文字、地名、通行方向等信息。"
+        )
+    return notice
+
+
 def clean_image(path: str | Path) -> bytes:
     with Image.open(path) as image:
         rgb = ImageOps.exif_transpose(image).convert("RGB")

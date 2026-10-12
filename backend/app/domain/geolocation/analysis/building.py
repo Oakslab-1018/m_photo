@@ -47,6 +47,6 @@ class BuildingAnalyzer(BaseAnalyzer):
                 confidence=round(confidence, 3),
                 evidence=evidence,
                 source=self.name,
-                extra={"dominant_rgb": [r, g, b]},
+                extra={"dominant_rgb": [r, g, b], "display_only": True, "affects_ranking": False, "reliable": False},
             )
         ]

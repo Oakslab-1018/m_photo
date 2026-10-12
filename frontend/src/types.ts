@@ -185,6 +185,8 @@ export interface UploadResponse {
   action: HypothesisAction | null
   messages: ChatMessage[]
   city_scores?: CityScore[]
+  /** Natural Chinese explanation when inference degraded; null/absent when healthy. */
+  inference_notice?: string | null
 }
 
 export interface FeedbackResponse {
@@ -399,6 +401,13 @@ export interface RegionAnalysisRecord {
 export type GuidedStage = 'country' | 'admin1' | 'city' | 'resolved'
 export type GuidedLocationLevel = Exclude<GuidedStage, 'resolved'>
 
+/**
+ * UI phase inside one guided stage.
+ * - review: one server-pinned observation/question at a time, candidates hidden.
+ * - candidates: user explicitly accepted the review round and may act on Top-5.
+ */
+export type GuidedPhase = 'review' | 'candidates'
+
 /** Minimal target reference used by guided events. */
 export interface GuidedTargetRef {
   level: GuidedLocationLevel
@@ -514,4 +523,6 @@ export interface GuidedDialogueResponse {
   clues: Clue[]
   exclusions: string[]
   receipt?: GuidedEventReceipt | null
+  /** Natural Chinese explanation when inference degraded; null/absent when healthy. */
+  inference_notice?: string | null
 }

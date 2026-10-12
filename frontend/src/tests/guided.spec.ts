@@ -8,6 +8,7 @@ import type {
   GuidedDialogueResponse,
   LocationCandidate,
   LocationTarget,
+  ReviewedClue,
 } from '@/types'
 
 const japan: LocationTarget = { level: 'country', id: 'JP', label: '日本', country_iso: 'JP' }
@@ -156,6 +157,7 @@ describe('useGuidedDialogue', () => {
     })
 
     await guided.start()
+    expect(guided.nextPhase()).toBe(true)
     await guided.confirmLocation(canada)
     await guided.rejectLocation(canada)
     await guided.confirmLocation(japan)
@@ -184,6 +186,7 @@ describe('useGuidedDialogue', () => {
     })
 
     await guided.start()
+    expect(guided.nextPhase()).toBe(true)
     const first = guided.confirmLocation(japan)
     const second = guided.confirmLocation(japan)
 
@@ -211,6 +214,7 @@ describe('useGuidedDialogue', () => {
     })
 
     await guided.start()
+    expect(guided.nextPhase()).toBe(true)
     const olderEvent = guided.confirmLocation(japan)
     await guided.reload()
     resolveEvent(snapshot(dialogue({ revision: 3 }), [{ target: japan }]))
@@ -232,6 +236,7 @@ describe('useGuidedDialogue', () => {
     })
 
     await guided.start()
+    expect(guided.nextPhase()).toBe(true)
     const applied = await guided.confirmLocation(japan)
 
     expect(applied).toBe(false)
@@ -331,6 +336,7 @@ describe('useGuidedDialogue', () => {
     })
 
     await guided.start()
+    expect(guided.nextPhase()).toBe(true)
     await guided.confirmCountry('jp')
 
     expect(api.dialogueEvent).toHaveBeenCalledWith(7, {
@@ -505,8 +511,19 @@ describe('useGuidedDialogue', () => {
     const guided = useGuidedDialogue(sessionId, { api, eventIdFactory: () => 'sticky-location' })
 
     await guided.start()
+    // Rankings are unlocked server-side, but the explicit next step gates them.
     expect(guided.rankingsUnlocked.value).toBe(true)
+    expect(guided.phase.value).toBe('review')
+    expect(guided.candidatesVisible.value).toBe(false)
+    expect(guided.locationConfirmationReady.value).toBe(false)
+    expect(guided.topCandidates.value).toEqual([])
+    expect(await guided.confirmLocation(japan)).toBe(false)
+    expect(api.dialogueEvent).not.toHaveBeenCalled()
+
+    expect(guided.nextPhase()).toBe(true)
+    expect(guided.candidatesVisible.value).toBe(true)
     expect(guided.locationConfirmationReady.value).toBe(true)
+    expect(guided.topCandidates.value.map((item) => item.target.id)).toEqual(['JP'])
 
     const pendingNew = {
       id: 'new-pending-clue',
@@ -524,8 +541,11 @@ describe('useGuidedDialogue', () => {
     await guided.reload()
 
     expect(guided.rankingsUnlocked.value).toBe(true)
+    // A newly appended observation pulls the UI back into the single review box.
+    expect(guided.phase.value).toBe('review')
+    expect(guided.candidatesVisible.value).toBe(false)
     expect(guided.locationConfirmationReady.value).toBe(false)
-    expect(guided.topCandidates.value.map((item) => item.target.id)).toEqual(['JP'])
+    expect(guided.topCandidates.value).toEqual([])
     expect(guided.recentClueIds.value).toEqual(['new-pending-clue'])
     expect(await guided.confirmLocation(japan)).toBe(false)
     expect(api.dialogueEvent).not.toHaveBeenCalled()
@@ -538,6 +558,8 @@ describe('useGuidedDialogue', () => {
       [{ target: japan, score: 0.8 }],
     ))
     await guided.reload()
+    expect(guided.reviewReady.value).toBe(true)
+    expect(guided.nextPhase()).toBe(true)
     expect(guided.locationConfirmationReady.value).toBe(true)
   })
 
@@ -570,8 +592,13 @@ describe('useGuidedDialogue', () => {
 
     await userPending.start()
     expect(userPending.rankingsUnlocked.value).toBe(true)
-    expect(userPending.topCandidates.value.map((item) => item.target.id)).toEqual(['JP'])
+    // A pending user observation keeps the review box in charge: no next step,
+    // no candidates, no location confirmation.
+    expect(userPending.phase.value).toBe('review')
+    expect(userPending.topCandidates.value).toEqual([])
     expect(userPending.locationConfirmationReady.value).toBe(false)
+    expect(userPending.nextPhase()).toBe(false)
+    expect(userPending.error.value).toContain('待核对观察')
     expect(await userPending.confirmLocation(japan)).toBe(false)
     expect(userPendingApi.dialogueEvent).not.toHaveBeenCalled()
 
@@ -604,6 +631,7 @@ describe('useGuidedDialogue', () => {
     await machinePending.start()
     expect(machinePending.rankingsUnlocked.value).toBe(false)
     expect(machinePending.topCandidates.value).toEqual([])
+    expect(machinePending.nextPhase()).toBe(false)
   })
 
   it('recomputes the Top-5 on every snapshot and rejects a hidden sixth target', async () => {
@@ -621,6 +649,8 @@ describe('useGuidedDialogue', () => {
     const guided = useGuidedDialogue(sessionId, { api, eventIdFactory: () => 'top-update' })
 
     await guided.start()
+    expect(guided.topCandidates.value).toEqual([])
+    expect(guided.nextPhase()).toBe(true)
     expect(guided.topCandidates.value.map((item) => item.target.id)).toEqual([
       'US',
       'DE',
@@ -648,6 +678,473 @@ describe('useGuidedDialogue', () => {
       'JP',
       'FR',
     ])
+  })
+
+  it('marks a blocking ask as unknown with the authoritative question id', async () => {
+    const sessionId = ref<number | null>(7)
+    const api = apiMock()
+    api.dialogueStart.mockResolvedValue(snapshot(dialogue({
+      revision: 2,
+      pending_question: {
+        id: 'ask-authoritative',
+        kind: 'ask',
+        message: '这里的气候更接近哪一种？',
+        options: [{ value: 'arid', label: '干旱气候' }],
+      },
+    })))
+    api.dialogueEvent.mockResolvedValue(snapshot(dialogue({ revision: 3 })))
+    const guided = useGuidedDialogue(sessionId, { api, eventIdFactory: () => 'unknown-ask' })
+
+    await guided.start()
+    expect(guided.reviewReady.value).toBe(false)
+
+    expect(await guided.unknown('stale-question-id')).toBe(true)
+    expect(api.dialogueEvent).toHaveBeenCalledWith(7, {
+      type: 'unknown',
+      event_id: 'unknown-ask',
+      expected_revision: 2,
+      question_id: 'ask-authoritative',
+    })
+    expect(guided.reviewHistory.value).toEqual([])
+    expect(guided.reviewReady.value).toBe(true)
+
+    // A location confirmation can never be skipped with 不确定.
+    api.dialogue.mockResolvedValueOnce(snapshot(dialogue({
+      revision: 4,
+      pending_question: { id: 'confirm-1', kind: 'confirm_location', message: '确认地点？' },
+    })))
+    await guided.reload()
+    expect(await guided.unknown()).toBe(false)
+    expect(api.dialogueEvent).toHaveBeenCalledTimes(1)
+  })
+
+  it('tolerates snapshots whose clue rows omit the source field', async () => {
+    const sessionId = ref<number | null>(7)
+    const api = apiMock()
+    api.dialogueStart.mockResolvedValue(snapshot(dialogue({
+      revision: 1,
+      clues: [
+        {
+          id: 'clue-1',
+          dimension: 'language',
+          value: 'zh',
+          description: '缺少来源字段',
+          status: 'pending',
+        } as unknown as ReviewedClue,
+      ],
+      pending_question: {
+        id: 'review-1',
+        kind: 'review_clue',
+        clue_id: 'clue-1',
+        message: '这条观察准确吗？',
+      },
+    })))
+    const guided = useGuidedDialogue(sessionId, { api, eventIdFactory: () => 'missing-source' })
+
+    await guided.start()
+
+    expect(guided.active.value).toBe(true)
+    expect(guided.error.value).toBeNull()
+    expect(guided.rankingsUnlocked.value).toBe(false)
+    expect(guided.currentReviewClue.value?.id).toBe('clue-1')
+  })
+
+  it('keeps every candidate entry hidden until the explicit next phase', async () => {
+    const sessionId = ref<number | null>(7)
+    const api = apiMock()
+    api.dialogueStart.mockResolvedValue(snapshot(
+      dialogue({
+        revision: 2,
+        clues: [
+          {
+            id: 'done-clue',
+            dimension: 'language',
+            value: 'ja',
+            description: '已核对的观察',
+            source: 'model',
+            confidence: 0.8,
+            status: 'confirmed',
+          },
+        ],
+      }),
+      [{ target: japan, score: 0.9 }],
+    ))
+    const guided = useGuidedDialogue(sessionId, { api, eventIdFactory: () => 'gate' })
+
+    await guided.start()
+
+    expect(guided.phase.value).toBe('review')
+    expect(guided.reviewReady.value).toBe(true)
+    expect(guided.candidatesVisible.value).toBe(false)
+    expect(guided.topCandidates.value).toEqual([])
+    expect(guided.locationConfirmationReady.value).toBe(false)
+    expect(await guided.confirmLocation(japan)).toBe(false)
+    expect(api.dialogueEvent).not.toHaveBeenCalled()
+
+    expect(guided.nextPhase()).toBe(true)
+    expect(guided.phase.value).toBe('candidates')
+    expect(guided.candidatesVisible.value).toBe(true)
+    expect(guided.topCandidates.value.map((item) => item.target.id)).toEqual(['JP'])
+    expect(guided.locationConfirmationReady.value).toBe(true)
+  })
+
+  it('hides the next step while a blocking ask is unresolved and reopens it after the answer', async () => {
+    const sessionId = ref<number | null>(7)
+    const api = apiMock()
+    api.dialogueStart.mockResolvedValue(snapshot(dialogue({
+      revision: 3,
+      pending_question: {
+        id: 'ask-1',
+        kind: 'ask',
+        message: '这段文字是什么？',
+        options: [{ value: 'zh', label: '中文' }],
+      },
+    })))
+    api.dialogueEvent.mockResolvedValue(snapshot(dialogue({ revision: 4 })))
+    const guided = useGuidedDialogue(sessionId, { api, eventIdFactory: () => 'ask-block' })
+
+    await guided.start()
+    expect(guided.reviewReady.value).toBe(false)
+    expect(guided.nextPhase()).toBe(false)
+    expect(guided.phase.value).toBe('review')
+    expect(guided.error.value).toContain('阻塞')
+
+    await guided.answer('zh')
+    expect(guided.reviewReady.value).toBe(true)
+    expect(guided.nextPhase()).toBe(true)
+    expect(guided.phase.value).toBe('candidates')
+  })
+
+  it('pushes review history only on success and 返回上一条观察 retracts the pinned clue', async () => {
+    const sessionId = ref<number | null>(7)
+    const api = apiMock()
+    const pinned = {
+      id: 'clue-1',
+      dimension: 'language',
+      value: 'ja',
+      description: '日语招牌',
+      source: 'model',
+      confidence: 0.8,
+      status: 'pending' as const,
+    }
+    api.dialogueStart.mockResolvedValue(snapshot(dialogue({
+      revision: 2,
+      clues: [pinned],
+      pending_question: {
+        id: 'review-1',
+        kind: 'review_clue',
+        clue_id: 'clue-1',
+        message: '这条观察准确吗？',
+      },
+    })))
+    api.dialogueEvent
+      .mockResolvedValueOnce(snapshot(dialogue({
+        revision: 3,
+        clues: [{ ...pinned, status: 'confirmed' }],
+        pending_question: null,
+      })))
+      .mockResolvedValueOnce(snapshot(dialogue({
+        revision: 4,
+        clues: [{ ...pinned, status: 'pending' }],
+        pending_question: {
+          id: 'review-1b',
+          kind: 'review_clue',
+          clue_id: 'clue-1',
+          message: '这条观察准确吗？',
+        },
+      })))
+    const guided = useGuidedDialogue(sessionId, { api, eventIdFactory: () => 'history' })
+
+    await guided.start()
+    expect(guided.reviewHistory.value).toEqual([])
+    expect(guided.canReviewBack.value).toBe(false)
+
+    await guided.confirmClue('clue-1')
+    const events = api.dialogueEvent.mock.calls.map((call) => call[1])
+    expect(events[0]).toMatchObject({ type: 'confirm_clue', clue_id: 'clue-1' })
+    expect(events[0]?.question_id).toBe('review-1')
+    expect(guided.reviewHistory.value).toEqual(['clue-1'])
+    expect(guided.canReviewBack.value).toBe(true)
+    expect(guided.reviewReady.value).toBe(true)
+
+    expect(await guided.reviewBack()).toBe(true)
+    const afterBack = api.dialogueEvent.mock.calls.map((call) => call[1])
+    expect(afterBack[1]).toMatchObject({ type: 'retract', clue_id: 'clue-1' })
+    expect(afterBack[1]).not.toHaveProperty('question_id')
+    expect(guided.reviewHistory.value).toEqual([])
+    expect(guided.canReviewBack.value).toBe(false)
+    expect(guided.phase.value).toBe('review')
+    expect(guided.currentReviewClue.value?.id).toBe('clue-1')
+    expect(guided.reviewProgress.value).toEqual({ current: 1, total: 1 })
+  })
+
+  it('keeps review history when 返回上一条观察 hits a 409', async () => {
+    const sessionId = ref<number | null>(7)
+    const api = apiMock()
+    const pinned = {
+      id: 'clue-1',
+      dimension: 'language',
+      value: 'ja',
+      description: '日语招牌',
+      source: 'model',
+      confidence: 0.8,
+      status: 'pending' as const,
+    }
+    api.dialogueStart.mockResolvedValue(snapshot(dialogue({
+      revision: 2,
+      clues: [pinned],
+      pending_question: {
+        id: 'review-1',
+        kind: 'review_clue',
+        clue_id: 'clue-1',
+        message: '这条观察准确吗？',
+      },
+    })))
+    api.dialogueEvent
+      .mockResolvedValueOnce(snapshot(dialogue({
+        revision: 3,
+        clues: [{ ...pinned, status: 'confirmed' }],
+        pending_question: null,
+      })))
+      .mockRejectedValueOnce(new ApiError({ message: 'conflict', status: 409 }))
+    api.dialogue.mockResolvedValueOnce(snapshot(dialogue({
+      revision: 4,
+      clues: [{ ...pinned, status: 'confirmed' }],
+      pending_question: null,
+    })))
+    const guided = useGuidedDialogue(sessionId, { api, eventIdFactory: () => 'retract-conflict' })
+
+    await guided.start()
+    await guided.confirmClue('clue-1')
+    expect(guided.nextPhase()).toBe(true)
+    expect(guided.phase.value).toBe('candidates')
+
+    const applied = await guided.reviewBack()
+
+    expect(applied).toBe(false)
+    expect(api.dialogueEvent).toHaveBeenCalledTimes(2)
+    expect(guided.reviewHistory.value).toEqual(['clue-1'])
+    expect(guided.canReviewBack.value).toBe(true)
+    expect(guided.phase.value).toBe('candidates')
+    expect(guided.currentReviewClue.value).toBeNull()
+  })
+
+  it('returns to the review box when a blocking question appears during the candidate phase', async () => {
+    const sessionId = ref<number | null>(7)
+    const api = apiMock()
+    const reviewed = {
+      id: 'reviewed-clue',
+      dimension: 'language',
+      value: 'ja',
+      description: '已核对观察',
+      source: 'model',
+      confidence: 0.8,
+      status: 'confirmed' as const,
+    }
+    api.dialogueStart.mockResolvedValue(snapshot(
+      dialogue({ revision: 2, clues: [reviewed] }),
+      [{ target: japan, score: 0.8 }],
+    ))
+    const guided = useGuidedDialogue(sessionId, { api, eventIdFactory: () => 'pull-back' })
+
+    await guided.start()
+    expect(guided.nextPhase()).toBe(true)
+    expect(guided.candidatesVisible.value).toBe(true)
+
+    api.dialogue.mockResolvedValueOnce(snapshot(
+      dialogue({
+        revision: 3,
+        clues: [reviewed],
+        pending_question: {
+          id: 'ask-new',
+          kind: 'ask',
+          message: '补充确认',
+          options: [{ value: 'yes', label: '是' }],
+        },
+      }),
+      [{ target: japan, score: 0.8 }],
+    ))
+    await guided.reload()
+
+    expect(guided.phase.value).toBe('review')
+    expect(guided.candidatesVisible.value).toBe(false)
+    expect(guided.topCandidates.value).toEqual([])
+    expect(guided.locationConfirmationReady.value).toBe(false)
+    expect(await guided.confirmLocation(japan)).toBe(false)
+    expect(api.dialogueEvent).not.toHaveBeenCalled()
+  })
+
+  it('returns to review when a newly appended observation arrives during the candidate phase', async () => {
+    const sessionId = ref<number | null>(7)
+    const api = apiMock()
+    const reviewed = {
+      id: 'reviewed-clue',
+      dimension: 'language',
+      value: 'ja',
+      description: '已核对观察',
+      source: 'model',
+      confidence: 0.8,
+      status: 'confirmed' as const,
+    }
+    api.dialogueStart.mockResolvedValue(snapshot(
+      dialogue({ revision: 2, clues: [reviewed] }),
+      [{ target: japan, score: 0.8 }],
+    ))
+    const guided = useGuidedDialogue(sessionId, { api, eventIdFactory: () => 'new-clue' })
+
+    await guided.start()
+    expect(guided.nextPhase()).toBe(true)
+
+    api.dialogue.mockResolvedValueOnce(snapshot(
+      dialogue({
+        revision: 3,
+        clues: [
+          reviewed,
+          {
+            id: 'new-clue',
+            dimension: 'signage',
+            value: '出口',
+            description: '新发现观察',
+            source: 'ocr',
+            confidence: 0.7,
+            status: 'pending',
+          },
+        ],
+        pending_question: {
+          id: 'review-new',
+          kind: 'review_clue',
+          clue_id: 'new-clue',
+          message: '这条观察准确吗？',
+        },
+      }),
+      [{ target: japan, score: 0.8 }],
+    ))
+    await guided.reload()
+
+    expect(guided.phase.value).toBe('review')
+    expect(guided.recentClueIds.value).toEqual(['new-clue'])
+    expect(guided.currentReviewClue.value?.id).toBe('new-clue')
+    expect(guided.reviewProgress.value).toEqual({ current: 2, total: 2 })
+    expect(guided.candidatesVisible.value).toBe(false)
+    expect(guided.topCandidates.value).toEqual([])
+  })
+
+  it('backtracks one level and shows the previous candidates only when review is ready', async () => {
+    const sessionId = ref<number | null>(7)
+    const api = apiMock()
+    const reviewed = {
+      id: 'reviewed-clue',
+      dimension: 'language',
+      value: 'ja',
+      description: '已核对观察',
+      source: 'model',
+      confidence: 0.8,
+      status: 'confirmed' as const,
+    }
+    api.dialogueStart.mockResolvedValue(snapshot(
+      dialogue({
+        revision: 5,
+        stage: 'city',
+        confirmed: { country: japan, admin1: hokkaido, city: null },
+        clues: [reviewed],
+      }),
+      [{ target: sapporo, score: 0.7 }],
+    ))
+    const guided = useGuidedDialogue(sessionId, { api, eventIdFactory: () => 'back' })
+
+    await guided.start()
+    expect(guided.previousLevel.value).toBe('admin1')
+    expect(guided.nextPhase()).toBe(true)
+
+    api.dialogueEvent.mockResolvedValueOnce(snapshot(
+      dialogue({
+        revision: 6,
+        stage: 'admin1',
+        confirmed: { country: japan, admin1: null, city: null },
+        clues: [reviewed],
+      }),
+      [{ target: hokkaido, score: 0.66 }],
+    ))
+    expect(await guided.backtrackPrevious()).toBe(true)
+    expect(api.dialogueEvent.mock.calls[0]?.[1]).toMatchObject({ type: 'backtrack', level: 'admin1' })
+    expect(guided.phase.value).toBe('candidates')
+    expect(guided.candidatesVisible.value).toBe(true)
+    expect(guided.topCandidates.value.map((item) => item.target.id)).toEqual(['JP.01'])
+    expect(guided.previousLevel.value).toBe('country')
+    expect(guided.dialogue.value?.confirmed.country?.id).toBe('JP')
+
+    api.dialogueEvent.mockResolvedValueOnce(snapshot(
+      dialogue({
+        revision: 7,
+        stage: 'country',
+        clues: [{ ...reviewed, status: 'pending' }],
+        pending_question: {
+          id: 'review-back',
+          kind: 'review_clue',
+          clue_id: 'reviewed-clue',
+          message: '这条观察准确吗？',
+        },
+      }),
+      [{ target: japan, score: 0.9 }],
+    ))
+    expect(await guided.backtrackPrevious()).toBe(true)
+    expect(guided.phase.value).toBe('review')
+    expect(guided.candidatesVisible.value).toBe(false)
+    expect(guided.topCandidates.value).toEqual([])
+  })
+
+  it('clears the phase and review history when the session switches', async () => {
+    const sessionId = ref<number | null>(7)
+    const api = apiMock()
+    api.dialogueStart.mockResolvedValue(snapshot(dialogue({
+      revision: 2,
+      clues: [
+        {
+          id: 'clue-1',
+          dimension: 'language',
+          value: 'ja',
+          description: '日语招牌',
+          source: 'model',
+          confidence: 0.8,
+          status: 'pending',
+        },
+      ],
+      pending_question: {
+        id: 'review-1',
+        kind: 'review_clue',
+        clue_id: 'clue-1',
+        message: '这条观察准确吗？',
+      },
+    })))
+    api.dialogueEvent.mockResolvedValue(snapshot(dialogue({
+      revision: 3,
+      clues: [
+        {
+          id: 'clue-1',
+          dimension: 'language',
+          value: 'ja',
+          description: '日语招牌',
+          source: 'model',
+          confidence: 0.8,
+          status: 'confirmed',
+        },
+      ],
+      pending_question: null,
+    })))
+    const guided = useGuidedDialogue(sessionId, { api, eventIdFactory: () => 'switch' })
+
+    await guided.start()
+    await guided.confirmClue('clue-1')
+    expect(guided.nextPhase()).toBe(true)
+    expect(guided.phase.value).toBe('candidates')
+    expect(guided.reviewHistory.value).toEqual(['clue-1'])
+
+    sessionId.value = 8
+
+    expect(guided.phase.value).toBe('review')
+    expect(guided.reviewHistory.value).toEqual([])
+    expect(guided.canReviewBack.value).toBe(false)
+    expect(guided.candidatesVisible.value).toBe(false)
   })
 
   it('keeps guided evidence separate from the legacy terminal country state', () => {

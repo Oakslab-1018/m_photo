@@ -7,13 +7,22 @@ import type {
   GuidedEventPayload,
   GuidedEventReceipt,
   GuidedLocationLevel,
+  GuidedPhase,
   GuidedQuestion,
   GuidedTargetRef,
   LocationCandidate,
   LocationTarget,
+  ReviewedClue,
 } from '@/types'
 import { normalizeIsoCode } from '@/utils/geo'
-import { canUnlockReviewedRankings, selectTopGuidedCandidates } from '@/utils/guided'
+import {
+  canUnlockReviewedRankings,
+  guidedCurrentReviewClue,
+  guidedPreviousLevel,
+  guidedReviewProgress,
+  guidedReviewReady,
+  selectTopGuidedCandidates,
+} from '@/utils/guided'
 
 export interface GuidedDialogueApi {
   dialogueStart(sessionId: number): Promise<GuidedDialogueResponse>
@@ -126,12 +135,17 @@ export function useGuidedDialogue(
   const retryable = ref(false)
   const activeSessionId = ref<number | null>(null)
   /**
-   * Once a stage's review round has completed, rankings stay visible even if a
-   * later dialogue turn adds new pending observations. Location confirmation
-   * still waits for every current observation to be handled.
+   * Once a stage's review round has completed, rankings stay *available* even
+   * if a later dialogue turn adds new pending observations. Visibility is a
+   * separate gate: candidates appear only after the explicit 下一步 (or an
+   * explicit back navigation), never while observations wait for review.
    */
   const unlockedStages = ref<Set<GuidedLocationLevel>>(new Set())
   const recentClueIds = ref<string[]>([])
+  /** UI phase inside the current stage; any new blocker forces it back to review. */
+  const phase = ref<GuidedPhase>('review')
+  /** Successfully reviewed clue ids in review order; drives 返回上一条观察. */
+  const reviewHistory = ref<string[]>([])
 
   const pendingQuestion = computed<GuidedQuestion | null>(
     () => dialogue.value?.pending_question ?? null,
@@ -141,26 +155,48 @@ export function useGuidedDialogue(
     () => dialogue.value?.clues.filter((clue) => clue.status === 'pending').length ?? 0,
   )
   const hasPendingClues = computed(() => pendingClueCount.value > 0)
+  /** No pending observation and no unresolved ask/correction question. */
+  const reviewReady = computed(() => guidedReviewReady(dialogue.value))
+  /** 第N/总数 position of the server-pinned review clue, if any. */
+  const reviewProgress = computed(() => guidedReviewProgress(dialogue.value))
+  /** The one observation the server currently asks about; never a UI-picked row. */
+  const currentReviewClue = computed<ReviewedClue | null>(() =>
+    guidedCurrentReviewClue(dialogue.value),
+  )
   const rankingsUnlocked = computed(() => {
     const current = dialogue.value
     if (!current) return false
     if (current.stage === 'resolved') return true
     return unlockedStages.value.has(current.stage)
   })
-  const locationConfirmationReady = computed(
+  /** Every candidate entry point (cards, map, refs, history) keys off this gate. */
+  const candidatesVisible = computed(
     () =>
       active.value &&
       dialogue.value !== null &&
       dialogue.value.stage !== 'resolved' &&
-      rankingsUnlocked.value &&
-      !hasPendingClues.value,
+      phase.value === 'candidates' &&
+      rankingsUnlocked.value,
+  )
+  const locationConfirmationReady = computed(
+    () => candidatesVisible.value && !hasPendingClues.value,
   )
   /** Only the five visible server candidates can be selected or confirmed. */
   const topCandidates = computed(() => {
     const current = dialogue.value
-    if (!current || current.stage === 'resolved' || !rankingsUnlocked.value) return []
+    if (!current || current.stage === 'resolved' || !candidatesVisible.value) return []
     return selectTopGuidedCandidates(candidates.value, current.stage)
   })
+  /** Level targeted by the prominent admin1/city/resolved 返回上一步 button. */
+  const previousLevel = computed<GuidedLocationLevel | null>(() =>
+    guidedPreviousLevel(dialogue.value?.stage),
+  )
+  const lastReviewedClueId = computed<string | null>(
+    () => reviewHistory.value[reviewHistory.value.length - 1] ?? null,
+  )
+  const canReviewBack = computed(
+    () => dialogue.value !== null && lastReviewedClueId.value !== null,
+  )
 
   let generation = 0
 
@@ -183,6 +219,8 @@ export function useGuidedDialogue(
     activeSessionId.value = null
     unlockedStages.value = new Set()
     recentClueIds.value = []
+    phase.value = 'review'
+    reviewHistory.value = []
   }
 
   function unlockCompletedStages(value: GuidedDialogue): void {
@@ -227,8 +265,99 @@ export function useGuidedDialogue(
           .map((clue) => clue.id)
       : []
     unlockCompletedStages(response.dialogue)
+    // Any new/restored pending observation or blocking question pulls the UI
+    // back into the single-box review; candidates stay hidden until ready again.
+    if (response.dialogue.stage !== 'resolved' && !guidedReviewReady(response.dialogue)) {
+      phase.value = 'review'
+    }
     receipt.value = response.receipt ?? null
     options.onSnapshot?.(response)
+  }
+
+  function pushReviewHistory(clueId: string): void {
+    // Re-reviewing an earlier observation moves it to the end of the stack.
+    reviewHistory.value = [...reviewHistory.value.filter((id) => id !== clueId), clueId]
+  }
+
+  function dropReviewHistory(clueId: string): void {
+    reviewHistory.value = reviewHistory.value.filter((id) => id !== clueId)
+  }
+
+  /**
+   * Side effects that only run after a *successful* event response. A 409/422
+   * never reaches this point, so history can never falsely advance.
+   */
+  function applyEventSideEffects(
+    event: GuidedEventPayload,
+    questionContext: GuidedQuestion | null,
+  ): void {
+    switch (event.type) {
+      case 'confirm_clue':
+      case 'reject_clue':
+        if (event.clue_id) pushReviewHistory(event.clue_id)
+        break
+      case 'unknown':
+        if (questionContext?.clue_id) pushReviewHistory(questionContext.clue_id)
+        break
+      case 'retract':
+        // A restored observation is pending again: drop it from history so a
+        // later review pushes it exactly once more.
+        if (event.clue_id) dropReviewHistory(event.clue_id)
+        break
+      case 'backtrack':
+        // Explicit back navigation: when no blocker remains, the previous
+        // level's candidates may be shown directly (never auto-confirmed).
+        phase.value = reviewReady.value ? 'candidates' : 'review'
+        break
+      default:
+        break
+    }
+  }
+
+  /** Explicit 下一步: only flips the UI phase, never sends an event. */
+  function nextPhase(): boolean {
+    if (!active.value || !dialogue.value) {
+      error.value = '引导状态尚未就绪，请先重新加载。'
+      return false
+    }
+    if (!reviewReady.value) {
+      error.value = hasPendingClues.value
+        ? `请先处理上方 ${pendingClueCount.value} 条待核对观察。`
+        : '请先完成当前阻塞问题，再查看地点候选。'
+      return false
+    }
+    phase.value = 'candidates'
+    error.value = null
+    return true
+  }
+
+  /** Candidate phase → review completion (candidates are hidden again). */
+  function returnToReview(): void {
+    phase.value = 'review'
+    error.value = null
+  }
+
+  /**
+   * 返回上一条观察: retract the last successfully reviewed clue. History is
+   * popped only by the successful response; a 409/422 keeps it untouched.
+   */
+  async function reviewBack(): Promise<boolean> {
+    const clueId = lastReviewedClueId.value
+    if (!clueId) {
+      error.value = '还没有可返回的核对记录。'
+      return false
+    }
+    return retractClue(clueId)
+  }
+
+  /** Prominent admin1/city/resolved 返回上一步 → backend backtrack one level. */
+  function backtrackPrevious(): Promise<boolean> {
+    const level = previousLevel.value
+    if (!level) {
+      error.value = '当前已是最初的层级，无法再返回。'
+      return Promise.resolve(false)
+    }
+    return backtrack(level)
   }
 
   async function start(id?: number | null): Promise<boolean> {
@@ -253,6 +382,8 @@ export function useGuidedDialogue(
     retryable.value = false
     unlockedStages.value = new Set()
     recentClueIds.value = []
+    phase.value = 'review'
+    reviewHistory.value = []
 
     try {
       const response = await client.dialogueStart(target)
@@ -380,6 +511,7 @@ export function useGuidedDialogue(
       const response = await client.dialogueEvent(target, event)
       if (!isCurrent(token, target)) return false
       applyResponse(response)
+      applyEventSideEffects(event, questionContext)
       failedEvent.value = null
       failedQuestion.value = null
       retryable.value = false
@@ -435,7 +567,9 @@ export function useGuidedDialogue(
       if (!locationConfirmationReady.value) {
         error.value = hasPendingClues.value
           ? `请先处理上方 ${pendingClueCount.value} 条待核对观察，再选择地点。`
-          : '地点候选尚未就绪，请先重新加载引导状态。'
+          : phase.value === 'review'
+            ? '请先完成观察核对并点击“下一步”，再选择地点。'
+            : '地点候选尚未就绪，请先重新加载引导状态。'
         return Promise.resolve(false)
       }
       if (
@@ -546,8 +680,13 @@ export function useGuidedDialogue(
   }
 
   function unknown(questionId?: string): Promise<boolean> {
-    const id = questionId ?? dialogue.value?.pending_question?.id
-    if (!id) {
+    const question = dialogue.value?.pending_question
+    // The authoritative pending id wins; a stale caller-supplied id never does.
+    const id = question?.id ?? questionId
+    // 不确定 always carries the currently authoritative question id; it can
+    // skip a review observation as well as a blocking ask/correction, but
+    // never a location confirmation.
+    if (!id || !question || question.kind === 'confirm_location') {
       error.value = '当前没有可标记为不确定的问题。'
       return Promise.resolve(false)
     }
@@ -617,6 +756,14 @@ export function useGuidedDialogue(
     pendingClueCount,
     hasPendingClues,
     rankingsUnlocked,
+    candidatesVisible,
+    reviewReady,
+    reviewProgress,
+    currentReviewClue,
+    reviewHistory,
+    phase,
+    previousLevel,
+    canReviewBack,
     locationConfirmationReady,
     topCandidates,
     recentClueIds,
@@ -637,6 +784,10 @@ export function useGuidedDialogue(
     retractTarget,
     retractClue,
     backtrack,
+    nextPhase,
+    returnToReview,
+    reviewBack,
+    backtrackPrevious,
     freeText,
   }
 }

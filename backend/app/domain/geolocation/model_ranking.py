@@ -16,7 +16,7 @@ from __future__ import annotations
 from .engine import ReasoningEngine, CountryScore, group_country_scores
 from .country_policy import canonical_country_iso, is_excluded, normalize_iso
 from .hypotheses import HypothesisManager, HypothesisAction
-from .clue import DIM_LABELS
+from .clue import DIM_LABELS, is_automated_heuristic_clue
 from config import MIN_CLUE_CONFIDENCE, TOP_N_HYPOTHESES
 
 # Modest, deterministic fusion weights: the immutable full-image cosine stays
@@ -87,9 +87,12 @@ class ModelAwareEngine(ReasoningEngine):
         observation-only semantic clues (``display_only``) stay display only.
         """
         extra = clue.extra if isinstance(clue.extra, dict) else {}
-        if extra.get("display_only") is True or extra.get("affects_ranking") is False:
-            # 观察型证据（road/terrain/waterbody/infrastructure/signage）
-            # 只展示，绝不进入融合排序。
+        if (
+            is_automated_heuristic_clue(clue)
+            or extra.get("display_only") is True
+            or extra.get("affects_ranking") is False
+        ):
+            # 颜色/亮度启发式以及观察型证据只展示，绝不进入融合排序。
             return False
         if clue.source == "user":
             return True

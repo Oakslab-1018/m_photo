@@ -54,6 +54,6 @@ class ClimateAnalyzer(BaseAnalyzer):
                 confidence=round(confidence, 3),
                 evidence=evidence,
                 source=self.name,
-                extra={"blue_ratio": round(blue_ratio, 3), "brightness": round(brightness, 3)},
+                extra={"blue_ratio": round(blue_ratio, 3), "brightness": round(brightness, 3), "display_only": True, "affects_ranking": False, "reliable": False},
             )
         ]

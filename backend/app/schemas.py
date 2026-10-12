@@ -123,6 +123,7 @@ class UploadResponse(BaseModel):
     clues: list[ClueModel] = Field(default_factory=list)
     scores: list[CountryScoreModel] = Field(default_factory=list)
     action: ActionModel | None = None
+    inference_notice: str | None = None
     messages: list[ChatMessageModel] = Field(default_factory=list)
 
 
@@ -252,6 +253,7 @@ class GuidedQuestionModel(BaseModel):
     message: str = Field(min_length=1, max_length=1000)
     dimension: str | None = Field(default=None, max_length=64)
     clue_id: str | None = Field(default=None, max_length=120)
+    target: GuidedLocationTarget | None = None
     options: list[GuidedQuestionOptionModel] | None = None
 
     model_config = {"extra": "forbid"}
@@ -315,6 +317,7 @@ class GuidedDialogueResponse(BaseModel):
     clues: list[ClueModel] = Field(default_factory=list)
     exclusions: list[str] = Field(default_factory=list)
     receipt: GuidedReceiptModel | None = None
+    inference_notice: str | None = None
 
 
 class MessagesResponse(BaseModel):

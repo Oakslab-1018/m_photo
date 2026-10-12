@@ -107,6 +107,10 @@ export class GeoApi {
       scores: asArray(raw.scores),
       action: isRecord(raw.action) ? (raw.action as unknown as UploadResponse['action']) : null,
       messages: asArray(raw.messages).map(asMessage).filter((item): item is ChatMessage => item !== null),
+      inference_notice:
+        typeof raw.inference_notice === 'string' && raw.inference_notice.trim()
+          ? raw.inference_notice.trim()
+          : null,
     }
   }
 

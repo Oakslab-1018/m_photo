@@ -40,6 +40,6 @@ class VehicleAnalyzer(BaseAnalyzer):
                 confidence=round(confidence, 3),
                 evidence=evidence,
                 source=self.name,
-                extra={"brightness": round(brightness, 3), "saturation": round(saturation, 3)},
+                extra={"brightness": round(brightness, 3), "saturation": round(saturation, 3), "display_only": True, "affects_ranking": False, "reliable": False},
             )
         ]

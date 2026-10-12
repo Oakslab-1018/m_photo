@@ -20,6 +20,46 @@ const responseBody: GuidedDialogueResponse = {
   exclusions: [],
 }
 
+describe('GeoApi upload mapping', () => {
+  it('maps the optional inference_notice and normalizes blank values to null', async () => {
+    const bodies = [
+      {
+        session_id: 3,
+        image_url: '/media/a.png',
+        clues: [],
+        scores: [],
+        action: null,
+        messages: [],
+        inference_notice: '  模型结果不可用，已回退到规则排序。  ',
+      },
+      {
+        session_id: 4,
+        image_url: '/media/b.png',
+        clues: [],
+        scores: [],
+        action: null,
+        messages: [],
+        inference_notice: '',
+      },
+    ]
+    let call = 0
+    const fetchImpl = vi.fn<typeof fetch>(async () =>
+      new Response(JSON.stringify(bodies[call++]), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    )
+    const client = new GeoApi({ fetchImpl })
+    const file = new File([new Uint8Array([1])], 'a.png', { type: 'image/png' })
+
+    const degraded = await client.upload(file)
+    const healthy = await client.upload(file)
+
+    expect(degraded.inference_notice).toBe('模型结果不可用，已回退到规则排序。')
+    expect(healthy.inference_notice).toBeNull()
+  })
+})
+
 describe('GeoApi guided dialogue routes', () => {
   it('calls the start, snapshot and event endpoints with the contract payload', async () => {
     const fetchImpl = vi.fn<typeof fetch>(async () =>

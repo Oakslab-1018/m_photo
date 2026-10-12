@@ -418,9 +418,24 @@ textarea.chat-input { resize: none; max-height: 96px; overflow-y: auto; line-hei
 .guided-panel-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
 .guided-kicker { display: block; color: var(--primary); font-size: 10px; font-weight: 700; letter-spacing: 0.12em; }
 .guided-panel-head h2 { margin-top: 2px; font-size: 17px; line-height: 1.35; }
+.guided-panel-head-actions {
+  display: flex; flex-direction: column; align-items: flex-end; gap: 6px; flex-shrink: 0;
+}
 .guided-progress {
   flex-shrink: 0; border: 1px solid var(--border); border-radius: 999px; background: var(--panel-soft);
   color: var(--ink-soft); font-size: 11px; padding: 3px 9px;
+}
+.guided-back-btn { min-height: 28px; padding: 4px 9px; font-size: 11px; white-space: nowrap; }
+.guided-review-box { display: flex; flex-direction: column; gap: 6px; }
+.guided-review-progress {
+  flex-shrink: 0; border: 1px solid var(--primary); border-radius: 999px; background: var(--primary-soft);
+  color: var(--primary-dark); font-size: 10px; font-weight: 700; padding: 2px 9px;
+}
+.guided-review-nav { display: flex; justify-content: flex-start; }
+.guided-candidates-toolbar { display: flex; flex-wrap: wrap; gap: 6px; }
+.inference-notice {
+  flex: 0 0 auto; border: 1px solid #f0d9b5; border-radius: var(--radius-sm); background: var(--city-soft);
+  color: var(--warn); font-size: 11px; line-height: 1.55; padding: 7px 9px;
 }
 .guided-loading { padding: 18px 10px; text-align: center; color: var(--muted); font-size: 12px; }
 .guided-error {

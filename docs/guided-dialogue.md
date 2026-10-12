@@ -11,7 +11,7 @@ starts guided mode after upload; model ranks are evidence, never confirmations.
 - GET /api/geo/{session_id}/dialogue: current snapshot; 404 if not initialized.
 - POST /api/geo/{session_id}/dialogue/events: validate and apply one event atomically.
 
-All return `{dialogue, candidates, action, messages, scores, clues, exclusions}`.
+All return `{dialogue, candidates, action, messages, scores, clues, exclusions}`. An optional `inference_notice` explains unavailable model results or insufficient reliable evidence; it is shown even before candidate selection.
 `action` retains existing kind/message/payload shape. `scores`, `clues`, and
 `exclusions` retain legacy shapes where relevant; guided review lives in dialogue.
 
@@ -114,3 +114,17 @@ retry preserves event_id. Disable duplicate submission while applying an event.
 Cover transitions, clue/location distinction, unknown, parent validation, scoped
 exclusion/restore, backtracking, free-text proposal, duplicate/stale events,
 restart persistence, rollback, no-provider operation, and legacy API compatibility.
+
+## Guided panel presentation
+
+The primary panel shows one authoritative observation question at a time. The
+left clue rail retains the full observation list. Completing the observations
+reveals an explicit Next button; only that action opens the current level's
+Top-5 candidates. Neither the button nor a ranking confirms a location.
+
+Returning to the previous observation retracts its review through the server,
+which makes that observation the current question again. Returning to a previous
+location level uses backtrack and preserves evidence and exclusion history.
+New pending observations or unresolved correction questions return the panel to
+review. Client review history records successful actions within the current
+page session and does not invent server state after a reload.

@@ -34,7 +34,7 @@ from ..schemas import (
 from ..services.chat import ChatService
 from ..services.geo_session import GeoSessionService
 from ..services.pipeline import PipelineService
-from ..services.model_gateway import StreetClipGateway
+from ..services.model_gateway import StreetClipGateway, build_inference_notice
 from ..services.region_analysis import RegionAnalysisService, provider_signature
 from ..domain.geolocation.clue import dicts_to_clues
 from ..domain.geolocation import knowledge_graph as kg
@@ -145,13 +145,27 @@ def upload_image(
             geo.set_clues(geo_session.id, clues)
             geo.set_model_evidence(geo_session.id, evidence)
             result = chat.initial_analysis(geo_session.id)
+            scores = result.get("scores") or []
+            inference_notice = build_inference_notice(
+                settings,
+                evidence,
+                has_trusted_evidence=bool(scores),
+            )
+            if inference_notice:
+                geo.add_message(
+                    geo_session.id,
+                    "system",
+                    inference_notice,
+                    {"inference_notice": True},
+                )
             response = UploadResponse(
                 session_id=geo_session.id,
                 image_url=f"{settings.media_url_prefix}/{filename}",
                 image_filename=filename,
                 clues=clues,
-                scores=result.get("scores") or [],
+                scores=scores,
                 action=result.get("action"),
+                inference_notice=inference_notice,
                 messages=geo.list_messages(geo_session.id),
             )
             _check_response_serializable(response)

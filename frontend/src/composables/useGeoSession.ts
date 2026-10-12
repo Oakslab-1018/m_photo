@@ -39,6 +39,8 @@ export function useGeoSession() {
   const cityScores = ref<CityScore[]>([])
   const cityCountryIso = ref<string | null>(null)
   const citiesStatus = ref<CitiesResponse['status'] | null>(null)
+  /** Degraded-inference explanation; rendered outside the phase-gated history. */
+  const inferenceNotice = ref<string | null>(null)
 
   const topCandidate = computed<CountryScore | null>(() => scores.value[0] ?? null)
   const isConfirmed = computed(() => confirmedIso.value !== null)
@@ -61,6 +63,7 @@ export function useGeoSession() {
     cityScores.value = [...(response.city_scores ?? [])]
     cityCountryIso.value = null
     citiesStatus.value = response.city_scores ? 'ok' : null
+    inferenceNotice.value = response.inference_notice ?? null
   }
 
   function applyFeedback(response: FeedbackResponse): void {
@@ -114,6 +117,11 @@ export function useGeoSession() {
     action.value = response.action ?? null
     confirmedIso.value = null
     done.value = false
+    // An updated snapshot may clear the degraded notice; an older payload
+    // without the field keeps the last known notice instead of lying.
+    if (response.inference_notice !== undefined) {
+      inferenceNotice.value = response.inference_notice ?? null
+    }
   }
 
   /** Replace city rows in place (region refilter) without touching the scope. */
@@ -148,6 +156,7 @@ export function useGeoSession() {
     cityScores.value = []
     cityCountryIso.value = null
     citiesStatus.value = null
+    inferenceNotice.value = null
   }
 
   return {
@@ -163,6 +172,7 @@ export function useGeoSession() {
     cityScores,
     cityCountryIso,
     citiesStatus,
+    inferenceNotice,
     topCandidate,
     isConfirmed,
     acceptedCountry,

@@ -64,6 +64,31 @@ OBSERVATION_DIMENSIONS = (
     "infrastructure",
 )
 
+# Color/brightness analyzers are display observations only. Their categorical
+# guesses must never become country-ranking evidence, including for older
+# persisted clues created before the metadata flags existed.
+_AUTOMATED_HEURISTIC_SOURCES = frozenset({"climate", "vegetation", "building", "vehicle"})
+
+
+def is_automated_heuristic_clue(clue: object) -> bool:
+    """True for analyzer-produced color/brightness guesses.
+
+    Checks source and origin_source for current analyzer output, then falls
+    back to the heuristic dimensions so legacy persisted clues with a generic
+    ``pipeline`` source stay display-only too. User/OCR/semantic evidence is
+    exempt unless it originated from one of the automated analyzers.
+    """
+    source = str(getattr(clue, "source", "") or "").strip().lower()
+    extra = getattr(clue, "extra", None)
+    extra = extra if isinstance(extra, dict) else {}
+    origin = str(extra.get("origin_source") or source or "").strip().lower()
+    if source in _AUTOMATED_HEURISTIC_SOURCES or origin in _AUTOMATED_HEURISTIC_SOURCES:
+        return True
+    dimension = str(getattr(clue, "dimension", "") or "").strip().lower()
+    trusted_source = source in {"user", "ocr", "text_language", "semantic"}
+    explicit_trust = extra.get("validated") is True or extra.get("reliable") is True
+    return dimension in _AUTOMATED_HEURISTIC_SOURCES and not (trusted_source or explicit_trust)
+
 # 维度中文名映射（与 DIMENSIONS 保持一致）
 DIM_LABELS = {
     "language": "文字语言",
@@ -272,6 +297,7 @@ __all__ = [
     "DIM_LABELS",
     "OBSERVATION_DIMENSIONS",
     "VALUE_LABELS",
+    "is_automated_heuristic_clue",
     "Clue",
     "clues_to_dicts",
     "dicts_to_clues",

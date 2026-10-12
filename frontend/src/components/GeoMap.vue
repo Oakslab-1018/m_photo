@@ -43,6 +43,8 @@ const props = withDefaults(
     guided?: boolean
     guidedStage?: GuidedStage | null
     guidedCandidates?: LocationCandidate[]
+    /** False while the guided UI is still in the review phase (candidates hidden). */
+    guidedCandidatesVisible?: boolean
     guidedConfirmed?: GuidedConfirmedPath | null
     selectedGuidedTargetKey?: string | null
     guidedConfirmationReady?: boolean
@@ -55,6 +57,7 @@ const props = withDefaults(
     guided: false,
     guidedStage: null,
     guidedCandidates: () => [],
+    guidedCandidatesVisible: true,
     guidedConfirmed: null,
     selectedGuidedTargetKey: null,
     guidedConfirmationReady: true,
@@ -93,7 +96,12 @@ const styleConfig = resolveMapStyle(import.meta.env as unknown as { VITE_MAP_STY
 
 const guidedMode = computed(() => props.guided)
 const guidedMap = computed(() =>
-  guidedLocationPoints(props.guidedCandidates, props.guidedConfirmed, props.guidedStage),
+  guidedLocationPoints(
+    // Review phase hides every candidate marker; the confirmed path stays.
+    props.guidedCandidatesVisible ? props.guidedCandidates : [],
+    props.guidedConfirmed,
+    props.guidedStage,
+  ),
 )
 const countries = computed<MapPoint[]>(() => countryPoints(props.scores, props.confirmedIso))
 const cities = computed<MapPoint[]>(() => cityPoints(props.cityScores))
