@@ -1,26 +1,20 @@
 """City-level catalog adapter for the StreetCLIP inference service.
 
-The geodata worker owns ``cities_catalog.py`` and ``data/cities.json``. This
-module is the bounded seam between that catalog and the inference service: it
-loads the flat GeoNames-derived rows once, exposes immutable per-ISO tuples,
-renders the city/region/country text prototypes and reports a catalog revision.
-
-``city_catalog_revision`` is the SHA-256 of the raw ``cities.json`` file bytes
-(not a re-serialized canonical form). The backend copies that file into its own
-image to verify revisions, so both sides must agree byte-for-byte without
-importing inference code or re-encoding JSON.
+The shipped read-only SQLite seed is the source of truth for the city
+directory. This module is the bounded seam between that database and the
+inference service: it loads the GeoNames-derived rows, exposes immutable
+per-source-ISO tuples, renders the city/region/country text prototypes and
+reports the stored logical catalog revision.
 """
 
 from __future__ import annotations
 
-import hashlib
-import importlib
-import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+from .catalog import CatalogDatabase, CatalogDatabaseError
 from .config import CITY_PROMPT_TEMPLATES, CITY_PROMPT_TEMPLATE_VERSION
 
 
@@ -41,17 +35,21 @@ class City:
     population: int
 
 
-def catalog_file_hash(path: Path) -> str:
-    """Return the SHA-256 of the raw ``cities.json`` file bytes."""
-    path = Path(path)
-    digest = hashlib.sha256()
+def _catalog_reader(path: Path | str | CatalogDatabase) -> CatalogDatabase:
+    if isinstance(path, CatalogDatabase):
+        return path
     try:
-        with open(path, "rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
-    except OSError as exc:
-        raise CityCatalogError(f"city catalog is unreadable: {path}") from exc
-    return digest.hexdigest()
+        return CatalogDatabase(path)
+    except CatalogDatabaseError as exc:
+        raise CityCatalogError(f"city catalog database is unreadable: {path}") from exc
+
+
+def catalog_file_hash(path: Path | str | CatalogDatabase) -> str:
+    """Return the stored logical city-source revision, never a SQLite file hash."""
+    try:
+        return _catalog_reader(path).revision("cities")
+    except CatalogDatabaseError as exc:
+        raise CityCatalogError(f"city catalog revision is unreadable: {path}") from exc
 
 
 def _coerce_city_id(value: Any) -> int:
@@ -130,90 +128,27 @@ def city_from_mapping(item: Any, index: int = 0) -> City:
     )
 
 
-def _read_catalog_rows(path: Path) -> list[City]:
-    if not path.is_file():
-        raise CityCatalogError(f"city catalog not found: {path}")
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError) as exc:
-        raise CityCatalogError(f"city catalog is unreadable: {path}") from exc
-    except json.JSONDecodeError as exc:
-        raise CityCatalogError(f"city catalog is not valid JSON: {path}") from exc
-    if isinstance(payload, dict):
-        payload = payload.get("cities")
-    if not isinstance(payload, list):
-        raise CityCatalogError("city catalog must be a JSON array of city rows")
-
-    cities: list[City] = []
-    seen: set[int] = set()
-    for index, item in enumerate(payload):
-        city = city_from_mapping(item, index)
-        if city.city_id in seen:
-            raise CityCatalogError(f"duplicate city_id in city catalog: {city.city_id}")
-        seen.add(city.city_id)
-        cities.append(city)
-    return cities
-
-
-def _load_via_worker_module(path: Path) -> list[City] | None:
-    """Use ``cities_catalog.py`` when present; ``None`` means fall back."""
-    try:
-        module = importlib.import_module("inference.streetclip.cities_catalog")
-    except Exception:
-        return None
-    loader = getattr(module, "load_cities", None) or getattr(module, "read_cities", None)
-    if loader is None:
-        return None
-    try:
-        loaded = loader(path)
-    except TypeError:
-        loaded = loader(str(path))
-    except Exception as exc:
-        raise CityCatalogError(f"cities_catalog loader failed: {exc}") from exc
-
-    rows: list[City] = []
-    if isinstance(loaded, dict):
-        for iso, values in loaded.items():
-            if isinstance(values, dict) and "cities" in values:
-                values = values["cities"]
-            for index, item in enumerate(values or ()):
-                row = city_from_mapping(item, index)
-                if row.iso != str(iso).strip().upper():
-                    row = City(
-                        city_id=row.city_id,
-                        iso=str(iso).strip().upper(),
-                        name=row.name,
-                        region=row.region,
-                        lat=row.lat,
-                        lng=row.lng,
-                        population=row.population,
-                    )
-                rows.append(row)
-    elif isinstance(loaded, (list, tuple)):
-        rows = [city_from_mapping(item, index) for index, item in enumerate(loaded)]
-    else:
-        return None
-    if not rows:
-        return None
-    seen: set[int] = set()
-    for row in rows:
-        if row.city_id in seen:
-            raise CityCatalogError(f"duplicate city_id in city catalog: {row.city_id}")
-        seen.add(row.city_id)
-    return rows
-
-
-def load_cities(path: Path) -> dict[str, tuple[City, ...]]:
+def load_cities(path: Path | str | CatalogDatabase) -> dict[str, tuple[City, ...]]:
     """Load the catalog grouped by ISO, sorted by population then city id.
 
     Every returned group is an immutable tuple already sorted for selection.
     The full mapping is kept so only the selected country's top cities are
     ever turned into text features.
     """
-    path = Path(path)
-    rows = _load_via_worker_module(path)
-    if rows is None:
-        rows = _read_catalog_rows(path)
+    try:
+        payload = _catalog_reader(path).cities()
+    except CatalogDatabaseError as exc:
+        raise CityCatalogError(f"city catalog database is unreadable: {path}") from exc
+
+    rows: list[City] = []
+    seen: set[int] = set()
+    for index, item in enumerate(payload):
+        city = city_from_mapping(item, index)
+        if city.city_id in seen:
+            raise CityCatalogError(f"duplicate city_id in city catalog: {city.city_id}")
+        seen.add(city.city_id)
+        rows.append(city)
+
     grouped: dict[str, list[City]] = {}
     for city in rows:
         grouped.setdefault(city.iso, []).append(city)

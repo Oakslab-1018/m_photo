@@ -21,7 +21,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, create_engine, event
+from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, event
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
@@ -132,6 +132,81 @@ class ChatMessage(Base):
         }
 
 
+class GuidedDialogue(Base):
+    """Persisted guided-dialogue state for one :class:`GeoSession`.
+
+    A separate table (rather than a ``geo_session`` JSON column) keeps guided
+    state additive and leaves the legacy upload/feedback contract untouched.
+    The evolving contract state is kept as a JSON document inside this table so
+    new review/proposal fields do not require a column per field; event
+    idempotency and receipts live in :class:`GuidedEvent` instead. ``revision``
+    is the optimistic concurrency token: every effective event performs a
+    conditional update on ``(session_id, revision)`` and increments it once.
+    """
+
+    __tablename__ = "guided_dialogue"
+
+    session_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("geo_session.id"), primary_key=True
+    )
+    revision: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    stage: Mapped[str] = mapped_column(String(20), default="country", nullable=False)
+    state_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
+    )
+
+    @property
+    def state(self) -> dict[str, Any]:
+        try:
+            value = json.loads(self.state_json or "{}")
+        except (TypeError, ValueError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    @state.setter
+    def state(self, value: dict[str, Any]) -> None:
+        self.state_json = json.dumps(value, ensure_ascii=False, allow_nan=False)
+
+
+class GuidedEvent(Base):
+    """Idempotency ledger for guided dialogue events.
+
+    ``(session_id, event_id)`` is unique. The receipt is the original response
+    summary for the event and is replayed unchanged when the same event id is
+    submitted again, regardless of the caller's later ``expected_revision``.
+    """
+
+    __tablename__ = "guided_event"
+    __table_args__ = (
+        UniqueConstraint("session_id", "event_id", name="uq_guided_event_session_event"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    session_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("geo_session.id"), nullable=False, index=True
+    )
+    event_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    summary: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    receipt_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+
+    @property
+    def receipt(self) -> dict[str, Any]:
+        try:
+            value = json.loads(self.receipt_json or "{}")
+        except (TypeError, ValueError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    @receipt.setter
+    def receipt(self, value: dict[str, Any]) -> None:
+        self.receipt_json = json.dumps(value, ensure_ascii=False, allow_nan=False)
+
+
 def create_db_engine(settings: Settings) -> Engine:
     """Create a lazily-connecting SQLite engine for ``settings``."""
     if settings.database_url.startswith("sqlite"):
@@ -189,10 +264,22 @@ def ensure_parent_dir(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
 
+# Imported for its side effect: geo_catalog_models defines the 0004 tables
+# (geo_catalog_source / geo_place) on ``Base.metadata`` so Alembic autogenerate
+# and the safe baseline-adoption reference see the complete schema. The import
+# lives at the bottom because the module maps itself onto ``Base``; the two
+# models are re-exported here for callers that import from ``database``.
+from .services import geo_catalog_models as _geo_catalog_models  # noqa: E402,F401
+from .services.geo_catalog_models import GeoCatalogSource, GeoPlace  # noqa: E402,F401
+
 __all__ = [
     "Base",
     "ChatMessage",
+    "GeoCatalogSource",
+    "GeoPlace",
     "GeoSession",
+    "GuidedDialogue",
+    "GuidedEvent",
     "create_db_engine",
     "create_session_factory",
     "ensure_parent_dir",

@@ -1,27 +1,32 @@
-"""Read-only access to the GeoNames city catalog (``data/cities.json``).
+"""Read-only access to the authoritative GeoNames city catalog (SQLite only).
 
 The inference service ranks cities, but the backend owns the authoritative
 catalog copy: every city row it returns is checked against this module before
-it is shown to a user, so a stale or diverging pair of catalogs surfaces as a
-rejected payload instead of fabricated geography on the map.
+it is shown to a user, so a stale or diverging catalog surfaces as a rejected
+payload instead of fabricated geography on the map.
 
-Pinned in ``data/geo-catalog-sources.json``: GeoNames ``cities15000``
-(CC BY 4.0), 34156 rows. ``catalog_digest`` exposes the raw-file SHA-256 that
-both services compare, so neither side has to re-serialize JSON to agree.
+The catalog now lives in the portable SQLite seed
+(``data/geo_catalog.sqlite3``) and is read through the standard-library
+:class:`catalog_db.CatalogDatabase`. ``data/cities.json`` is never read.
+``catalog_digest`` returns the stored logical fingerprint
+(``geo_catalog_source.fingerprint`` for the ``cities`` source), never a hash of
+the SQLite file itself, so both services can keep comparing the same revision
+string without hashing multi-megabyte files.
 
-Parsing is cached per ``(path, mtime, size)``; the catalog is read-only and
-shipped inside the backend image, so a given deployment parses it once.
+Parsing is cached per ``(database path, logical revision)``; the fingerprint
+changes when ``--force`` copies an updated seed, which naturally invalidates
+the cache.
 """
 from __future__ import annotations
 
-import hashlib
-import json
 import math
 import re
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
+
+from catalog_db import CatalogDatabase, CatalogDatabaseError
 
 _ISO_RE = re.compile(r"^[A-Z]{2}$")
 
@@ -109,55 +114,73 @@ def city_from_mapping(item: Any, index: int = 0) -> CityRow:
                    lat=lat, lng=lng, population=population)
 
 
-def catalog_digest(path: str | Path) -> str:
-    """SHA-256 of the raw catalog bytes (never a re-serialized canonical form)."""
-    digest = hashlib.sha256()
+def catalog_digest(path: str | Path | None = None) -> str:
+    """Return the stored logical revision of the city catalog.
+
+    ``path`` is a SQLite catalog database path (``None`` selects the immutable
+    shipped seed). The value is the fingerprint recorded at seed-build time,
+    never a SHA-256 of the database file or a re-serialized JSON document.
+    """
     try:
-        with open(path, "rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
-    except OSError as exc:
-        raise CityCatalogError(f"city catalog is unreadable: {Path(path).name}") from exc
-    return digest.hexdigest()
+        reader = CatalogDatabase(None if path is None else Path(path))
+        return reader.revision("cities")
+    except CatalogDatabaseError as exc:
+        raise CityCatalogError(f"city catalog is unreadable: {exc}") from exc
+
+
+def _city_mapping(row: dict[str, Any]) -> dict[str, Any]:
+    """Rebuild the original city-object shape from one SQL storage row."""
+
+    city_id = row.get("geoname_id")
+    if city_id is None:
+        city_id = row.get("place_id")
+    return {
+        "city_id": city_id,
+        "iso": row.get("source_iso"),
+        "name": row.get("name"),
+        "region": row.get("code") or "",
+        "lat": row.get("lat"),
+        "lng": row.get("lng"),
+        "population": row.get("population") if row.get("population") is not None else 0,
+    }
 
 
 @lru_cache(maxsize=4)
-def _load_cached(key: tuple[str, int, int]) -> dict[str, dict[int, CityRow]]:
-    path = Path(key[0])
+def _load_cached(path_key: str, revision: str) -> dict[str, dict[int, CityRow]]:
+    # ``revision`` is part of the cache key; the rows are always re-read from
+    # the database on a miss, then validated by the strict converter below.
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except OSError as exc:
-        raise CityCatalogError(f"city catalog is unreadable: {path.name}") from exc
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise CityCatalogError(f"city catalog is not valid JSON: {path.name}") from exc
-    if isinstance(payload, dict):
-        payload = payload.get("cities")
-    if not isinstance(payload, list) or not payload:
-        raise CityCatalogError("city catalog must be a non-empty JSON array")
+        reader = CatalogDatabase(path_key)
+        rows = reader.places("city")
+    except CatalogDatabaseError as exc:
+        raise CityCatalogError(f"city catalog is unreadable: {exc}") from exc
 
     index: dict[str, dict[int, CityRow]] = {}
-    seen: set[int] = set()
-    for position, item in enumerate(payload):
-        row = city_from_mapping(item, position)
-        if row.city_id in seen:
-            raise CityCatalogError(f"duplicate city_id in city catalog: {row.city_id}")
-        seen.add(row.city_id)
-        index.setdefault(row.iso, {})[row.city_id] = row
+    for position, row in enumerate(rows):
+        city = city_from_mapping(_city_mapping(row), position)
+        bucket = index.setdefault(city.iso, {})
+        if city.city_id in bucket:
+            raise CityCatalogError(f"duplicate city_id in city catalog: {city.city_id}")
+        bucket[city.city_id] = city
     return index
 
 
-def load_city_index(path: str | Path) -> dict[str, dict[int, CityRow]]:
+def load_city_index(path: str | Path | None = None) -> dict[str, dict[int, CityRow]]:
     """Return ``{iso: {city_id: CityRow}}`` for the catalog at ``path``.
 
-    Raises :class:`CityCatalogError` for a missing, malformed or duplicated
-    catalog; callers treat that exactly like invalid provider output.
+    ``path`` is a SQLite catalog database path; ``None`` selects the immutable
+    shipped seed. Raises :class:`CityCatalogError` for a missing, malformed or
+    duplicated catalog; callers treat that exactly like invalid provider
+    output. The legacy JSON path form is rejected because the SQLite reader
+    cannot open it.
     """
-    candidate = Path(path)
+    candidate = None if path is None else Path(path)
     try:
-        stat = candidate.stat()
-    except OSError as exc:
-        raise CityCatalogError(f"city catalog not found: {candidate.name}") from exc
-    return _load_cached((str(candidate), stat.st_mtime_ns, stat.st_size))
+        reader = CatalogDatabase(candidate)
+        revision = reader.revision("cities")
+    except CatalogDatabaseError as exc:
+        raise CityCatalogError(f"city catalog is unreadable: {exc}") from exc
+    return _load_cached(str(reader.path), revision)
 
 
 def clear_city_cache() -> None:

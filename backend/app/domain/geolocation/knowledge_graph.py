@@ -1,21 +1,40 @@
-"""知识图谱：加载国家知识库并提供线索匹配查询。"""
+"""知识图谱：从只读 SQLite 目录加载国家知识库并提供线索匹配查询。"""
 from __future__ import annotations
 
-import json
-import os
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, Dict, List
 
-from config import BASE_DIR
+from catalog_db import CatalogDatabase, default_catalog_path
 
-_DATA_PATH = os.path.join(BASE_DIR, "data", "countries.json")
+_CONFIGURED_CATALOG_PATH: Path | None = None
+
+
+def catalog_path() -> Path:
+    """Return the process catalog path: configured runtime DB or seed fallback."""
+
+    return _CONFIGURED_CATALOG_PATH or default_catalog_path()
+
+
+def configure_catalog(path: str | Path) -> None:
+    """Select the process catalog DB and invalidate the country payload cache.
+
+    Backend startup calls this once after the runtime SQLite catalog has been
+    imported. Offline callers that never configure the process keep reading the
+    immutable shipped seed.
+    """
+
+    global _CONFIGURED_CATALOG_PATH
+    candidate = Path(path).expanduser().resolve()
+    _CONFIGURED_CATALOG_PATH = candidate
+    load_countries.cache_clear()
 
 
 @lru_cache(maxsize=1)
 def load_countries() -> List[Dict[str, Any]]:
-    """加载国家知识库（带缓存）。"""
-    with open(_DATA_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+    """加载只读国家目录（带缓存），数据直接来自 SQLite seed/runtime 目录。"""
+
+    return CatalogDatabase(catalog_path()).countries()
 
 
 def get_by_iso(iso: str) -> Dict[str, Any] | None:

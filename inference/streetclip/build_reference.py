@@ -117,7 +117,7 @@ def main(argv: Sequence[str] | None = None, *, settings: Settings | None = None)
     args = _parse_args(argv)
     try:
         resolved = settings or load_settings()
-        countries = _read_catalog(resolved.countries_path)
+        countries = _read_catalog(resolved.catalog_db_path)
         catalog_revision = compute_catalog_revision(countries)
         predictor = StreetClipPredictor(
             resolved,

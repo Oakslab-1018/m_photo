@@ -277,15 +277,36 @@
     }
   },
   "outputs": {
-    "data/countries.json": {
-      "sha256": "b1c83e9612383927f849dde3bc91a222a877836812b70405b6780b8e7efb69f3",
-      "records": 250
+    "data/geo_catalog.sqlite3": {
+      "path": "data/geo_catalog.sqlite3",
+      "format": "sqlite",
+      "tables": [
+        "geo_catalog_source",
+        "geo_place"
+      ],
+      "logical_revisions": {
+        "countries": "b1c83e9612383927f849dde3bc91a222a877836812b70405b6780b8e7efb69f3",
+        "admin1": "9833ccbdda47da04cac6ebc3a6c19021df56dcc02fe5cd718c7759394722073e",
+        "cities": "f3f6381a0e942655544d82eef89ac7053df6d2bf8edd9d5c07f5806330857038"
+      },
+      "record_counts": {
+        "countries": 250,
+        "admin1": 3865,
+        "cities": 34156
+      },
+      "note": "Per-level fingerprints are the stored logical source revisions; they are never a hash of the SQLite database file."
     },
-    "data/cities.json": {
-      "sha256": "f3f6381a0e942655544d82eef89ac7053df6d2bf8edd9d5c07f5806330857038",
-      "records": 34156
+    "logical_revisions": {
+      "countries": "b1c83e9612383927f849dde3bc91a222a877836812b70405b6780b8e7efb69f3",
+      "admin1": "9833ccbdda47da04cac6ebc3a6c19021df56dcc02fe5cd718c7759394722073e",
+      "cities": "f3f6381a0e942655544d82eef89ac7053df6d2bf8edd9d5c07f5806330857038"
+    },
+    "record_counts": {
+      "countries": 250,
+      "admin1": 3865,
+      "cities": 34156
     }
   },
-  "build_command": "python scripts/update-geo-catalog.py",
-  "verify_command": "python scripts/update-geo-catalog.py --check"
+  "build_command": "python scripts/update-geo-catalog.py --database data/geo_catalog.sqlite3",
+  "verify_command": "python scripts/update-geo-catalog.py --database data/geo_catalog.sqlite3 --check"
 }

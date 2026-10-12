@@ -32,7 +32,8 @@ import httpx
 from PIL import Image, ImageOps
 
 from ..config import Settings
-from .city_catalog import CityCatalogError, catalog_digest, load_city_index
+from .catalog_access import catalog_for_settings
+from .city_catalog import CityCatalogError, load_city_index
 
 MODEL_ID = "geolocal/StreetCLIP"
 MODEL_REVISION = "e3561ba2ad9bf14c9efd6b0092607b8497efbfea"
@@ -117,6 +118,14 @@ class StreetClipGateway:
     def __init__(self, settings: Settings, *, transport: httpx.BaseTransport | None = None):
         self.settings = settings
         self.transport = transport
+        self._catalog_database = None
+
+    def _catalog(self):
+        """Return the request's read-only runtime catalog handle."""
+
+        if self._catalog_database is None:
+            self._catalog_database = catalog_for_settings(self.settings)
+        return self._catalog_database
 
     def _endpoint(self) -> tuple[str, float]:
         """Validated ``(base_url, timeout)`` or ``ValueError``."""
@@ -135,7 +144,7 @@ class StreetClipGateway:
 
     def country_isos(self) -> set[str]:
         """ISO codes of the loaded country catalog (the only valid city scope)."""
-        return {c["iso"] for c in json.loads(self.settings.countries_path.read_text(encoding="utf-8"))}
+        return {c["iso"] for c in self._catalog().countries()}
 
     def rank_image(self, path: str | Path) -> dict | None:
         if not self.settings.streetclip_enabled:
@@ -186,7 +195,7 @@ class StreetClipGateway:
 
     # ---- contract validation -------------------------------------------------
     def _validate_rankings(self, data: object) -> dict:
-        countries = json.loads(self.settings.countries_path.read_text(encoding="utf-8"))
+        countries = self._catalog().countries()
         allowed = {c["iso"] for c in countries}
         if not isinstance(data, dict) or data.get("model") != MODEL_ID or data.get("model_revision") != MODEL_REVISION:
             raise ValueError("unexpected model")
@@ -306,7 +315,7 @@ class StreetClipGateway:
             raise ValueError("invalid reference payload")
         if data.get("model_revision") != MODEL_REVISION:
             raise ValueError("reference model mismatch")
-        countries = json.loads(self.settings.countries_path.read_text(encoding="utf-8"))
+        countries = self._catalog().countries()
         allowed = {c["iso"] for c in countries}
         if data.get("catalog_revision") != catalog_revision(countries):
             raise ValueError("reference catalog mismatch")
@@ -431,8 +440,8 @@ class StreetClipGateway:
         else:
             revision = _sha256_text(revision, "city catalog revision")
             try:
-                expected_revision = catalog_digest(self.settings.cities_path)
-            except CityCatalogError as exc:
+                expected_revision = self._catalog().revision("cities")
+            except (CityCatalogError, ValueError) as exc:
                 raise ValueError("city catalog unavailable") from exc
             if revision != expected_revision:
                 raise ValueError("city catalog mismatch")
@@ -448,7 +457,7 @@ class StreetClipGateway:
             raise ValueError("invalid city count")
 
         try:
-            allowed = load_city_index(self.settings.cities_path).get(requested, {})
+            allowed = load_city_index(self._catalog().path).get(requested, {})
         except CityCatalogError as exc:
             raise ValueError("city catalog unavailable") from exc
 

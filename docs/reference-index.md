@@ -85,8 +85,8 @@ the service attach it (key absent otherwise) to the `/predict` response:
 
 `StreetClipGateway.validate` re-checks the sidecar before anything is stored or
 returned: `model_revision` must equal the backend's pinned `MODEL_REVISION`,
-`catalog_revision` must equal the SHA-256 of the backend's own
-`data/countries.json`, `aggregation` must be a known value, `index_revision` a
+`catalog_revision` must equal the backend's semantic country catalog revision
+computed from SQLite country candidates and the pinned prompt templates, `aggregation` must be a known value, `index_revision` a
 SHA-256, and every `iso` in `matches`/`regions` must appear in `coverage`. Order
 and bounds are re-imposed rather than trusted. A sidecar that fails any of this
 is dropped with a warning while the country ranking is kept: the ranking is

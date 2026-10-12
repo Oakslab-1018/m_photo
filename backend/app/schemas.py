@@ -171,6 +171,152 @@ class FeedbackResponse(BaseModel):
     iso: str | None = None
 
 
+GuidedLocationLevel = Literal["country", "admin1", "city"]
+GuidedStage = Literal["country", "admin1", "city", "resolved"]
+ReviewedClueStatus = Literal["pending", "confirmed", "rejected", "uncertain"]
+GuidedEventType = Literal[
+    "confirm_clue",
+    "reject_clue",
+    "confirm_location",
+    "reject_location",
+    "answer",
+    "unknown",
+    "retract",
+    "backtrack",
+    "free_text",
+]
+
+
+class GuidedLocationTarget(BaseModel):
+    """Catalog-validated location identity used by the guided flow."""
+
+    level: GuidedLocationLevel
+    id: str = Field(min_length=1, max_length=120)
+    label: str = Field(min_length=1, max_length=200)
+    country_iso: str = Field(min_length=2, max_length=2)
+    source_iso: str | None = Field(default=None, min_length=2, max_length=2)
+    admin1_id: str | None = Field(default=None, max_length=120)
+    city_id: str | None = Field(default=None, max_length=32)
+    lat: float | None = Field(default=None, ge=-90.0, le=90.0, allow_inf_nan=False)
+    lng: float | None = Field(default=None, ge=-180.0, le=180.0, allow_inf_nan=False)
+    coordinate_source: str | None = Field(default=None, max_length=40)
+    coordinate_quality: str | None = Field(default=None, max_length=40)
+    coordinate_city_id: int | None = Field(default=None, ge=1)
+
+    model_config = {"extra": "forbid"}
+
+
+class GuidedCandidateModel(BaseModel):
+    """One current option; catalog-only rows intentionally omit score fields."""
+
+    target: GuidedLocationTarget
+    score: float | None = Field(default=None, allow_inf_nan=False)
+    score_type: str | None = None
+    reason: str | None = None
+
+    model_config = {"extra": "forbid"}
+
+    @model_serializer(mode="wrap")
+    def _drop_absent_optional_fields(self, handler):
+        data = handler(self)
+        for key in ("score", "score_type", "reason"):
+            if data.get(key) is None:
+                data.pop(key, None)
+        return data
+
+
+class ReviewedClueModel(BaseModel):
+    """User-review state layered over immutable machine evidence."""
+
+    id: str = Field(min_length=1, max_length=120)
+    dimension: str = Field(min_length=1, max_length=64)
+    value: str = Field(max_length=256)
+    description: str = ""
+    source: str = ""
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0, allow_inf_nan=False)
+    status: ReviewedClueStatus
+
+    model_config = {"extra": "forbid"}
+
+
+class GuidedQuestionOptionModel(BaseModel):
+    value: str = Field(min_length=1, max_length=200)
+    label: str = Field(min_length=1, max_length=200)
+
+    model_config = {"extra": "forbid"}
+
+
+class GuidedQuestionModel(BaseModel):
+    id: str = Field(min_length=1, max_length=200)
+    kind: Literal["review_clue", "ask", "confirm_location", "request_clue"]
+    message: str = Field(min_length=1, max_length=1000)
+    dimension: str | None = Field(default=None, max_length=64)
+    clue_id: str | None = Field(default=None, max_length=120)
+    options: list[GuidedQuestionOptionModel] | None = None
+
+    model_config = {"extra": "forbid"}
+
+
+class ConfirmedPathModel(BaseModel):
+    country: GuidedLocationTarget | None = None
+    admin1: GuidedLocationTarget | None = None
+    city: GuidedLocationTarget | None = None
+
+    model_config = {"extra": "forbid"}
+
+
+class GuidedDialogueModel(BaseModel):
+    version: Literal[1] = 1
+    revision: int = Field(ge=0)
+    stage: GuidedStage
+    confirmed: ConfirmedPathModel = Field(default_factory=ConfirmedPathModel)
+    exclusions: list[GuidedLocationTarget] = Field(default_factory=list)
+    clues: list[ReviewedClueModel] = Field(default_factory=list)
+    pending_question: GuidedQuestionModel | None = None
+
+    model_config = {"extra": "forbid"}
+
+
+class GuidedEventTarget(BaseModel):
+    level: GuidedLocationLevel
+    id: str = Field(min_length=1, max_length=120)
+
+    model_config = {"extra": "forbid"}
+
+
+class GuidedEventRequest(BaseModel):
+    type: GuidedEventType
+    event_id: str = Field(min_length=1, max_length=200)
+    expected_revision: int = Field(ge=0)
+    question_id: str | None = Field(default=None, max_length=200)
+    target: GuidedEventTarget | None = None
+    clue_id: str | None = Field(default=None, max_length=120)
+    value: str | None = Field(default=None, max_length=500)
+    text: str | None = Field(default=None, max_length=2000)
+    level: GuidedLocationLevel | None = None
+
+    model_config = {"extra": "forbid"}
+
+
+class GuidedReceiptModel(BaseModel):
+    event_id: str
+    status: Literal["applied", "unchanged", "unrecognized"]
+    summary: str
+
+    model_config = {"extra": "forbid"}
+
+
+class GuidedDialogueResponse(BaseModel):
+    dialogue: GuidedDialogueModel
+    candidates: list[GuidedCandidateModel] = Field(default_factory=list)
+    action: ActionModel | None = None
+    messages: list[ChatMessageModel] = Field(default_factory=list)
+    scores: list[CountryScoreModel] = Field(default_factory=list)
+    clues: list[ClueModel] = Field(default_factory=list)
+    exclusions: list[str] = Field(default_factory=list)
+    receipt: GuidedReceiptModel | None = None
+
+
 class MessagesResponse(BaseModel):
     messages: list[ChatMessageModel] = Field(default_factory=list)
 
@@ -326,8 +472,19 @@ __all__ = [
     "ErrorResponse",
     "FeedbackRequest",
     "FeedbackResponse",
+    "ConfirmedPathModel",
+    "GuidedCandidateModel",
+    "GuidedDialogueModel",
+    "GuidedDialogueResponse",
+    "GuidedEventRequest",
+    "GuidedEventTarget",
+    "GuidedLocationTarget",
+    "GuidedQuestionModel",
+    "GuidedQuestionOptionModel",
+    "GuidedReceiptModel",
     "HealthResponse",
     "MatchedClueModel",
     "MessagesResponse",
+    "ReviewedClueModel",
     "UploadResponse",
 ]

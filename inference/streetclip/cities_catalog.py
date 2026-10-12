@@ -1,30 +1,18 @@
-"""Strict helpers for the flat GeoNames-derived city catalog.
+"""Strict helpers for the GeoNames-derived city catalog.
 
-The generated ``data/cities.json`` keeps GeoNames numeric identifiers as
-positive decimal strings. That spelling is part of the cross-stack contract:
-the frontend and backend receive strings and convert only at the inference
-boundary. These helpers validate that contract and provide deterministic
-country selection without depending on the inference package.
+Rows come from the shipped read-only SQLite seed through the shared
+``catalog_db`` reader. The helpers keep raw source ISO grouping, preserve the
+raw region code and provide deterministic country selection by population
+descending and numeric GeoNames identifier ascending.
 """
 
 from __future__ import annotations
 
-import hashlib
-import json
 import math
 from pathlib import Path
 from typing import Any
 
-_CITY_KEYS = (
-    "city_id",
-    "iso",
-    "name",
-    "ascii_name",
-    "region",
-    "lat",
-    "lng",
-    "population",
-)
+from .catalog import CatalogDatabase, CatalogDatabaseError
 
 
 class CityCatalogError(ValueError):
@@ -54,12 +42,18 @@ def _normalize_iso(value: object, *, context: str) -> str:
     return iso
 
 
-def _normalize_city_id(value: object, index: int) -> str:
-    if not isinstance(value, str):
-        raise CityCatalogError(f"city catalog item {index} has a non-string city_id")
-    if not value.isascii() or not value.isdigit() or int(value) <= 0:
+def _normalize_city_id(value: object, index: int) -> int:
+    if isinstance(value, bool):
         raise CityCatalogError(f"city catalog item {index} has an invalid city_id")
-    return value
+    if isinstance(value, int):
+        city_id = value
+    elif isinstance(value, str) and value.isascii() and value.isdigit():
+        city_id = int(value)
+    else:
+        raise CityCatalogError(f"city catalog item {index} has an invalid city_id")
+    if city_id <= 0:
+        raise CityCatalogError(f"city catalog item {index} has an invalid city_id")
+    return city_id
 
 
 def _normalize_coordinate(value: object, field: str, index: int, *, low: float, high: float) -> float:
@@ -86,14 +80,14 @@ def _normalize_population(value: object, index: int) -> int:
 
 
 def validate_cities(payload: object) -> list[dict]:
-    """Validate and normalize the city rows, preserving JSON-compatible extras."""
+    """Validate and normalize city rows, preserving database payload extras."""
     if isinstance(payload, dict):
         payload = payload.get("cities")
     if not isinstance(payload, list):
-        raise CityCatalogError("city catalog must be a JSON array of city rows")
+        raise CityCatalogError("city catalog must be an array of city rows")
 
     cities: list[dict] = []
-    seen: set[str] = set()
+    seen: set[int] = set()
     for index, item in enumerate(payload):
         if not isinstance(item, dict):
             raise CityCatalogError(f"city catalog item {index} is not an object")
@@ -110,7 +104,7 @@ def validate_cities(payload: object) -> list[dict]:
         if raw_region is None:
             region = None
         elif isinstance(raw_region, str):
-            region = raw_region.strip() or None
+            region = raw_region
         else:
             raise CityCatalogError(f"city catalog item {index} has a non-string region")
 
@@ -133,17 +127,21 @@ def validate_cities(payload: object) -> list[dict]:
     return cities
 
 
-def load_cities(path: str | Path) -> list[dict]:
-    """Load and validate ``data/cities.json``-shaped JSON."""
-    path = Path(path)
-    if not path.is_file():
-        raise CityCatalogError(f"city catalog not found: {path}")
+def _catalog_reader(path: str | Path | CatalogDatabase) -> CatalogDatabase:
+    if isinstance(path, CatalogDatabase):
+        return path
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError) as exc:
-        raise CityCatalogError(f"city catalog is unreadable: {path}") from exc
-    except json.JSONDecodeError as exc:
-        raise CityCatalogError(f"city catalog is not valid JSON: {path}") from exc
+        return CatalogDatabase(path)
+    except CatalogDatabaseError as exc:
+        raise CityCatalogError(f"city catalog database is unreadable: {path}") from exc
+
+
+def load_cities(path: str | Path | CatalogDatabase) -> list[dict]:
+    """Load and validate city rows from the SQLite catalog seed."""
+    try:
+        payload = _catalog_reader(path).cities()
+    except CatalogDatabaseError as exc:
+        raise CityCatalogError(f"city catalog database is unreadable: {path}") from exc
     return validate_cities(payload)
 
 
@@ -154,25 +152,20 @@ def select_country(cities: list[dict] | tuple[dict, ...], iso: str, limit: int =
         raise CityCatalogError("city limit must be a positive integer")
     rows = validate_cities(list(cities))
     selected = [row for row in rows if row["iso"] == normalized_iso]
-    selected.sort(key=lambda row: (-row["population"], int(row["city_id"])))
+    selected.sort(key=lambda row: (-row["population"], row["city_id"]))
     return selected[:limit]
 
 
-def file_sha256(path: str | Path) -> str:
-    """Return the SHA-256 of the raw catalog file bytes."""
-    path = Path(path)
-    digest = hashlib.sha256()
+def file_sha256(path: str | Path | CatalogDatabase) -> str:
+    """Return the stored logical city revision, never a SQLite file hash."""
     try:
-        with path.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
-    except OSError as exc:
-        raise CityCatalogError(f"city catalog is unreadable: {path}") from exc
-    return digest.hexdigest()
+        return _catalog_reader(path).revision("cities")
+    except CatalogDatabaseError as exc:
+        raise CityCatalogError(f"city catalog revision is unreadable: {path}") from exc
 
 
-def catalog_revision(path: str | Path) -> str:
-    """Alias for :func:`file_sha256` used by revision metadata callers."""
+def catalog_revision(path: str | Path | CatalogDatabase) -> str:
+    """Return the stored logical city revision for revision metadata callers."""
     return file_sha256(path)
 
 

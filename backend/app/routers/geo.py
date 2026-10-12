@@ -290,7 +290,7 @@ def list_cities(
         return response
 
     try:
-        catalog = load_city_index(settings.cities_path)
+        catalog = load_city_index(settings.catalog_db_path)
     except CityCatalogError:
         catalog = None
     try:

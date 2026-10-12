@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 
 from .config import Settings
 from .services.chat import ChatService
+from .services.guided_dialogue import GuidedDialogueService
 from .services.geo_session import GeoSessionService
 from .services.pipeline import PipelineService
 
@@ -55,10 +56,18 @@ def get_chat_service(
     return ChatService(geo, settings=settings)
 
 
+def get_guided_dialogue_service(
+    geo: GeoSessionService = Depends(get_geo_service),
+    settings: Settings = Depends(get_settings),
+) -> GuidedDialogueService:
+    return GuidedDialogueService(geo, settings)
+
+
 __all__ = [
     "get_chat_service",
     "get_db_session",
     "get_geo_service",
+    "get_guided_dialogue_service",
     "get_pipeline_service",
     "get_settings",
 ]

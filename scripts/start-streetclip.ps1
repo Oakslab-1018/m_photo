@@ -5,6 +5,8 @@ $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $python = Join-Path $repoRoot "inference\streetclip\.venv\Scripts\python.exe"
 $storage = Join-Path $repoRoot "inference\streetclip\storage"
 $pidFile = Join-Path $storage "server.pid"
+# Make the shared root catalog_db.py importable by the -m package launch.
+$env:PYTHONPATH = if ($env:PYTHONPATH) { "$repoRoot;$env:PYTHONPATH" } else { $repoRoot }
 if (-not (Test-Path -LiteralPath $python)) { throw "Run scripts/setup-streetclip.ps1 first." }
 New-Item -ItemType Directory -Path $storage -Force | Out-Null
 if (Test-Path -LiteralPath $pidFile) {

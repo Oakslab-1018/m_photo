@@ -1,6 +1,6 @@
 """Country knowledge-base access with canonical product grouping.
 
-The raw ``data/countries.json`` remains the source of catalog identities and
+The read-only SQLite catalog remains the source of catalog identities and
 revision material. This service only presents the product-country directory:
 subordinate China source scopes are listed once under ``CN`` in
 ``source_regions`` instead of appearing as independent top-level countries.
@@ -9,11 +9,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..domain.geolocation import knowledge_graph as kg
 from ..domain.geolocation.country_policy import (
     canonical_country_iso,
     region_members,
 )
+from .catalog_access import catalog_for_settings
 
 
 def _region_entry(source_iso: str, parent_iso: str, row: dict[str, Any]) -> dict[str, Any]:
@@ -34,7 +34,7 @@ class CountriesService:
 
     def list_countries(self) -> list[dict[str, Any]]:
         raw_countries = [
-            country for country in kg.load_countries()
+            country for country in catalog_for_settings(self._settings).countries()
             if isinstance(country, dict) and isinstance(country.get("iso"), str)
         ]
         by_iso = {country["iso"].strip().upper(): country for country in raw_countries}

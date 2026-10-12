@@ -3,6 +3,7 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { api } from '@/api'
 import { normalizeApiError } from '@/api/errors'
 import type {
+  GuidedDialogueResponse,
   Country,
   CountryScore,
   FeedbackPayload,
@@ -10,8 +11,10 @@ import type {
   PendingChatMessage,
 } from '@/types'
 import { useGeoSession } from '@/composables/useGeoSession'
+import { useGuidedDialogue } from '@/composables/useGuidedDialogue'
 import { clueValueLabel, countGroupedClues, dimensionLabel } from '@/utils/clues'
 import { isQuestionAction } from '@/utils/dialogue'
+import { guidedStageTitle, targetLabel } from '@/utils/guided'
 import { feedbackReceipt, receiptText, type FeedbackReceiptTone } from '@/utils/feedback'
 import {
   CHINA_REGION_LABELS,
@@ -32,9 +35,17 @@ import GeoMap from '@/components/GeoMap.vue'
 import FeedbackBar from '@/components/FeedbackBar.vue'
 import CandidatePanel from '@/components/CandidatePanel.vue'
 import ConfirmLocationDialog from '@/components/ConfirmLocationDialog.vue'
+import GuidedDialoguePanel from '@/components/GuidedDialoguePanel.vue'
 import ImageViewer from '@/components/ImageViewer.vue'
 
 const session = useGeoSession()
+const guided = useGuidedDialogue(session.sessionId, {
+  onSnapshot: applyGuidedSnapshot,
+})
+
+function applyGuidedSnapshot(response: GuidedDialogueResponse): void {
+  session.applyGuidedResponse(response)
+}
 
 const ACCEPTED_TYPES = ['image/jpeg', 'image/png', 'image/webp']
 const MAX_UPLOAD_BYTES = 16 * 1024 * 1024
@@ -69,12 +80,24 @@ const sessionEpoch = ref(0)
 let cityRequestNonce = 0
 let pendingNonce = 0
 
-const busy = computed(() => uploading.value || feedbackBusy.value || pointBusy.value || cityBusy.value)
+const busy = computed(
+  () =>
+    uploading.value ||
+    feedbackBusy.value ||
+    pointBusy.value ||
+    cityBusy.value ||
+    guided.loading.value ||
+    guided.applying.value,
+)
 const hasSession = computed(() => session.sessionId.value !== null)
 const previewUrl = computed(() => localPreviewUrl.value ?? session.imageUrl.value)
 /** Card count after grouping/dedupe, matching what the clue panel actually renders. */
 const clueCount = computed(() => countGroupedClues(session.clues.value))
-const questionPending = computed(() => isQuestionAction(session.action.value))
+const questionPending = computed(() =>
+  guided.active.value
+    ? guided.pendingQuestion.value !== null
+    : isQuestionAction(session.action.value),
+)
 const confirmSubregion = computed(() =>
   confirmCandidate.value ? regionScopeLabel(confirmCandidate.value) : null,
 )
@@ -104,6 +127,14 @@ const countryOptions = computed(() => {
 
 const sessionStatus = computed(() => {
   if (uploading.value) return '正在分析图像…'
+  if (guided.active.value) {
+    const current = guided.dialogue.value
+    if (!current) return guided.loading.value ? '正在启动引导定位…' : '引导定位待重试'
+    if (current.stage === 'resolved') {
+      return `已完成：${targetLabel(current.confirmed.city)}`
+    }
+    return `${guidedStageTitle(current.stage)} · 候选 ${guided.candidates.value.length} 个`
+  }
   if (session.confirmedIso.value) {
     const country = session.scores.value.find((item) => item.iso === session.confirmedIso.value)
     const scope = country ? regionScopeLabel(country) : null
@@ -117,9 +148,20 @@ const sessionStatus = computed(() => {
 const liveStatus = computed<{ tone: FeedbackReceiptTone | 'info'; text: string }>(() => {
   const failed = pendingMessages.value.find((item) => item.status === 'failed')
   if (failed) return { tone: 'warn', text: `发送失败：${failed.error ?? '未知错误'} · 可在对话中重试或删除` }
+  if (guided.conflict.value) return { tone: 'warn', text: guided.conflict.value }
+  if (guided.error.value) return { tone: 'warn', text: guided.error.value }
+  if (guided.applying.value) return { tone: 'info', text: '正在提交引导操作，等待服务器确认…' }
+  if (guided.loading.value) return { tone: 'info', text: '正在同步引导状态…' }
   if (feedbackBusy.value) return { tone: 'info', text: '正在提交反馈，等待服务器回执…' }
   if (uploading.value) return { tone: 'info', text: '正在分析图像…' }
   if (lastOutcome.value) return lastOutcome.value
+  if (guided.active.value) {
+    const current = guided.dialogue.value
+    if (!current) return { tone: 'muted', text: '等待引导状态' }
+    if (current.stage === 'resolved') return { tone: 'ok', text: `已确认城市：${targetLabel(current.confirmed.city)}` }
+    if (current.pending_question) return { tone: 'info', text: current.pending_question.message }
+    return { tone: 'muted', text: `${guidedStageTitle(current.stage)} · 请确认或排除候选` }
+  }
   if (hasSession.value) {
     if (session.confirmedIso.value) {
       const country = session.scores.value.find((item) => item.iso === session.confirmedIso.value)
@@ -225,6 +267,7 @@ function feedbackContent(payload: FeedbackPayload): string {
 
 function newAnalysis(): void {
   sessionEpoch.value += 1
+  guided.clear()
   session.reset()
   cancelInFlightUi()
   releasePreviewUrl()
@@ -252,6 +295,7 @@ function onFile(file: File): void {
   }
   // A new file supersedes any in-flight request; the epoch guard drops its result.
   sessionEpoch.value += 1
+  guided.clear()
   session.reset()
   cancelInFlightUi()
   resetTransientUi()
@@ -279,11 +323,13 @@ async function upload(): Promise<void> {
     const response = await api.upload(file)
     if (epoch !== sessionEpoch.value) return
     session.applyUpload(response)
+    guided.clear()
     releasePreviewUrl()
     resetTransientUi()
     selectedIso.value = session.scores.value[0]?.iso ?? null
     lastOutcome.value = null
     insightsOpen.value = true
+    void guided.start(response.session_id)
   } catch (caught) {
     if (epoch === sessionEpoch.value) setError(caught, '上传失败，请稍后重试')
   } finally {
@@ -448,6 +494,7 @@ async function submitFeedback(
   options: { content?: string; existing?: PendingChatMessage } = {},
 ): Promise<void> {
   const id = session.sessionId.value
+  if (routeGuidedFeedback(payload)) return
   if (id === null || feedbackBusy.value) return
   const epoch = sessionEpoch.value
   const content = options.content ?? feedbackContent(payload)
@@ -494,6 +541,10 @@ async function submitFeedback(
 
 function retryPending(pending: PendingChatMessage): void {
   if (feedbackBusy.value || pending.orphaned) return
+  if (guided.active.value && routeGuidedFeedback(pending.payload)) {
+    removePending(pending.id)
+    return
+  }
   if (session.sessionId.value === null) {
     updatePending(pending.id, { status: 'failed', error: '当前没有会话，请先上传图片' })
     return
@@ -519,8 +570,30 @@ function dismissPending(pending: PendingChatMessage): void {
 }
 
 /** Chat/feedback buttons requesting confirmation must go through the dialog. */
+function routeGuidedFeedback(payload: FeedbackPayload): boolean {
+  if (!guided.active.value) return false
+  if (guided.loading.value || guided.applying.value) return true
+  switch (payload.type) {
+    case 'free_text':
+      if (payload.text?.trim()) void guided.freeText(payload.text)
+      break
+    case 'confirm':
+      if (payload.iso) void guided.confirmCountry(payload.iso)
+      break
+    case 'reject':
+      if (payload.iso) void guided.rejectCountry(payload.iso)
+      break
+    case 'answer':
+      void guided.answer(payload.value ?? '')
+      break
+  }
+  return true
+}
+
+/** Chat/feedback buttons requesting confirmation must go through the dialog or guided event. */
 function onFeedback(payload: FeedbackPayload): void {
-  if (feedbackBusy.value) return
+  if (feedbackBusy.value || guided.applying.value || guided.loading.value) return
+  if (routeGuidedFeedback(payload)) return
   // Confirm targets the canonical CN country; a reject keeps its raw region
   // scope (TW/HK/MO only excludes that region, CN excludes all members).
   let normalized: FeedbackPayload = payload
@@ -542,13 +615,37 @@ function doConfirm(): void {
   const candidate = confirmCandidate.value
   if (!candidate) return
   confirmCandidate.value = null
+  if (guided.active.value) {
+    // Resolve the exact backend target inside the guided composable; never
+    // reconstruct a target from the legacy country score.
+    void guided.confirmCountry(candidate.iso)
+    return
+  }
   const payload: FeedbackPayload = { type: 'confirm', iso: candidate.iso }
   void submitFeedback(payload, { content: feedbackContent(payload) })
 }
 
+function onCountryConfirm(score: CountryScore): void {
+  if (guided.active.value && (guided.loading.value || guided.applying.value)) return
+  if (guided.active.value && guided.dialogue.value?.stage !== 'country') {
+    void guided.confirmCountry(score.iso)
+    return
+  }
+  confirmCandidate.value = score
+}
+
+function onCountryReject(score: CountryScore): void {
+  if (guided.active.value && (guided.loading.value || guided.applying.value)) return
+  if (guided.active.value) {
+    void guided.rejectCountry(score.iso)
+    return
+  }
+  onFeedback({ type: 'reject', iso: score.iso })
+}
+
 async function analyzePoint(point: { x: number; y: number }): Promise<void> {
   const id = session.sessionId.value
-  if (id === null || pointBusy.value) return
+  if (id === null || pointBusy.value || guided.loading.value || guided.applying.value) return
   const epoch = sessionEpoch.value
   const snapshot = captureCandidateSnapshot()
   pointBusy.value = true
@@ -560,9 +657,26 @@ async function analyzePoint(point: { x: number; y: number }): Promise<void> {
     if (epoch !== sessionEpoch.value) return
     session.applyPointAnalysis(response)
     clickPoints.value = [...clickPoints.value, point]
-    pointStatus.value = `分析完成，发现 ${response.new_clues?.length ?? 0} 条新线索，候选国家评分已更新。`
-    pointStatusKind.value = 'success'
     handleCityStaleness(snapshot)
+    const newClueCount = response.new_clues?.length ?? 0
+
+    // Point analysis mutates evidence in the same session. Wait for the
+    // authoritative guided snapshot before releasing pointBusy so an older
+    // dialogue response cannot re-enable controls against stale evidence.
+    if (guided.active.value) {
+      const reloaded = await guided.reload()
+      if (epoch !== sessionEpoch.value) return
+      if (!reloaded) {
+        pointStatus.value = `分析完成，发现 ${newClueCount} 条新线索，但引导状态同步失败：${guided.error.value ?? '请重试'}`
+        pointStatusKind.value = 'error'
+      } else {
+        pointStatus.value = `分析完成，发现 ${newClueCount} 条新线索，引导状态已同步。`
+        pointStatusKind.value = 'success'
+      }
+    } else {
+      pointStatus.value = `分析完成，发现 ${newClueCount} 条新线索，候选国家评分已更新。`
+      pointStatusKind.value = 'success'
+    }
   } catch (caught) {
     if (epoch !== sessionEpoch.value) return
     const message = normalizeApiError(caught, undefined, '局部区域分析失败').message
@@ -682,7 +796,7 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
               <path d="M21 12a8 8 0 0 1-8 8H4l2-3a8 8 0 1 1 15-5z" />
             </svg>
-            <span class="chat-title">人机协同对话</span>
+            <span class="chat-title">{{ guided.active.value ? '引导定位' : '人机协同对话' }}</span>
             <span class="panel-count">{{ session.messages.value.length }} 条</span>
             <span v-if="questionPending" class="chat-alert">待回答</span>
             <div class="chat-live" :class="liveStatus.tone" role="status" aria-live="polite">
@@ -690,8 +804,32 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
               <span>{{ liveStatus.text }}</span>
             </div>
           </div>
-          <div class="chat-body">
+          <div class="chat-body" :class="{ 'guided-chat-body': guided.active.value }">
+            <GuidedDialoguePanel
+              v-if="guided.active.value"
+              :dialogue="guided.dialogue.value"
+              :candidates="guided.candidates.value"
+              :loading="guided.loading.value"
+              :applying="guided.applying.value"
+              :external-busy="uploading || feedbackBusy || pointBusy || cityBusy"
+              :error="guided.error.value"
+              :conflict="guided.conflict.value"
+              :can-retry="guided.canRetry.value"
+              :receipt="guided.receipt.value"
+              @confirm-location="guided.confirmLocation"
+              @reject-location="guided.rejectLocation"
+              @confirm-clue="guided.confirmClue"
+              @reject-clue="guided.rejectClue"
+              @answer="(payload) => guided.answer(payload.value)"
+              @unknown="guided.unknown()"
+              @retract-target="guided.retractTarget"
+              @retract-clue="guided.retractClue"
+              @backtrack="guided.backtrack"
+              @free-text="guided.freeText"
+              @retry="guided.retry"
+            />
             <ChatLog
+              v-if="!guided.active.value"
               :messages="session.messages.value"
               :pending="pendingMessages"
               :loading="pointBusy || feedbackBusy"
@@ -699,12 +837,23 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
               @dismiss="dismissPending"
             />
             <FeedbackBar
+              v-if="!guided.active.value"
               v-model:draft="feedbackDraft"
               :action="session.action.value"
               :busy="feedbackBusy || uploading"
               :disabled="!hasSession"
               @feedback="onFeedback"
             />
+            <details v-else class="guided-history">
+              <summary>查看推理记录（{{ session.messages.value.length }} 条）</summary>
+              <ChatLog
+                :messages="session.messages.value"
+                :pending="pendingMessages"
+                :loading="pointBusy || feedbackBusy"
+                @retry="retryPending"
+                @dismiss="dismissPending"
+              />
+            </details>
           </div>
         </section>
 
@@ -718,6 +867,8 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
             :selected-iso="selectedIso"
             :exclusions="exclusionChips"
             :busy="busy"
+            :guided-mode="guided.active.value"
+            :guided-country-allowed="!guided.active.value || guided.dialogue.value?.stage === 'country'"
             :city-scores="session.cityScores.value"
             :city-country-iso="session.cityCountryIso.value"
             :cities-status="session.citiesStatus.value"
@@ -728,8 +879,8 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
             :city-source-label="citySourceLabel"
             @toggle-collapse="insightsOpen = !insightsOpen"
             @expand="insightsOpen = true"
-            @confirm="confirmCandidate = $event"
-            @reject="(score) => onFeedback({ type: 'reject', iso: score.iso })"
+            @confirm="onCountryConfirm"
+            @reject="onCountryReject"
             @select-country="selectedIso = $event"
             @request-cities="requestCities"
           >
@@ -740,7 +891,7 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
                 :city-scores="session.cityScores.value"
                 :city-country-iso="session.cityCountryIso.value"
                 :selected-iso="selectedIso"
-                @confirm="confirmCandidate = $event"
+                @confirm="onCountryConfirm"
                 @select-country="selectedIso = $event"
               />
             </template>
@@ -760,7 +911,7 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
       v-if="confirmCandidate"
       :country="confirmCandidate"
       :subregion="confirmSubregion"
-      :busy="feedbackBusy"
+      :busy="feedbackBusy || guided.applying.value"
       @confirm="doConfirm"
       @cancel="confirmCandidate = null"
     />
@@ -772,9 +923,13 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
       :analyzing="pointBusy"
       :status="pointStatus"
       :status-kind="pointStatusKind"
-      :disabled="!hasSession"
+      :disabled="!hasSession || guided.loading.value || guided.applying.value"
       @analyze="analyzePoint"
       @close="viewerOpen = false"
     />
   </div>
 </template>
+
+
+
+

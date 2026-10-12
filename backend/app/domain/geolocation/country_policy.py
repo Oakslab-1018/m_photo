@@ -1,6 +1,6 @@
 """Application-level country grouping policy.
 
-Raw ``data/countries.json`` and inference catalog identities stay immutable:
+Raw source/catalog identities from the read-only SQLite catalog stay immutable:
 ``TW``, ``HK`` and ``MO`` remain valid two-letter source/catalog codes so
 model revisions, reference sidecars and city-catalog validation continue to
 work.  This module only maps those source scopes into the product country

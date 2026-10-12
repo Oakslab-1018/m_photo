@@ -15,16 +15,35 @@ from alembic import command
 from alembic.runtime.migration import MigrationContext
 from alembic.util.exc import CommandError
 from fastapi.testclient import TestClient
-from sqlalchemy import CheckConstraint, DefaultClause, MetaData, String, inspect, text
+from sqlalchemy import (
+    CheckConstraint,
+    DefaultClause,
+    MetaData,
+    String,
+    create_engine,
+    insert,
+    inspect,
+    text,
+)
+from sqlalchemy.exc import IntegrityError
 
 from backend.app import migrations
-from backend.app.database import Base, ChatMessage, GeoSession, create_db_engine, create_session_factory, init_db
+from backend.app.database import (
+    Base,
+    ChatMessage,
+    GeoPlace,
+    GeoSession,
+    create_db_engine,
+    create_session_factory,
+    init_db,
+)
 from backend.app.main import create_app
 from backend.app.migrations import BASELINE_REVISION, SchemaCompatibilityError
 from backend.tests.support import make_settings, make_test_image_bytes
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-HEAD_REVISION = "0002_model_evidence"
+HEAD_REVISION = "0004_geo_catalog"
+GEO_TABLES = ("geo_catalog_source", "geo_place")
 
 
 class MigrationTest(unittest.TestCase):
@@ -68,7 +87,18 @@ class MigrationTest(unittest.TestCase):
             engine, _ = init_db(self.settings)
         self.addCleanup(engine.dispose)
         self.assertEqual(self.revision(engine), (HEAD_REVISION,))
-        self.assertEqual(set(inspect(engine).get_table_names()), {"geo_session", "chat_message", "alembic_version"})
+        self.assertEqual(
+            set(inspect(engine).get_table_names()),
+            {
+                "geo_session",
+                "chat_message",
+                "guided_dialogue",
+                "guided_event",
+                "geo_catalog_source",
+                "geo_place",
+                "alembic_version",
+            },
+        )
 
     def test_repeated_initialization_is_idempotent(self):
         first, _ = init_db(self.settings)
@@ -227,9 +257,9 @@ class MigrationTest(unittest.TestCase):
         fixture.mkdir()
         shutil.copy2(migrations.ALEMBIC_INI, fixture / "alembic.ini")
         shutil.copytree(migrations.ALEMBIC_INI.parent / "alembic", fixture / "alembic")
-        (fixture / "alembic" / "versions" / "0003_test.py").write_text(
+        (fixture / "alembic" / "versions" / "0005_test.py").write_text(
             "from alembic import op\nimport sqlalchemy as sa\n"
-            "revision = '0003_test'\ndown_revision = '0002_model_evidence'\n"
+            "revision = '0005_test'\ndown_revision = '0004_geo_catalog'\n"
             "def upgrade():\n    op.add_column('geo_session', sa.Column('note', sa.Text(), nullable=True))\n"
             "def downgrade():\n    op.drop_column('geo_session', 'note')\n",
             encoding="utf-8",
@@ -237,7 +267,7 @@ class MigrationTest(unittest.TestCase):
         with mock.patch.object(migrations, "ALEMBIC_INI", fixture / "alembic.ini"):
             migrations.migrate_database(engine)
             migrations.migrate_database(engine)
-        self.assertEqual(self.revision(engine), ("0003_test",))
+        self.assertEqual(self.revision(engine), ("0005_test",))
         self.assertIn("note", {c["name"] for c in inspect(engine).get_columns("geo_session")})
 
     def test_failed_migration_rolls_back_schema_and_revision_changes(self):
@@ -245,9 +275,9 @@ class MigrationTest(unittest.TestCase):
         fixture.mkdir()
         shutil.copy2(migrations.ALEMBIC_INI, fixture / "alembic.ini")
         shutil.copytree(migrations.ALEMBIC_INI.parent / "alembic", fixture / "alembic")
-        (fixture / "alembic" / "versions" / "0003_failure.py").write_text(
+        (fixture / "alembic" / "versions" / "0005_failure.py").write_text(
             "from alembic import op\nimport sqlalchemy as sa\n"
-            "revision = '0003_failure'\ndown_revision = '0002_model_evidence'\n"
+            "revision = '0005_failure'\ndown_revision = '0004_geo_catalog'\n"
             "def upgrade():\n    op.add_column('geo_session', sa.Column('note', sa.Text()))\n"
             "    raise RuntimeError('injected migration failure')\n"
             "def downgrade():\n    pass\n",
@@ -287,9 +317,9 @@ class MigrationTest(unittest.TestCase):
         fixture.mkdir()
         shutil.copy2(migrations.ALEMBIC_INI, fixture / "alembic.ini")
         shutil.copytree(migrations.ALEMBIC_INI.parent / "alembic", fixture / "alembic")
-        (fixture / "alembic" / "versions" / "0003_failure.py").write_text(
+        (fixture / "alembic" / "versions" / "0005_failure.py").write_text(
             "from alembic import op\nimport sqlalchemy as sa\n"
-            "revision = '0003_failure'\ndown_revision = '0002_model_evidence'\n"
+            "revision = '0005_failure'\ndown_revision = '0004_geo_catalog'\n"
             "def upgrade():\n    op.add_column('geo_session', sa.Column('note', sa.Text()))\n"
             "    raise RuntimeError('injected CLI migration failure')\n"
             "def downgrade():\n    pass\n",
@@ -312,6 +342,160 @@ class MigrationTest(unittest.TestCase):
         result = subprocess.run([sys.executable, "-m", "backend.app.migrations"], cwd=self.tmp.name, env=env, text=True, capture_output=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.revision(engine), (HEAD_REVISION,))
+
+    # ---- 0004 geo catalog ------------------------------------------------
+    def geo_table_definitions(self, engine):
+        """Reflect the two imported-catalog tables for migration/ORM comparison."""
+        inspector = inspect(engine)
+        definitions = {}
+        for table in GEO_TABLES:
+            definitions[table] = {
+                "columns": {
+                    column["name"]: (
+                        str(column["type"]).upper(),
+                        bool(column["nullable"]),
+                        column["default"],
+                    )
+                    for column in inspector.get_columns(table)
+                },
+                "primary_key": tuple(
+                    inspector.get_pk_constraint(table)["constrained_columns"]
+                ),
+                "unique_constraints": sorted(
+                    (item["name"], tuple(item["column_names"]))
+                    for item in inspector.get_unique_constraints(table)
+                ),
+                "check_constraints": sorted(
+                    item["sqltext"] for item in inspector.get_check_constraints(table)
+                ),
+                "indexes": sorted(
+                    (index["name"], bool(index["unique"]), tuple(index["column_names"]))
+                    for index in inspector.get_indexes(table)
+                ),
+                "foreign_keys": sorted(
+                    (tuple(fk["constrained_columns"]), fk["referred_table"])
+                    for fk in inspector.get_foreign_keys(table)
+                ),
+            }
+        return definitions
+
+    def assert_geo_tables_match_orm(self, engine):
+        reference = create_engine("sqlite://")
+        try:
+            Base.metadata.create_all(reference)
+            self.assertEqual(
+                self.geo_table_definitions(engine), self.geo_table_definitions(reference)
+            )
+        finally:
+            reference.dispose()
+
+    def test_geo_catalog_migration_matches_orm_metadata(self):
+        engine, _ = init_db(self.settings)
+        self.addCleanup(engine.dispose)
+        self.assertEqual(self.revision(engine), (HEAD_REVISION,))
+        self.assertTrue(set(GEO_TABLES) <= set(inspect(engine).get_table_names()))
+        self.assert_geo_tables_match_orm(engine)
+
+    def test_geo_catalog_downgrade_and_reupgrade_preserve_business_tables(self):
+        engine, _ = init_db(self.settings)
+        self.addCleanup(engine.dispose)
+        with engine.begin() as connection:
+            connection.execute(text(
+                "INSERT INTO geo_session "
+                "(image_path, image_filename, clues_json, exclusions_json, status, created_at) "
+                "VALUES (\'/tmp/a.png\', \'a.png\', \'[]\', \'[]\', \'active\', \'2026-01-01 00:00:00\')"
+            ))
+            connection.execute(text(
+                "INSERT INTO geo_catalog_source "
+                "(source, path, fingerprint, record_count, import_version, imported_at) "
+                "VALUES (\'countries\', \'/tmp/countries.json\', \'deadbeef\', 1, "
+                "\'geo-catalog-v1\', \'2026-01-01 00:00:00\')"
+            ))
+            command.downgrade(migrations._config(connection), "0003_guided_dialogue")
+        tables = set(inspect(engine).get_table_names())
+        self.assertFalse(set(GEO_TABLES) & tables)
+        with engine.connect() as connection:
+            self.assertEqual(
+                connection.execute(text("SELECT COUNT(*) FROM geo_session")).scalar_one(), 1
+            )
+            self.assertEqual(
+                connection.execute(text("SELECT COUNT(*) FROM guided_event")).scalar_one(), 0
+            )
+        with engine.begin() as connection:
+            command.upgrade(migrations._config(connection), "head")
+        self.assertEqual(self.revision(engine), (HEAD_REVISION,))
+        with engine.connect() as connection:
+            self.assertEqual(
+                connection.execute(text("SELECT COUNT(*) FROM geo_place")).scalar_one(), 0
+            )
+        self.assert_geo_tables_match_orm(engine)
+
+    def test_geo_place_check_constraints_are_enforced(self):
+        engine, _ = init_db(self.settings)
+        self.addCleanup(engine.dispose)
+        base = {
+            "place_id": "XX",
+            "source_iso": "JP",
+            "country_iso": "JP",
+            "name": "Example",
+            "payload": "{}",
+            "coordinate_source": "catalog",
+        }
+        rejected = [
+            {"level": "country", "lat": None, "lng": None},
+            {"level": "city", "lat": None, "lng": None},
+            {"level": "city", "lat": 1.0, "lng": None},
+            {"level": "city", "lat": 91.0, "lng": 2.0},
+            {"level": "city", "lat": 1.0, "lng": 181.0},
+            {"level": "continent", "lat": 1.0, "lng": 2.0},
+            {"level": "city", "lat": 1.0, "lng": 2.0, "population": -1},
+            # (0, 0) is a placeholder, never a catalog coordinate.
+            {"level": "city", "lat": 0.0, "lng": 0.0},
+            # coordinate_source must be one of the three known policies.
+            {"level": "city", "lat": 1.0, "lng": 2.0, "coordinate_source": "gps"},
+            # unavailable must keep the pair NULL; catalog requires a pair.
+            {"level": "admin1", "lat": 1.0, "lng": 2.0, "coordinate_source": "unavailable"},
+            {"level": "city", "lat": None, "lng": None, "coordinate_source": "catalog"},
+            # derived admin1 pins must carry coordinate_city_id provenance.
+            {"level": "admin1", "lat": 1.0, "lng": 2.0, "coordinate_source": "admin1-largest-city-v1"},
+        ]
+        for case in rejected:
+            with self.subTest(case=case):
+                with self.assertRaises(IntegrityError):
+                    with engine.begin() as connection:
+                        connection.execute(
+                            insert(GeoPlace.__table__).values(**{**base, **case})
+                        )
+        # Admin1 may keep an unavailable coordinate pair; cities may not.
+        with engine.begin() as connection:
+            connection.execute(insert(GeoPlace.__table__).values(**{
+                **base, "level": "admin1", "lat": None, "lng": None,
+                "coordinate_source": "unavailable",
+            }))
+            connection.execute(insert(GeoPlace.__table__).values(**{
+                **base, "level": "admin1", "place_id": "JP.01", "lat": 35.0,
+                "lng": 139.0, "coordinate_source": "admin1-largest-city-v1",
+                "coordinate_city_id": 1850147,
+            }))
+            connection.execute(insert(GeoPlace.__table__).values(**{
+                **base, "level": "city", "place_id": "1", "lat": 35.0, "lng": 139.0,
+            }))
+        with self.assertRaises(IntegrityError):
+            with engine.begin() as connection:
+                connection.execute(insert(GeoPlace.__table__).values(**{
+                    **base, "level": "city", "place_id": "1", "lat": 35.0, "lng": 139.0,
+                }))
+
+    def test_unversioned_current_orm_schema_is_rejected_not_stamped(self):
+        engine = create_db_engine(self.settings)
+        self.addCleanup(engine.dispose)
+        Base.metadata.create_all(engine)
+        before = self.definition(engine)
+        with self.assertRaises(SchemaCompatibilityError):
+            unexpected_engine, _ = init_db(self.settings)
+            unexpected_engine.dispose()
+        self.assertEqual(self.definition(engine), before)
+        self.assertNotIn("alembic_version", inspect(engine).get_table_names())
 
 
 if __name__ == "__main__":

@@ -13,6 +13,12 @@ Application lifespan runs Alembic upgrades before handling requests. A pre-
 Alembic Geo database is adopted only after its structure matches the initial
 migration; incompatible databases stop startup without being stamped or altered.
 
+After migrations, startup validates the runtime ``geo_place`` /
+``geo_catalog_source`` metadata and counts. An already-initialized runtime
+catalog is adopted without opening the shipped seed; an empty/partial/invalid
+runtime catalog is bootstrapped transactionally from the immutable SQLite seed
+``data/geo_catalog.sqlite3``. No JSON catalog is read at startup.
+
 """
 from __future__ import annotations
 
@@ -31,7 +37,8 @@ from fastapi.staticfiles import StaticFiles
 from . import __version__
 from .config import Settings, get_settings
 from .database import init_db
-from .routers import countries, geo, health
+from .routers import countries, geo, geo_catalog, guided, health
+from .services.geo_catalog_import import import_geo_catalog
 from .services.pipeline import PipelineService
 
 logger = logging.getLogger("backend.app")
@@ -44,13 +51,28 @@ async def lifespan(app: FastAPI):
     app.state.engine = engine
     app.state.session_factory = session_factory
     app.state.pipeline_service = PipelineService(settings)
-    logger.info(
-        "backend ready (ai_mode=%s data_dir=%s upload_dir=%s)",
-        settings.geo_ai_mode,
-        settings.data_dir,
-        settings.upload_dir,
-    )
     try:
+        result = import_geo_catalog(engine, settings)
+        logger.info(
+            "geo catalog %s (%s; admin1 with coordinates=%d, missing=%d)",
+            "imported" if result.imported else "unchanged",
+            ", ".join(f"{name}={count}" for name, count in sorted(result.counts.items())),
+            result.admin1_with_coordinates,
+            result.admin1_missing_coordinates,
+        )
+        # Point the process-wide knowledge-graph caches at the runtime SQLite
+        # catalog now that bootstrap/adoption has completed. Lazy import keeps
+        # the domain module optional at import time.
+        from .domain.geolocation import knowledge_graph as kg
+
+        kg.configure_catalog(settings.catalog_db_path)
+        logger.info(
+            "backend ready (ai_mode=%s geo_catalog_mode=%s data_dir=%s upload_dir=%s)",
+            settings.geo_ai_mode,
+            settings.geo_catalog_mode,
+            settings.data_dir,
+            settings.upload_dir,
+        )
         yield
     finally:
         engine.dispose()
@@ -121,6 +143,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(health.router, prefix="/api")
     app.include_router(countries.router, prefix="/api")
     app.include_router(geo.router, prefix="/api")
+    app.include_router(geo_catalog.router, prefix="/api")
+    app.include_router(guided.router, prefix="/api")
 
     @app.exception_handler(HTTPException)
     async def http_exception_handler(_request: Request, exc: HTTPException) -> JSONResponse:

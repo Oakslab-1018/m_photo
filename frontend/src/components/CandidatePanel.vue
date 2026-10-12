@@ -34,6 +34,10 @@ const props = defineProps<{
   embedded?: boolean
   collapsible?: boolean
   collapsed?: boolean
+  /** Guided flow is active: this panel is evidence-only for lower stages. */
+  guidedMode?: boolean
+  /** Country actions can be sent only while the guided stage is country. */
+  guidedCountryAllowed?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -183,7 +187,15 @@ function isForeignCitySelection(): boolean {
         <span class="next">先上传照片并完成推理</span>
       </div>
       <template v-else>
-        <div class="panel-hint">按序候选 · 代表点不是照片 GPS；确认需二次确认</div>
+        <div class="panel-hint">
+          {{
+            guidedMode
+              ? (guidedCountryAllowed
+                ? '引导模式：这里的确认 / 排除会提交引导协议事件'
+                : '引导进行中：国家候选仅供浏览，请在主引导面板完成当前步骤')
+              : '按序候选 · 代表点不是照片 GPS；确认需二次确认'
+          }}
+        </div>
         <article
           v-for="(candidate, index) in scores"
           :key="candidate.iso"
@@ -210,8 +222,18 @@ function isForeignCitySelection(): boolean {
             </div>
           </div>
           <div class="candidate-actions">
-            <button type="button" class="mini-btn confirm" :disabled="busy" @click.stop="emit('confirm', candidate)">确认</button>
-            <button type="button" class="mini-btn reject" :disabled="busy" @click.stop="emit('reject', candidate)">排除</button>
+            <button
+              type="button"
+              class="mini-btn confirm"
+              :disabled="busy || (guidedMode && !guidedCountryAllowed)"
+              @click.stop="emit('confirm', candidate)"
+            >确认</button>
+            <button
+              type="button"
+              class="mini-btn reject"
+              :disabled="busy || (guidedMode && !guidedCountryAllowed)"
+              @click.stop="emit('reject', candidate)"
+            >排除</button>
           </div>
         </article>
         <div v-if="exclusions.length" class="exclusion-note">

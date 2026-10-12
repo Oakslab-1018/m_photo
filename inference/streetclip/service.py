@@ -17,7 +17,7 @@ from typing import Any
 
 import numpy as np
 
-from .catalog import CatalogError, Country, compute_catalog_revision
+from .catalog import Country, compute_catalog_revision
 from .cities import (
     City,
     CityCatalogError,
@@ -120,12 +120,9 @@ class StreetClipService:
         with self._load_lock:
             if self._loaded:
                 return
-            try:
-                from .catalog import _read_catalog
+            from .catalog import _read_catalog
 
-                countries = _read_catalog(self.settings.countries_path)
-            except CatalogError as exc:
-                countries = self._read_dynamic_countries(exc)
+            countries = _read_catalog(self.settings.catalog_db_path)
             self._countries = tuple(countries)
             self._country_by_iso = {country.iso: country for country in countries}
             self._catalog_revision = compute_catalog_revision(countries)
@@ -148,45 +145,8 @@ class StreetClipService:
             self._load_error = None
             self._loaded = True
 
-    def _read_dynamic_countries(self, original: CatalogError) -> list[Country]:
-        """Compat reader while the shared catalog loader is being upgraded.
-
-        The geodata worker owns ``catalog.py`` and ``data/countries.json``. Once
-        the dynamic loader lands, ``_read_catalog`` succeeds and this bounded
-        fallback is never used. It only accepts a well-formed JSON array of
-        ``{iso, name}`` rows; any malformed catalog re-raises the original
-        strict error, so a broken catalog cannot silently pass startup.
-        """
-        import json as _json
-
-        try:
-            payload = _json.loads(self.settings.countries_path.read_text(encoding="utf-8"))
-        except Exception:
-            raise original
-        if not isinstance(payload, list) or not payload:
-            raise original
-        rows: list[Country] = []
-        try:
-            for item in payload:
-                if not isinstance(item, dict):
-                    raise ValueError("country item must be an object")
-                iso = str(item.get("iso") or "").strip().upper()
-                name = str(item.get("name") or "").strip()
-                if len(iso) != 2 or not iso.isalpha() or not name:
-                    raise ValueError("country item needs iso and name")
-                rows.append(Country(iso=iso, name=name))
-        except ValueError:
-            raise original
-        if len({row.iso for row in rows}) != len(rows):
-            raise original
-        logger.info(
-            "country catalog loaded via dynamic compatibility reader countries=%d",
-            len(rows),
-        )
-        return sorted(rows, key=lambda row: row.iso)
-
     def _load_cities(self) -> None:
-        path = self.settings.cities_path
+        path = self.settings.catalog_db_path
         try:
             grouped = load_cities(path)
             revision = catalog_file_hash(path)

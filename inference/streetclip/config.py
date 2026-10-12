@@ -38,9 +38,13 @@ CITY_PROMPT_TEMPLATES = (
 
 _SERVICE_ROOT = Path(__file__).resolve().parent
 REPO_ROOT = _SERVICE_ROOT.parents[1]
-DEFAULT_COUNTRIES_PATH = REPO_ROOT / "data" / "countries.json"
-DEFAULT_CITIES_PATH = REPO_ROOT / "data" / "cities.json"
+DEFAULT_CATALOG_DB_PATH = REPO_ROOT / "data" / "geo_catalog.sqlite3"
 DEFAULT_STORAGE_DIR = _SERVICE_ROOT / "storage"
+
+# Deprecated compatibility names. They point at the SQLite seed, never at the
+# retired JSON catalogs, so older imports cannot reintroduce a file dependency.
+DEFAULT_COUNTRIES_PATH = DEFAULT_CATALOG_DB_PATH
+DEFAULT_CITIES_PATH = DEFAULT_CATALOG_DB_PATH
 
 
 def _env_value(env: dict[str, str], *names: str) -> str | None:
@@ -87,8 +91,7 @@ def load_root_dotenv(repo_root: Path | None = None) -> Path | None:
 class Settings:
     """Immutable process settings resolved from environment variables."""
 
-    countries_path: Path = DEFAULT_COUNTRIES_PATH
-    cities_path: Path = DEFAULT_CITIES_PATH
+    catalog_db_path: Path = DEFAULT_CATALOG_DB_PATH
     storage_dir: Path = DEFAULT_STORAGE_DIR
     api_key: str | None = field(default=None, repr=False)
     device: str = "cuda"
@@ -100,6 +103,16 @@ class Settings:
     city_prompt_chunk: int = DEFAULT_CITY_PROMPT_CHUNK
     reference_index_path: Path | None = None
 
+    @property
+    def countries_path(self) -> Path:
+        """Deprecated alias for the SQLite catalog path."""
+        return self.catalog_db_path
+
+    @property
+    def cities_path(self) -> Path:
+        """Deprecated alias for the SQLite catalog path."""
+        return self.catalog_db_path
+
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "Settings":
         source = dict(os.environ) if env is None else {k: str(v) for k, v in env.items()}
@@ -107,18 +120,11 @@ class Settings:
         def get(*names: str) -> str | None:
             return _env_value(source, *names)
 
-        countries_value = get("STREETCLIP_COUNTRIES_PATH")
-        countries_path = (
-            Path(countries_value).expanduser().resolve()
-            if countries_value
-            else DEFAULT_COUNTRIES_PATH
-        )
-
-        cities_value = get("STREETCLIP_CITIES_PATH", "STREETCLIP_CITY_CATALOG_PATH")
-        cities_path = (
-            Path(cities_value).expanduser().resolve()
-            if cities_value
-            else DEFAULT_CITIES_PATH
+        catalog_db_value = get("STREETCLIP_CATALOG_DB")
+        catalog_db_path = (
+            Path(catalog_db_value).expanduser().resolve()
+            if catalog_db_value
+            else DEFAULT_CATALOG_DB_PATH
         )
 
         storage_value = get("STREETCLIP_STORAGE_DIR")
@@ -151,8 +157,7 @@ class Settings:
         cache_embeddings = cache_raw is None or cache_raw.lower() not in {"0", "false", "no", "off"}
 
         return cls(
-            countries_path=countries_path,
-            cities_path=cities_path,
+            catalog_db_path=catalog_db_path,
             storage_dir=storage_dir,
             api_key=api_key,
             device=device,
@@ -182,6 +187,7 @@ __all__ = [
     "CITY_REFERENCE_FUSION_WEIGHT",
     "CITY_TEXT_FEATURE_CACHE_COUNTRIES",
     "CITY_TEXT_FUSION_WEIGHT",
+    "DEFAULT_CATALOG_DB_PATH",
     "DEFAULT_CITIES_PATH",
     "DEFAULT_CITY_LIMIT_PER_COUNTRY",
     "DEFAULT_CITY_PROMPT_CHUNK",

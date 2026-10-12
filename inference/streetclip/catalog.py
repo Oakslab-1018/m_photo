@@ -1,6 +1,6 @@
 """Country catalog loading and prompt templating.
 
-``data/countries.json`` is the dynamic source of truth for the country
+The shipped read-only SQLite seed is the source of truth for the country
 directory. The catalog is intentionally not a fixed allowlist: any non-empty
 set of at least two unique two-letter ISO-style codes is accepted. This lets a
 later catalog edit add or remove candidates without changing inference code.
@@ -18,11 +18,22 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
 from .config import PROMPT_TEMPLATE_VERSION, PROMPT_TEMPLATES
+
+try:
+    from catalog_db import CatalogDatabase, CatalogDatabaseError
+except ModuleNotFoundError as exc:  # support standalone script execution
+    if exc.name != "catalog_db":
+        raise
+    repo_root = Path(__file__).resolve().parents[2]
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+    from catalog_db import CatalogDatabase, CatalogDatabaseError
 
 _ISO2_RE = re.compile(r"^[A-Z]{2}$")
 
@@ -37,18 +48,15 @@ class Country:
     name: str
 
 
-def _read_catalog(path: Path) -> list[Country]:
-    path = Path(path)
-    if not path.is_file():
-        raise CatalogError(f"country catalog not found: {path}")
+def _read_catalog(path: Path | str) -> list[Country]:
+    """Load and strictly validate country payloads from the SQLite seed."""
+
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError) as exc:
-        raise CatalogError(f"country catalog is unreadable: {path}") from exc
-    except json.JSONDecodeError as exc:
-        raise CatalogError(f"country catalog is not valid JSON: {path}") from exc
+        payload = CatalogDatabase(path).countries()
+    except CatalogDatabaseError as exc:
+        raise CatalogError(f"country catalog database is unreadable: {path}") from exc
     if not isinstance(payload, list):
-        raise CatalogError("country catalog must be a JSON array")
+        raise CatalogError("country catalog database must return a list")
 
     countries: list[Country] = []
     seen: set[str] = set()

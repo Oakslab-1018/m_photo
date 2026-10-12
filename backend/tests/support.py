@@ -18,7 +18,12 @@ from backend.app.main import create_app
 
 
 def make_settings(tmpdir: str | Path) -> Settings:
-    """Build isolated test settings rooted at ``tmpdir``."""
+    """Build isolated test settings rooted at ``tmpdir``.
+
+    The catalog is database-only now; dedicated catalog tests inject a
+    temporary SQLite seed (``catalog_seed_path_override``) instead of the
+    retired JSON path overrides.
+    """
     root = Path(tmpdir).resolve()
     data_dir = root / "data"
     upload_dir = data_dir / "uploads"

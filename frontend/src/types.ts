@@ -251,3 +251,124 @@ export interface Point {
   x: number
   y: number
 }
+/* ------------------------------------------------------------------ */
+/* Guided dialogue contract (see docs/guided-dialogue.md)             */
+/* ------------------------------------------------------------------ */
+
+export type GuidedStage = 'country' | 'admin1' | 'city' | 'resolved'
+export type GuidedLocationLevel = Exclude<GuidedStage, 'resolved'>
+
+/** Minimal target reference used by guided events. */
+export interface GuidedTargetRef {
+  level: GuidedLocationLevel
+  id: string
+}
+
+/** Catalog-backed location target. IDs are authoritative and never inferred by the UI. */
+export interface LocationTarget extends GuidedTargetRef {
+  label: string
+  country_iso: string
+  source_iso?: string | null
+  admin1_id?: string | null
+  city_id?: string | null
+  lat?: number | null
+  lng?: number | null
+  coordinate_source?: string | null
+  coordinate_quality?: string | null
+  coordinate_city_id?: number | null
+}
+
+/** One ranked/sorted location option. score is absent for catalog-only rows. */
+export interface LocationCandidate {
+  target: LocationTarget
+  score?: number | null
+  score_type?: string | null
+  reason?: string | null
+}
+
+export type ReviewedClueStatus = 'pending' | 'confirmed' | 'rejected' | 'uncertain'
+
+/** Evidence review state is separate from geographic exclusion state. */
+export interface ReviewedClue {
+  id: string
+  dimension: string
+  value: string
+  description: string
+  source: string
+  confidence?: number | null
+  status: ReviewedClueStatus
+}
+
+export interface GuidedQuestionOption {
+  value: string
+  label: string
+}
+
+export type GuidedQuestionKind = 'review_clue' | 'ask' | 'confirm_location' | 'request_clue'
+
+export interface GuidedQuestion {
+  id: string
+  kind: GuidedQuestionKind
+  message: string
+  dimension?: string | null
+  clue_id?: string | null
+  options?: GuidedQuestionOption[] | null
+}
+
+export interface GuidedConfirmedPath {
+  country: LocationTarget | null
+  admin1: LocationTarget | null
+  city: LocationTarget | null
+}
+
+export interface GuidedDialogue {
+  version: 1
+  revision: number
+  stage: GuidedStage
+  confirmed: GuidedConfirmedPath
+  exclusions: LocationTarget[]
+  clues: ReviewedClue[]
+  pending_question: GuidedQuestion | null
+}
+
+export type GuidedEventType =
+  | 'confirm_clue'
+  | 'reject_clue'
+  | 'confirm_location'
+  | 'reject_location'
+  | 'answer'
+  | 'unknown'
+  | 'retract'
+  | 'backtrack'
+  | 'free_text'
+
+/** Event sent to the authoritative dialogue endpoint. */
+export interface GuidedEventPayload {
+  type: GuidedEventType
+  event_id: string
+  expected_revision: number
+  question_id?: string
+  target?: GuidedTargetRef
+  clue_id?: string
+  value?: string
+  text?: string
+  level?: GuidedLocationLevel
+}
+
+export interface GuidedEventReceipt {
+  event_id: string
+  status: string
+  summary?: string | null
+}
+
+/** Every guided endpoint returns this envelope. */
+export interface GuidedDialogueResponse {
+  dialogue: GuidedDialogue
+  candidates: LocationCandidate[]
+  action: HypothesisAction | null
+  messages: ChatMessage[]
+  scores: CountryScore[]
+  clues: Clue[]
+  exclusions: string[]
+  receipt?: GuidedEventReceipt | null
+}

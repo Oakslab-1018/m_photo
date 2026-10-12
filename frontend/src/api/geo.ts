@@ -6,6 +6,8 @@ import {
   type Country,
   type FeedbackPayload,
   type FeedbackResponse,
+  type GuidedDialogueResponse,
+  type GuidedEventPayload,
   type MessagesResponse,
   type Point,
   type UploadResponse,
@@ -159,6 +161,27 @@ export class GeoApi {
       source_isos: asArray<string>(raw.source_isos),
       note: typeof raw.note === 'string' && raw.note.trim() ? raw.note.trim() : null,
     }
+  }
+
+  async dialogueStart(sessionId: number): Promise<GuidedDialogueResponse> {
+    return this.request<GuidedDialogueResponse>(`/api/geo/${sessionId}/dialogue/start`, {
+      method: 'POST',
+    })
+  }
+
+  async dialogue(sessionId: number): Promise<GuidedDialogueResponse> {
+    return this.request<GuidedDialogueResponse>(`/api/geo/${sessionId}/dialogue`)
+  }
+
+  async dialogueEvent(
+    sessionId: number,
+    payload: GuidedEventPayload,
+  ): Promise<GuidedDialogueResponse> {
+    return this.request<GuidedDialogueResponse>(`/api/geo/${sessionId}/dialogue/events`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
   }
 
   async analyzePoint(sessionId: number, point: Point): Promise<AnalyzePointResponse> {

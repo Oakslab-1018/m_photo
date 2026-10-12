@@ -37,6 +37,8 @@ database.db
 *.db-*
 *.sqlite
 *.sqlite3
+# 唯一的可移植地理目录种子资产（随仓库发布；其余 *.sqlite3/*.sqlite 保持忽略）
+!data/geo_catalog.sqlite3
 data/uploads/
 data/m_photo.db
 data/database.db

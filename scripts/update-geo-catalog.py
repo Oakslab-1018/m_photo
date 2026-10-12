@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
-"""Build the reproducible country/territory and city metadata catalogs.
+"""Build the reproducible country/territory and city metadata catalogs in SQLite.
 
-Pinned inputs (recorded in ``data/geo-catalog-sources.json``):
+Pinned upstream inputs (recorded in ``data/geo-catalog-sources.json``):
 
 * ``mledoze/countries`` @ commit ``c2ac0049c14edcf2436c7aa1b2493222a020b462``
   (ODbL-1.0, verified from the repository ``LICENSE`` file), file
   ``countries.json`` (250 entries, including the user-assigned code ``XK``).
 * GeoNames ``cities15000.zip`` retrieved 2026-10-09 (CC BY 4.0, verified from
-  the GeoNames ``readme.txt``). GeoNames refreshes the dump daily, so the zip
-  is pinned by sha256: a checksum mismatch fails the build instead of silently
+  the GeoNames ``readme.txt``). GeoNames refreshes the dump daily, so the zip is
+  pinned by sha256: a checksum mismatch fails the build instead of silently
   producing different data.
 
-The script downloads missing inputs into the git-ignored cache
-``.cache/geo-catalog``, never extracts an archive to disk (it reads the single
-``cities15000.txt`` member in memory) and writes deterministic
-one-record-per-line JSON. Use ``--offline`` to build strictly from the cache
-and ``--check`` to prove the committed catalogs match a clean rebuild.
+The parser output is written to the portable SQLite seed through the atomic
+maintenance writer.  The retired generated ``data/countries.json`` and
+``data/cities.json`` files are never read, required or recreated.  The
+remaining JSON document is provenance/metadata only.  Use ``--offline`` to
+build strictly from the cache and ``--check`` to compare logical database rows
+and source revisions without writing.
 """
 from __future__ import annotations
 
@@ -31,9 +32,21 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CACHE_DIR = REPO_ROOT / ".cache" / "geo-catalog"
-DEFAULT_COUNTRIES_PATH = REPO_ROOT / "data" / "countries.json"
-DEFAULT_CITIES_PATH = REPO_ROOT / "data" / "cities.json"
+DEFAULT_DATABASE_PATH = REPO_ROOT / "data" / "geo_catalog.sqlite3"
 DEFAULT_SOURCES_PATH = REPO_ROOT / "data" / "geo-catalog-sources.json"
+SCRIPTS_DIR = Path(__file__).resolve().parent
+for _path in (REPO_ROOT, SCRIPTS_DIR):
+    if str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
+
+from catalog_db import CatalogDatabase, CatalogDatabaseError  # noqa: E402
+from geo_catalog_maintenance import (  # noqa: E402
+    CatalogMaintenanceError,
+    canonical_row_hash,
+    check_catalog_levels,
+    logical_revision,
+    replace_catalog_levels,
+)
 
 RETRIEVED_DATE = "2026-10-09"
 
@@ -309,22 +322,62 @@ def build_cities(zip_payload: bytes) -> list[dict]:
     return ordered
 
 
-def _dumps_records(records: list[dict]) -> str:
-    lines = [json.dumps(record, ensure_ascii=False, separators=(",", ":")) for record in records]
-    return "[\n" + ",\n".join(lines) + "\n]\n"
-
-
 def _dumps_sources(metadata: dict) -> str:
     return json.dumps(metadata, ensure_ascii=False, indent=2) + "\n"
 
 
-def _sources_metadata(mledoze_sha: str, geonames_sha: str, countries: list[dict], cities: list[dict]) -> dict:
-    countries_sha = sha256_bytes(_dumps_records(countries).encode("utf-8"))
-    cities_sha = sha256_bytes(_dumps_records(cities).encode("utf-8"))
+def _relative_label(path: Path) -> str:
+    try:
+        return path.resolve().relative_to(REPO_ROOT).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
+def _database_outputs(
+    database_path: Path,
+    *,
+    revisions: dict[str, str],
+    counts: dict[str, int],
+) -> dict:
+    logical_revisions = {
+        name: str(revisions[name]) for name in ("countries", "admin1", "cities")
+    }
+    record_counts = {
+        name: int(counts[name]) for name in ("countries", "admin1", "cities")
+    }
+    label = _relative_label(database_path)
+    detail = {
+        "path": label,
+        "format": "sqlite",
+        "tables": ["geo_catalog_source", "geo_place"],
+        "logical_revisions": logical_revisions,
+        "record_counts": record_counts,
+        "note": (
+            "Per-level fingerprints are the stored logical source revisions; "
+            "they are never a hash of the SQLite database file."
+        ),
+    }
+    return {
+        label: detail,
+        "logical_revisions": logical_revisions,
+        "record_counts": record_counts,
+    }
+
+
+def _sources_metadata(
+    mledoze_sha: str,
+    geonames_sha: str,
+    countries: list[dict],
+    cities: list[dict],
+    *,
+    revisions: dict[str, str],
+    counts: dict[str, int],
+    database_path: Path,
+) -> dict:
     scopes = sorted({city["iso"] for city in cities})
     return {
         "schema_version": 1,
-        "generated": "2026-10-09",
+        "generated": RETRIEVED_DATE,
         "scope_note": (
             "Country/territory directory follows the ISO-style codes present in the "
             "pinned mledoze/countries dataset: 249 officially assigned codes plus the "
@@ -345,7 +398,10 @@ def _sources_metadata(mledoze_sha: str, geonames_sha: str, countries: list[dict]
                 "license_sha256": MLEDOZE_LICENSE_SHA256,
                 "sha256": mledoze_sha,
                 "records": len(countries),
-                "note": "250 country/territory records incl. XK; coordinates are source representative points except for the preserved 20-country curated values.",
+                "note": (
+                    "250 country/territory records incl. XK; coordinates are source "
+                    "representative points except for the preserved 20-country curated values."
+                ),
             },
             "cities": {
                 "name": "GeoNames cities15000",
@@ -354,88 +410,167 @@ def _sources_metadata(mledoze_sha: str, geonames_sha: str, countries: list[dict]
                 "download_url": GEONAMES_URL,
                 "license": GEONAMES_LICENSE_NAME,
                 "license_url": "https://creativecommons.org/licenses/by/4.0/",
-                "attribution": "Contains data from GeoNames (https://www.geonames.org/), licensed CC BY 4.0.",
+                "attribution": (
+                    "Contains data from GeoNames (https://www.geonames.org/), "
+                    "licensed CC BY 4.0."
+                ),
                 "readme_sha256": GEONAMES_README_SHA256,
                 "sha256": geonames_sha,
                 "records": len(cities),
                 "coverage_country_codes": scopes,
-                "note": "Populated places with population > 15000 or capitals; region is the GeoNames admin1 code when no province names are embedded.",
+                "note": (
+                    "Populated places with population > 15000 or capitals; region is "
+                    "the GeoNames admin1 code when no province names are embedded."
+                ),
             },
         },
-        "outputs": {
-            "data/countries.json": {"sha256": countries_sha, "records": len(countries)},
-            "data/cities.json": {"sha256": cities_sha, "records": len(cities)},
-        },
-        "build_command": "python scripts/update-geo-catalog.py",
-        "verify_command": "python scripts/update-geo-catalog.py --check",
+        "outputs": _database_outputs(
+            database_path,
+            revisions=revisions,
+            counts=counts,
+        ),
+        "build_command": (
+            "python scripts/update-geo-catalog.py --database data/geo_catalog.sqlite3"
+        ),
+        "verify_command": (
+            "python scripts/update-geo-catalog.py --database data/geo_catalog.sqlite3 --check"
+        ),
     }
+
+
+def _write_if_changed(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    encoded = text.encode("utf-8")
+    if path.is_file() and path.read_bytes() == encoded:
+        print(f"unchanged {path}")
+        return
+    path.write_bytes(encoded)
+    print(f"wrote {path} ({len(encoded)} bytes)")
+
+
+def _json_text_equal(path: Path, expected_text: str) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        actual = json.loads(path.read_text(encoding="utf-8"))
+        expected = json.loads(expected_text)
+    except (OSError, ValueError):
+        return False
+    return actual == expected
+
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
-    parser.add_argument("--countries", type=Path, default=DEFAULT_COUNTRIES_PATH)
-    parser.add_argument("--cities", type=Path, default=DEFAULT_CITIES_PATH)
+    parser.add_argument("--database", type=Path, default=DEFAULT_DATABASE_PATH)
     parser.add_argument("--sources", type=Path, default=DEFAULT_SOURCES_PATH)
     parser.add_argument("--offline", action="store_true", help="fail instead of downloading")
-    parser.add_argument("--check", action="store_true", help="verify outputs match a clean rebuild")
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="compare logical catalog rows/revisions without writing",
+    )
     args = parser.parse_args(argv)
 
-    mledoze_payload = _cached_bytes(
-        MLEDOZE_URL, args.cache_dir, CACHE_MLEDOZE, MLEDOZE_SHA256, offline=args.offline
-    )
-    geonames_payload = _cached_bytes(
-        GEONAMES_URL, args.cache_dir, CACHE_GEONAMES_ZIP, GEONAMES_SHA256, offline=args.offline
-    )
-    _cached_bytes(
-        MLEDOZE_LICENSE_URL, args.cache_dir, CACHE_MLEDOZE_LICENSE,
-        MLEDOZE_LICENSE_SHA256, offline=args.offline,
-    )
-    _cached_bytes(
-        GEONAMES_README_URL, args.cache_dir, CACHE_GEONAMES_README,
-        GEONAMES_README_SHA256, offline=args.offline,
-    )
-
-    countries = build_countries(mledoze_payload)
-    cities = build_cities(geonames_payload)
-
-    countries_text = _dumps_records(countries)
-    cities_text = _dumps_records(cities)
-    sources_text = _dumps_sources(
-        _sources_metadata(
-            sha256_bytes(mledoze_payload), sha256_bytes(geonames_payload), countries, cities
+    try:
+        mledoze_payload = _cached_bytes(
+            MLEDOZE_URL,
+            args.cache_dir,
+            CACHE_MLEDOZE,
+            MLEDOZE_SHA256,
+            offline=args.offline,
         )
-    )
+        geonames_payload = _cached_bytes(
+            GEONAMES_URL,
+            args.cache_dir,
+            CACHE_GEONAMES_ZIP,
+            GEONAMES_SHA256,
+            offline=args.offline,
+        )
+        _cached_bytes(
+            MLEDOZE_LICENSE_URL,
+            args.cache_dir,
+            CACHE_MLEDOZE_LICENSE,
+            MLEDOZE_LICENSE_SHA256,
+            offline=args.offline,
+        )
+        _cached_bytes(
+            GEONAMES_README_URL,
+            args.cache_dir,
+            CACHE_GEONAMES_README,
+            GEONAMES_README_SHA256,
+            offline=args.offline,
+        )
+        countries = build_countries(mledoze_payload)
+        cities = build_cities(geonames_payload)
+    except BuildError as exc:
+        print(f"geo catalog update failed: {exc}", file=sys.stderr)
+        return 2
 
     if args.check:
-        failures = []
-        for path, expected in (
-            (args.countries, countries_text),
-            (args.cities, cities_text),
-            (args.sources, sources_text),
-        ):
-            actual = path.read_text(encoding="utf-8") if path.is_file() else ""
-            if actual != expected:
-                failures.append(str(path))
+        try:
+            check = check_catalog_levels(args.database, countries=countries, cities=cities)
+            sources_text = _dumps_sources(
+                _sources_metadata(
+                    sha256_bytes(mledoze_payload),
+                    sha256_bytes(geonames_payload),
+                    countries,
+                    cities,
+                    revisions=dict(check.plan.revisions),
+                    counts=dict(check.plan.counts),
+                    database_path=args.database,
+                )
+            )
+        except (CatalogMaintenanceError, CatalogDatabaseError) as exc:
+            print(f"geo catalog check failed: {exc}", file=sys.stderr)
+            return 2
+        failures = list(check.mismatches)
+        if not _json_text_equal(args.sources, sources_text):
+            failures.append(str(args.sources))
         if failures:
-            print("catalog check failed; regenerate: " + ", ".join(failures), file=sys.stderr)
+            print(
+                "geo catalog check failed; regenerate: " + ", ".join(failures),
+                file=sys.stderr,
+            )
             return 1
-        print(f"catalog check ok: {len(countries)} countries, {len(cities)} cities")
+        print(
+            "geo catalog check ok: "
+            f"{check.plan.counts['countries']} countries, "
+            f"{check.plan.counts['cities']} cities, "
+            f"{check.plan.counts['admin1']} admin1 rows"
+        )
         return 0
 
-    for path, text in (
-        (args.countries, countries_text),
-        (args.cities, cities_text),
-        (args.sources, sources_text),
-    ):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text, encoding="utf-8", newline="\n")
-        print(f"wrote {path} ({len(text)} bytes)")
+    try:
+        result = replace_catalog_levels(
+            args.database,
+            countries=countries,
+            cities=cities,
+        )
+        sources_text = _dumps_sources(
+            _sources_metadata(
+                sha256_bytes(mledoze_payload),
+                sha256_bytes(geonames_payload),
+                countries,
+                cities,
+                revisions=dict(result.revisions),
+                counts=dict(result.counts),
+                database_path=args.database,
+            )
+        )
+    except (CatalogMaintenanceError, CatalogDatabaseError) as exc:
+        print(f"geo catalog update failed: {exc}", file=sys.stderr)
+        return 2
 
+    _write_if_changed(args.sources, sources_text)
     feature_count = sum(1 for country in countries if country["features"])
-    missing_coords = sum(1 for country in countries if country["lat"] is None or country["lng"] is None)
     print(
-        f"countries={len(countries)} with_features={feature_count} "
-        f"missing_coords={missing_coords} cities={len(cities)}"
+        "geo catalog database updated: "
+        f"countries={result.counts['countries']} cities={result.counts['cities']} "
+        f"admin1={result.counts['admin1']} with_features={feature_count} "
+        f"changed={','.join(result.changed_sources) or 'none'} "
+        f"admin1_with_coordinates={result.admin1_with_coordinates} "
+        f"admin1_missing_coordinates={result.admin1_missing_coordinates}"
     )
     return 0
 

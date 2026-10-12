@@ -7,7 +7,7 @@
 - 只有 :data:`CATALOG_DIMENSIONS` 中的维度参与评分：
     * language      -> 目录 ``languages_spoken``
     * place_name    -> 目录 ``iso``/``name``/``name_zh``/ISO3，或
-                       ``data/cities.json`` 中校验过的城市名（含中文别名）
+                       只读 SQLite 城市目录中校验过的城市名（含中文别名）
     * driving_side  -> 目录 ``driving_side`` 字段（仅 left/right）
     * culture 等    -> 目录 ``features[dimension]`` 特征值
 - 观察维度（signage/road/terrain/waterbody/infrastructure）没有目录元数据，
@@ -16,7 +16,7 @@
 地名歧义防护：
 - 2 字母 ISO 只接受大小写完全一致的 ``"JP"`` 形式（避免英文常用词 in/it/us/me）；
 - 国家名/中文名经规范化（大小写、变音符、标点）后只做完整匹配；
-- 城市名来自 ``data/cities.json``：全局唯一 ISO → 全额置信；跨国家同名
+- 城市名来自只读 SQLite 城市目录：全局唯一 ISO → 全额置信；跨国家同名
   （Paris/York 等）一律视为歧义、保持未解析，人口不是照片国家的证据；
   只有 :data:`CITY_NAME_ALIASES` 中显式且经目录 ID 核对的别名
   （巴黎→FR、东京→JP 等）才提供国家范围；
@@ -25,14 +25,14 @@
 """
 from __future__ import annotations
 
-import json
 import unicodedata
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
-from config import BASE_DIR, MIN_CLUE_CONFIDENCE, TOP_N_HYPOTHESES
+from catalog_db import CatalogDatabase
+from config import MIN_CLUE_CONFIDENCE, TOP_N_HYPOTHESES
 from .clue import CATALOG_DIMENSIONS, Clue
 from . import knowledge_graph as kg
 from .country_policy import (
@@ -221,19 +221,28 @@ def build_city_name_index(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Tuple[
 
 
 @lru_cache(maxsize=4)
-def _load_city_name_index_cached(path: str, mtime_ns: int, size: int):
-    payload = json.loads(Path(path).read_text(encoding="utf-8"))
-    rows = payload.get("cities") if isinstance(payload, dict) else payload
-    if not isinstance(rows, list):
-        return {}
+def _load_city_name_index_cached(path: str, revision: str):
+    """Build one name index from a validated SQLite catalog revision."""
+
+    rows = CatalogDatabase(path).cities()
     return build_city_name_index(rows)
 
 
-def load_city_name_index(path: str | Path) -> Dict[str, Tuple[Tuple[str, int, str, str], ...]]:
-    """Load ``data/cities.json`` name index once per (path, mtime, size)."""
-    candidate = Path(path)
-    stat = candidate.stat()
-    return _load_city_name_index_cached(str(candidate), stat.st_mtime_ns, stat.st_size)
+def load_city_name_index(
+    path: str | Path | None = None,
+) -> Dict[str, Tuple[Tuple[str, int, str, str], ...]]:
+    """Load the city-name index from a SQLite catalog database.
+
+    ``path`` selects the runtime catalog database; ``None`` uses the process
+    catalog selected by ``knowledge_graph.configure_catalog`` (immutable seed
+    fallback before backend startup configures the runtime DB). The logical city
+    revision participates in the cache key while the database file itself is
+    never hashed.
+    """
+
+    reader = CatalogDatabase(kg.catalog_path() if path is None else Path(path))
+    revision = reader.revision("cities")
+    return _load_city_name_index_cached(str(reader.path), revision)
 
 
 def resolve_city_name(index: Mapping[str, Tuple[Tuple[str, int, str, str], ...]],
@@ -243,7 +252,7 @@ def resolve_city_name(index: Mapping[str, Tuple[Tuple[str, int, str, str], ...]]
     Multi-ISO same-name cities (Paris, York, ...) return ``None``: population
     is never used as evidence of the photographed country. Only the bounded
     :data:`CITY_NAME_ALIASES` table provides an explicit country scope, and
-    even aliases must match a real ``data/cities.json`` row for that ISO.
+    even aliases must match a real SQLite city-catalog row for that ISO.
     """
     if not isinstance(value, str) or not value.strip():
         return None
@@ -519,10 +528,7 @@ class ReasoningEngine:
 
     def _city_name_index(self) -> Dict[str, Tuple[Tuple[str, int, str, str], ...]]:
         if self._city_index_cache is None:
-            try:
-                self._city_index_cache = load_city_name_index(BASE_DIR / "data" / "cities.json")
-            except (OSError, ValueError, TypeError, json.JSONDecodeError):
-                self._city_index_cache = {}
+            self._city_index_cache = load_city_name_index()
         return self._city_index_cache
 
     def resolve_place(self, value: object) -> Optional[PlaceResolution]:

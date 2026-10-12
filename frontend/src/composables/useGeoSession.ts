@@ -7,11 +7,13 @@ import type {
   Clue,
   CountryScore,
   FeedbackResponse,
+  GuidedDialogueResponse,
   HypothesisAction,
   UploadResponse,
 } from '@/types'
 import { sortScores } from '@/utils/map'
 import { normalizeCountryIso, normalizeCountryScores, normalizeIsoCode } from '@/utils/geo'
+import { safeGuidedText } from '@/utils/guided'
 
 /** Raw exclusion codes (TW/HK/MO) stay regional; never fold them into CN here. */
 function normalizeExclusionCodes(codes: readonly string[] | null | undefined): string[] {
@@ -94,6 +96,26 @@ export function useGeoSession() {
     citiesStatus.value = null
   }
 
+  /**
+   * Apply one authoritative guided snapshot to the legacy evidence surfaces.
+   * Guided confirmation state lives in the guided composable; this method only
+   * refreshes evidence and never marks the old country flow as terminal.
+   */
+  function applyGuidedResponse(response: GuidedDialogueResponse): void {
+    if (response.clues) clues.value = [...response.clues]
+    if (response.scores) scores.value = sortScores(normalizeCountryScores(response.scores))
+    if (response.messages) {
+      messages.value = response.messages.map((message) => ({
+        ...message,
+        content: safeGuidedText(message.content),
+      }))
+    }
+    if (response.exclusions) exclusions.value = normalizeExclusionCodes(response.exclusions)
+    action.value = response.action ?? null
+    confirmedIso.value = null
+    done.value = false
+  }
+
   /** Replace city rows in place (region refilter) without touching the scope. */
   function setCityRows(rows: readonly CityScore[]): void {
     cityScores.value = [...rows]
@@ -147,6 +169,7 @@ export function useGeoSession() {
     applyUpload,
     applyFeedback,
     applyCities,
+    applyGuidedResponse,
     clearCities,
     setCityRows,
     applyPointAnalysis,

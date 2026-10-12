@@ -104,8 +104,8 @@ Alembic `0002_model_evidence` 增加可空 `model_evidence_json`，原会话和�
 
 选中国家后前端调用 `POST /api/geo/{session_id}/cities`，后端用该会话原图调用
 `POST /predict-cities`（multipart `file` + 表单 `country_iso`），返回该国目录内的城市候选。
-城市由 `data/cities.json` 定义，不由模型定义：后端逐行核对 id、名称与经纬度，
-并校验 `scope.city_catalog_revision` 等于该文件的 SHA-256，对不上就整份丢弃。
+城市由 `data/geo_catalog.sqlite3` 中的城市目录定义，不由模型定义：后端逐行核对 id、名称与经纬度，
+并校验 `scope.city_catalog_revision` 等于库内保存的城市逻辑 revision，对不上就整份丢弃。
 `city_id` 在 API 层序列化为十进制字符串（前端以它为 key）。
 城市候选同样是代表点，不是照片定位；`region` 是 GeoNames admin1 **代码**（例如东京为 `40`），不是地区名。
 该接口只读且无状态：不写消息、不改国家排序、不影响已确认国家，切换国家查看城市不会污染分析结果。
@@ -119,7 +119,7 @@ Alembic `0002_model_evidence` 增加可空 `model_evidence_json`，原会话和�
 
 - RTX 5060 Laptop GPU；CUDA 可用，实际服务 `/health` 为
   `ready=true, device=cuda, countries=250, city_capability=true, cities_loaded=34156,
-  reference_configured=false`，其 `city_catalog_revision` 与后端 `data/cities.json` 的 SHA-256 一致。
+  reference_configured=false`，其 `city_catalog_revision` 与后端 `data/geo_catalog.sqlite3` 中的城市目录 保存的城市逻辑 revision 一致。
 - 仓库公开 `nagasaki.jpg` 示例：日本排第一，原始余弦约 0.225（`hybrid_rank`，含 OCR 线索加成后 0.2631）；
   首次请求约 9.65 秒（含模型预热），随后完整请求约 1.0 秒。
   这只是单张示例实测，不是准确率或普遍延迟承诺。

@@ -35,7 +35,7 @@ backend/
       analysis/          # AnalysisPipeline + concrete analyzers
     services/            # thin adapters over domain packages
       model_gateway.py   # StreetCLIP HTTP adapter + evidence contract validation
-      city_catalog.py    # read-only data/cities.json (city identity & coordinates)
+      city_catalog.py    # read-only data/geo_catalog.sqlite3 (city identity & coordinates)
   alembic/               # baseline migration (0001_initial) + env.py
   alembic.ini
   tests/                 # pytest *and* `python -m unittest` compatible
@@ -118,6 +118,30 @@ adoption. Legacy Flask `database.db` is not supported or automatically migrated.
 Docker already copies `backend/alembic.ini` and the scripts with `backend/`;
 migrations run against the mounted volume at runtime, never during image build.
 
+## 引导对话与地理目录
+
+新前端在上传后启动引导式会话。确认国家后进入一级行政区，确认行政区后进入城市；
+只有明确确认城市才完成。线索核实、地点排除、未知回答、恢复排除和回退分别处理。
+对话状态与事件记录保存在 `guided_dialogue` / `guided_event`，由 revision 和 event_id
+防止旧问题、重复提交或并发请求覆盖当前状态。原反馈和只读城市浏览接口继续支持。
+
+- `POST /api/geo/{session_id}/dialogue/start`：幂等启动。
+- `GET /api/geo/{session_id}/dialogue`：获取权威状态。
+- `POST /api/geo/{session_id}/dialogue/events`：提交带版本和事件 ID 的结构化反馈。
+- `GET /api/geo/catalog/countries.geojson`：国家目录点。
+- `GET /api/geo/catalog/admin1.geojson?country=CN`：省级目录点。
+- `GET /api/geo/catalog/cities.geojson?admin1_id=CN.02`：行政区内的城市点。
+
+启动迁移至 `0004_geo_catalog` 后，首次使用时从 `data/geo_catalog.sqlite3` 初始化
+`geo_catalog_source` / `geo_place`。后续启动仅校验库内目录版本及记录数，不再读取目录 JSON；
+目录更新使用显式导入命令，在一个事务内完成。模型校验读取库内的逻辑 revision，
+不再提供目录 JSON 回退。
+GeoJSON 每个 Feature 必须具有有效 `[lng, lat]` 和数值型 `properties.lat/lng`。
+省级坐标以所属目录中人口最多城市的坐标作为派生代表点，缺坐标的行政区保留在库中，
+不输出空几何，而以 `missing_coordinates` 报告。所有点均不表示照片 GPS。
+
+完整协议见 [引导对话](../docs/guided-dialogue.md) 与 [目录入库及 GeoJSON](../docs/geo-catalog.md)。
+
 ## API
 
 | Method | Path                                  | Notes |
@@ -142,8 +166,8 @@ cities cannot alter the analysis. It answers with a `status` rather than an erro
 — `ok`, `no_cities` (catalog holds none for that ISO), or `unavailable` (the
 model service is off or unreachable). A malformed `{iso}` → **422**; a session
 whose stored image has disappeared → **404**. City rows are validated against the
-backend's own `data/cities.json`: the service's `scope.city_catalog_revision`
-must match that file's SHA-256, and every returned `city_id`, name and coordinate
+backend's own `data/geo_catalog.sqlite3`: the service's `scope.city_catalog_revision`
+must match the stored logical city revision, and every returned `city_id`, name and coordinate
 must exist in it, so the catalog — not the model — owns city identity. `city_id`
 is serialized as a **decimal string** (the UI keys markers and rows on it) and
 coordinates are the catalog's representative points, not the photo's location.
@@ -156,6 +180,7 @@ coordinates are the catalog's representative points, not the photo's location.
 | `M_PHOTO_UPLOAD_DIR` | `<data_dir>/uploads` | uploaded images |
 | `M_PHOTO_DB_PATH` | `<data_dir>/m_photo.db` | SQLite file |
 | `M_PHOTO_DB_URL` | derived | full SQLAlchemy URL (wins over path) |
+| `M_PHOTO_GEO_CATALOG_SEED` | `<repo>/data/geo_catalog.sqlite3` | SQLite catalog seed for first initialization or explicit replacement |
 | `M_PHOTO_CORS_ORIGINS` | dev origins | comma-separated allowed origins |
 | `GEO_AI_MODE` | `mock` | passed to the reused AI pipeline; unknown values pass through unchanged |
 | `OCR_PROVIDER` | `mock` (code); `rapidocr` in example/Compose | `mock` or real RapidOCR |
@@ -167,9 +192,9 @@ coordinates are the catalog's representative points, not the photo's location.
 | `STREETCLIP_TIMEOUT_SECONDS` | `45` | per-request HTTP timeout |
 
 The default data root deliberately avoids the repo-level `data/` directory,
-which holds the read-only catalogs `data/countries.json` (country directory and
-ranking targets) and `data/cities.json` (GeoNames settlements used to resolve
-city identity). Both are read straight from the repo/image, never written.
+which holds the shipped read-only `data/geo_catalog.sqlite3` seed. Fresh runtime
+databases copy its indexed catalog tables once; API validation and reasoning then
+read the runtime database. The isolated inference service reads the shipped seed.
 Legacy aliases accepted: `DATA_DIR`, `APP_DATA_DIR`, `UPLOAD_ROOT`,
 `M_PHOTO_DATA`, `UPLOAD_FOLDER`, `DATABASE_PATH`, `DATABASE_URL`, `AI_MODE`,
 `CORS_ORIGINS`.
@@ -212,8 +237,8 @@ preservation, and CLI execution outside the repo.
 
 详细启动、缓存、认证、数据迁移、故障兜底和验收说明见 `docs/streetclip-deployment-plan.md`。
 
-候选范围跟随 `data/countries.json`（当前 250 个国家/地区）；原始余弦不是概率，地图上的点是国家代表位置，不是照片 GPS。
-选定国家后，`POST /api/geo/{session_id}/cities` 再从 `data/cities.json`（GeoNames，34156 个城市 / 244 个国家/地区）
+候选范围跟随 `data/geo_catalog.sqlite3`（当前 250 个国家/地区）；原始余弦不是概率，地图上的点是国家代表位置，不是照片 GPS。
+选定国家后，`POST /api/geo/{session_id}/cities` 再从 `data/geo_catalog.sqlite3`（GeoNames，34156 个城市 / 244 个国家/地区）
 按该会话原图检索城市候选，同样是代表点。城市行必须能在这份目录里逐条对上（id、名称、经纬度），
 否则整份响应作废，因此城市身份由数据目录而不是模型说了算。
 

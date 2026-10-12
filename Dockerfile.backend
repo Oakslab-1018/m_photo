@@ -15,6 +15,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     UV_PYTHON_DOWNLOADS=never \
     HOME=/tmp \
     PATH="/opt/venv/bin:$PATH" \
+    PYTHONPATH=/app \
     M_PHOTO_DATA_DIR=/data \
     GEO_AI_MODE=mock
 
@@ -33,6 +34,7 @@ RUN uv sync --frozen --no-dev --no-install-project
 # 包含 Alembic 配置/迁移脚本；由应用 lifespan 在运行时升级挂载的数据库。
 COPY backend/ ./backend/
 COPY services/ ./services/
+COPY catalog_db.py ./
 COPY config.py ./
 COPY data/ ./data/
 COPY scripts/ocr_download_models.py ./scripts/ocr_download_models.py

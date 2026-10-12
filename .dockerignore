@@ -80,6 +80,8 @@ database.db
 **/*.sqlite
 *.sqlite3
 **/*.sqlite3
+# The portable geo catalog seed is the one SQLite asset intentionally shipped.
+!data/geo_catalog.sqlite3
 backend/storage/
 backend/uploads/
 backend/data/

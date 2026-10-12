@@ -9,7 +9,7 @@
     all_clues.extend(derived)
 
 - 构造：``SemanticClueAnalyzer(countries=None, min_confidence=0.3)``。
-  ``countries`` 只用于离线测试注入；默认读取缓存的 ``data/countries.json``。
+  ``countries`` 只用于离线测试注入；默认读取缓存的 SQLite 国家目录。
 - 输入：任意 ``Clue`` 列表。只消费 ``dimension == "signage"`` 且
   ``extra.reliable is True``（或 source 为 ``ocr``/``point_click``）
   且置信度不低于 ``min_confidence`` 的 OCR 文本行；其余线索一律忽略。
@@ -44,7 +44,6 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from config import BASE_DIR
 from ..clue import Clue, DIMENSIONS
 from .. import knowledge_graph as kg
 from ..engine import (
@@ -145,7 +144,7 @@ class SemanticClueAnalyzer:
                  min_confidence: float = MIN_SEMANTIC_CONFIDENCE) -> None:
         self.countries = list(countries) if countries is not None else kg.load_countries()
         self.min_confidence = float(min_confidence)
-        # 城市目录懒加载：只有出现可靠 OCR 文本时才读取 data/cities.json。
+        # 城市目录懒加载：只有出现可靠 OCR 文本时才读取只读 SQLite 目录。
         self._cities_arg = list(cities) if cities is not None else None
         self._city_index_cache = None
         self._place_phrases: List[Tuple[str, str, str]] = self._build_place_phrases()
@@ -256,20 +255,17 @@ class SemanticClueAnalyzer:
 
     def _city_index(self):
         if self._city_index_cache is None:
-            try:
-                if self._cities_arg is not None:
-                    self._city_index_cache = build_city_name_index(self._cities_arg)
-                else:
-                    self._city_index_cache = load_city_name_index(BASE_DIR / "data" / "cities.json")
-            except (OSError, ValueError, TypeError):
-                self._city_index_cache = {}
+            if self._cities_arg is not None:
+                self._city_index_cache = build_city_name_index(self._cities_arg)
+            else:
+                self._city_index_cache = load_city_name_index()
         return self._city_index_cache
 
     def _collect_city_places(self, norm: str, clue: Clue,
                              collected: Dict[Tuple[str, str], Dict[str, Any]]) -> None:
         """Bounded city evidence: curated CJK aliases + exact English n-grams.
 
-        Every hit is re-resolved against data/cities.json and fails closed on
+        Every hit is re-resolved against the SQLite city catalog and fails closed on
         multi-ISO same-name cities; only unique-ISO names or explicit aliases
         produce a clue, and no coordinate or row is ever invented here.
         """

@@ -11,6 +11,7 @@ import httpx
 
 from ..config import Settings
 from ..domain.geolocation.clue import DIMENSIONS, VALUE_LABELS
+from .catalog_access import catalog_for_settings
 
 logger = logging.getLogger(__name__)
 SYSTEM_PROMPT = """你是照片国家级定位助手，请用简短中文与用户交流。
@@ -78,7 +79,7 @@ class DeepSeekClient:
             if not math.isfinite(timeout) or timeout <= 0:
                 raise ValueError("invalid timeout")
             # Explicit allowlist: never forward image paths, bytes, GPS, URLs or credentials.
-            countries = json.loads(self.settings.countries_path.read_text(encoding="utf-8"))
+            countries = catalog_for_settings(self.settings).countries()
             labels = set(VALUE_LABELS) | {v for c in countries for values in c.get("features", {}).values() for v in values}
             clues = [{"dimension": c["dimension"],
                       "value": c.get("value") if c.get("value") in labels else "[原始文字已隐藏]"}
