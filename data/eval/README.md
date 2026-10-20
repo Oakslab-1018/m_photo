@@ -6,6 +6,8 @@
 > 本地已导入 img2gps3k：2997 条合法坐标与图片（目录共 3000 图，另 3 张未标注），其中
 > 2737 条有派生国家标签、260 条 `country_iso=null`。30 张冒烟已完成；国家
 > 子集不能代表全体，e2e 距离使用全部合法坐标样本。
+>
+> 国家消融 capture/replay 与 semantic 守卫说明见 [country-ablation.md](../../docs/country-ablation.md)；当前尚无收益结论。
 
 ## 快速开始
 
