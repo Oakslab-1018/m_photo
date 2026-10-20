@@ -35,12 +35,16 @@ class ManifestError(ValueError):
 
 @dataclass(frozen=True)
 class ManifestEntry:
-    """One validated, labeled evaluation photo."""
+    """One validated evaluation photo.
+
+    ``country_iso`` is ``None`` only when the loader explicitly permits
+    coordinate-only ground truth.
+    """
 
     id: str
     image_path: Path
     image_ref: str
-    country_iso: str
+    country_iso: str | None
     lat: float
     lng: float
     city_id: str | None = None
@@ -177,12 +181,16 @@ def load_manifest(
     *,
     image_root: str | Path | None = None,
     valid_isos: Iterable[str] | None = None,
+    allow_unlabeled_country: bool = False,
 ) -> list[ManifestEntry]:
     """Load and strictly validate a JSONL manifest.
 
     ``valid_isos`` should be the loaded catalog's source ISO set; passing it
     turns an unknown label into a hard error instead of a silently unmatched
-    sample. Blank lines are allowed; every other line must be a JSON object.
+    sample. ``allow_unlabeled_country`` opts in to coordinate-only samples;
+    missing/null country labels are then accepted, while non-empty malformed or
+    unknown labels are still rejected. Blank lines are allowed; every other
+    line must be a JSON object.
     """
 
     manifest_path = Path(path)
@@ -229,13 +237,19 @@ def load_manifest(
                 raise ManifestError(f"{label}: duplicate image path: {image_ref}")
             seen_images.add(image_path)
 
-            country_iso = _require_text(raw, "country_iso", lineno=lineno).upper()
-            if not _ISO_RE.match(country_iso):
-                raise ManifestError(f"{label}: country_iso must be a two-letter code")
-            if allowed is not None and country_iso not in allowed:
-                raise ManifestError(
-                    f"{label}: country_iso {country_iso} is not in the loaded catalog"
-                )
+            country_iso = (
+                _optional_text(raw, "country_iso")
+                if allow_unlabeled_country
+                else _require_text(raw, "country_iso", lineno=lineno)
+            )
+            if country_iso is not None:
+                country_iso = country_iso.upper()
+                if not _ISO_RE.match(country_iso):
+                    raise ManifestError(f"{label}: country_iso must be a two-letter code")
+                if allowed is not None and country_iso not in allowed:
+                    raise ManifestError(
+                        f"{label}: country_iso {country_iso} is not in the loaded catalog"
+                    )
 
             city_source_iso = _optional_iso(raw, "city_source_iso")
             if allowed is not None and city_source_iso and city_source_iso not in allowed:

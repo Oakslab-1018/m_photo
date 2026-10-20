@@ -8,7 +8,7 @@
 - 参考索引的国家评分目前仅作诊断，不参与国家排序；纳入统一 scorer 仍属计划。
 - 候选差异已有基础：`ModelAwareHypotheses` 会找 top-2 的不同特征维度并避免重复，但仍按固定维度优先级，暂无 margin/问题预算驱动的停止与弃权；同一 scorer 的有/无对话对比仍在计划中。
 - LLM 当前仅有可选文字抽取/措辞，尚未接入 guided 建议问题；不接收图片、不猜坐标、不独立决定地点。
-- 仓库没有真实评测图片或已标注 manifest，不能据此声称已有真实基线与准确率。
+- 本地已导入 img2gps3k：2997 条合法坐标与图片（目录共 3000 图，另 3 张未标注）；2737 条有派生国家标签，260 条 `country_iso=null`。已完成 30 张冒烟；全量基线状态和报告见本地 `reports/`。
 
 ## 启动
 
@@ -30,7 +30,7 @@ docker compose up -d --no-build --force-recreate --wait
 ## 评测入口
 
 离线评测、最小 manifest、指标口径、严格退出行为和后续“当前 → 计划”安排统一见
-[data/eval/README.md](data/eval/README.md)。评测脚本在宿主机运行；没有标注数据时只能生成骨架或做规则回退冒烟，不能产出模型准确率。
+[data/eval/README.md](data/eval/README.md)。评测脚本在宿主机运行；本地 manifest 含未标国家样本，需显式 `--allow-unlabeled-country`。国家指标只覆盖有标签子集，e2e 距离覆盖全部合法坐标；真实 baseline 尚未运行。
 
 ## 边界与文档
 

@@ -222,7 +222,9 @@ def _probe_streetclip(settings: Settings, *, require_city: bool) -> dict[str, An
 # ---------------------------------------------------------------------------
 
 
-def _canonical_gt(entry: ManifestEntry) -> str:
+def _canonical_gt(entry: ManifestEntry) -> str | None:
+    if entry.country_iso is None:
+        return None
     return canonical_country_iso(entry.country_iso) or entry.country_iso
 
 
@@ -247,13 +249,16 @@ def _predicted_source_iso(scores: Sequence[Any]) -> str | None:
     return str(top.iso)
 
 
-def _country_result(scores: Sequence[Any], gt_iso: str, evidence: dict | None) -> dict[str, Any]:
+def _country_result(
+    scores: Sequence[Any], gt_iso: str | None, evidence: dict | None
+) -> dict[str, Any]:
     predicted = [str(score.iso) for score in scores]
     margin = None
     if len(scores) >= 2:
         margin = round(float(scores[0].score) - float(scores[1].score), 6)
     return {
-        "rank": rank_of(predicted, gt_iso),
+        "labeled": gt_iso is not None,
+        "rank": rank_of(predicted, gt_iso) if gt_iso is not None else None,
         "predicted_iso": predicted,
         "top1_score": round(float(scores[0].score), 6) if scores else None,
         "margin": margin,
@@ -364,6 +369,13 @@ def _evaluate_sample(
     }
     timings: dict[str, float] = record["timing_ms"]
     started = time.perf_counter()
+    oracle_skipped = evaluate_cities and entry.country_iso is None
+    if oracle_skipped:
+        record["city_true_country"] = {
+            "available": False,
+            "skipped": True,
+            "reason": "no_country_label",
+        }
 
     try:
         tick = time.perf_counter()
@@ -398,15 +410,17 @@ def _evaluate_sample(
         timings["total_ms"] = round((time.perf_counter() - started) * 1000.0, 1)
         return record
 
-    if reasoner is None and (evaluate_cities or evaluate_e2e_cities):
+    needs_city_path = evaluate_e2e_cities or (evaluate_cities and not oracle_skipped)
+    if reasoner is None and needs_city_path:
         record["city_error"] = city_path_error or "city catalog unavailable"
         timings["total_ms"] = round((time.perf_counter() - started) * 1000.0, 1)
         return record
 
     if reasoner is not None and (evaluate_cities or evaluate_e2e_cities):
         true_city: dict[str, Any] | None = None
-        true_iso = entry.city_source_iso or entry.country_iso
-        if evaluate_cities:
+        true_iso: str | None = None
+        if evaluate_cities and not oracle_skipped:
+            true_iso = entry.city_source_iso or entry.country_iso
             tick = time.perf_counter()
             try:
                 payload = gateway.rank_cities(entry.image_path, true_iso)
@@ -496,9 +510,10 @@ def _aggregate(
 ) -> dict[str, Any]:
     """Aggregate attempted records without hiding failed samples.
 
-    The existing country and city metrics remain available-conditional. Each
-    also carries an overall block whose denominator is every attempted
-    sample; errors and unavailable city paths count as misses there.
+    Country metrics use only attempted samples with a country label. Country
+    errors still count as misses there; unlabeled samples remain in e2e city,
+    global error/degraded, and strict checks. City metrics are
+    available-conditional, with an overall block over attempted city paths.
     """
 
     if evaluate_cities is None:
@@ -506,22 +521,49 @@ def _aggregate(
     if evaluate_e2e_cities is None:
         evaluate_e2e_cities = any("city_e2e" in record for record in records)
 
-    country_records = [record["country"] for record in records if isinstance(record.get("country"), dict)]
+    def country_labeled(record: dict) -> bool:
+        ground_truth = record.get("ground_truth")
+        if isinstance(ground_truth, dict) and "country_iso" in ground_truth:
+            return ground_truth.get("country_iso") not in (None, "")
+        country_row = record.get("country")
+        return not (isinstance(country_row, dict) and country_row.get("labeled") is False)
+
+    labeled_records = [record for record in records if country_labeled(record)]
+    unlabeled_records = [record for record in records if not country_labeled(record)]
+    country_records = [
+        record["country"] for record in labeled_records if isinstance(record.get("country"), dict)
+    ]
     country = summarize_country(country_records)
     country["overall"] = summarize_country(
         [
             record["country"]
             if isinstance(record.get("country"), dict)
             else {"rank": None, "degraded": False}
-            for record in records
+            for record in labeled_records
         ]
     )
+    country["labeled_samples"] = len(labeled_records)
+    country["unlabeled_samples"] = len(unlabeled_records)
+    country["label_coverage"] = (
+        round(len(labeled_records) / len(records), 6) if records else None
+    )
+
+    def city_path_skipped(record: dict, field: str) -> bool:
+        row = record.get(field)
+        return (
+            field == "city_true_country"
+            and isinstance(row, dict)
+            and bool(row.get("skipped"))
+            and row.get("reason") == "no_country_label"
+        )
 
     def attempted_city_rows(field: str, enabled: bool) -> list[dict]:
         if not enabled:
             return []
         rows: list[dict] = []
         for record in records:
+            if city_path_skipped(record, field):
+                continue
             row = record.get(field)
             if isinstance(row, dict):
                 rows.append(row)
@@ -581,6 +623,8 @@ def _aggregate(
     ) + ((("e2e", "city_e2e"),) if evaluate_e2e_cities else ())
 
     def path_unavailable(record: dict, field: str) -> bool:
+        if city_path_skipped(record, field):
+            return False
         row = record.get(field)
         return not isinstance(row, dict) or not row.get("available")
 
@@ -595,11 +639,20 @@ def _aggregate(
             continue
         setup_error = record.get("city_error")
         if setup_error:
+            active_paths = [
+                (path, field)
+                for path, field in enabled_city_paths
+                if not city_path_skipped(record, field)
+            ]
+            if not active_paths:
+                continue
             city_errors.append(
                 {"id": str(record.get("id")), "path": "setup", "error": str(setup_error)}
             )
             continue
         for path, field in enabled_city_paths:
+            if city_path_skipped(record, field):
+                continue
             row = record.get(field)
             if isinstance(row, dict) and row.get("available"):
                 continue
@@ -689,6 +742,7 @@ def _render_markdown(report: dict[str, Any]) -> str:
         "prompt_version",
         "catalog_revision",
         "city_catalog_revision",
+        "allow_unlabeled_country",
         "ocr_provider",
         "ocr_model_type",
         "geo_ai_mode",
@@ -736,7 +790,12 @@ def _render_markdown(report: dict[str, Any]) -> str:
     overall = country.get("overall") or {}
     lines.append("| metric | value |")
     lines.append("| --- | --- |")
-    lines.append(f"| attempted samples | {overall.get('samples')} |")
+    lines.append(
+        f"| country labels / unlabeled | {country.get('labeled_samples')} / "
+        f"{country.get('unlabeled_samples')} |"
+    )
+    lines.append(f"| country label coverage | {_fmt_rate(country.get('label_coverage'))} |")
+    lines.append(f"| country-labeled attempted samples | {overall.get('samples')} |")
     lines.append(f"| country ranking available | {country.get('samples')} |")
     lines.append(f"| top-1 (available) | {_fmt_rate(country.get('top1'))} |")
     lines.append(f"| top-1 (all attempted) | {_fmt_rate(overall.get('top1'))} |")
@@ -750,7 +809,10 @@ def _render_markdown(report: dict[str, Any]) -> str:
     lines.append(f"| unranked (available denominator) | {country.get('unranked')} |")
     lines.append(f"| unranked (all attempted denominator) | {overall.get('unranked')} |")
     lines.append(f"| degraded (rules only, available) | {_fmt_rate(country.get('degraded_rate'))} |")
-    lines.append(f"| degraded (rules only, all attempted) | {_fmt_rate(overall.get('degraded_rate'))} |")
+    lines.append(
+        f"| degraded (rules only, country-labeled attempted) | "
+        f"{_fmt_rate(overall.get('degraded_rate'))} |"
+    )
     lines.append(f"| mean top-1 score (available) | {_fmt_num(country.get('mean_top1_score'))} |")
     lines.append(f"| mean top1-top2 margin (available) | {_fmt_num(country.get('mean_margin'))} |")
     lines.append("")
@@ -897,10 +959,12 @@ def _render_markdown(report: dict[str, Any]) -> str:
     lines.append("- Samples with `degraded=true` ran without StreetCLIP evidence and "
                  "must not be compared against model-enabled baselines.")
     lines.append("- Existing country/city rates are conditioned on available rankings. "
-                 "`overall` rates use every attempted sample; errors and unavailable "
-                 "paths count as misses; country mean score/margin remain "
-                 "available-only, and optional exact-city IDs remain "
-                 "available-conditional only.")
+                 "Country `overall` rates use country-labeled attempted samples; "
+                 "unlabeled samples are excluded from country accuracy and oracle "
+                 "city metrics but remain in end-to-end city and global error/degraded "
+                 "checks. Errors and unavailable paths count as misses where attempted; "
+                 "country mean score/margin remain available-only, and optional "
+                 "exact-city IDs remain available-conditional only.")
     lines.append("")
     return "\n".join(lines)
 
@@ -924,6 +988,9 @@ def _print_summary(report: dict[str, Any], output_dir: Path) -> None:
     print(f"Country top-1 (all attempted): {_fmt_rate(overall.get('top1'))}   "
           f"top-3: {_fmt_rate(overall.get('top3'))}   "
           f"MRR: {_fmt_num(overall.get('mrr'))}")
+    print(f"Country label coverage: {_fmt_rate(country.get('label_coverage'))} "
+          f"({country.get('labeled_samples')}/{summary['samples']}; "
+          f"{country.get('unlabeled_samples')} unlabeled)")
     city_true = summary["city"].get("true_country") or {}
     city_e2e = summary["city"].get("e2e") or {}
     if city_true:
@@ -938,7 +1005,9 @@ def _print_summary(report: dict[str, Any], output_dir: Path) -> None:
               f"{_fmt_rate(city_e2e.get('top1_at_50km'))} available / "
               f"{_fmt_rate(city_e2e_overall.get('top1_at_50km'))} all attempted   "
               f"available: {_fmt_rate(city_e2e.get('available_rate'))}")
-    print(f"Degraded: {_fmt_rate(overall.get('degraded_rate'))}   "
+    degraded = int(summary.get("degraded") or 0)
+    degraded_rate = degraded / summary["samples"] if summary.get("samples") else None
+    print(f"Degraded (all samples): {_fmt_rate(degraded_rate)}   "
           f"errors: {summary['errors']}/{summary['samples']}")
     print(f"Report: {output_dir / 'report.md'}")
 
@@ -976,6 +1045,11 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--ids", help="comma-separated sample ids to evaluate")
     parser.add_argument("--no-cities", action="store_true", help="skip oracle-country city ranking")
     parser.add_argument("--no-e2e-cities", action="store_true", help="skip end-to-end city ranking")
+    parser.add_argument(
+        "--allow-unlabeled-country",
+        action="store_true",
+        help="allow coordinate-only samples without a country label",
+    )
     parser.add_argument(
         "--allow-degraded",
         action="store_true",
@@ -1074,7 +1148,7 @@ def _gate_failures(
     if args.strict:
         if summary.get("errors"):
             failures.append(f"{summary['errors']} sample error(s)")
-        if overall.get("degraded_rate"):
+        if summary.get("degraded") or overall.get("degraded_rate"):
             failures.append("some samples ran without StreetCLIP evidence")
         enabled_city_errors = len(report.get("city_errors") or [])
         if not enabled_city_errors:
@@ -1117,6 +1191,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.manifest,
             image_root=args.image_root,
             valid_isos=valid_isos,
+            allow_unlabeled_country=args.allow_unlabeled_country,
         )
         entries = _select_entries(entries, args)
     except (ManifestError, EvalError, ValueError) as exc:
@@ -1135,7 +1210,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     evaluate_cities = not args.no_cities
     evaluate_e2e_cities = not args.no_e2e_cities
-    require_city = evaluate_cities or evaluate_e2e_cities
+    require_city = evaluate_e2e_cities or (
+        evaluate_cities and any(entry.country_iso is not None for entry in entries)
+    )
 
     runtime_settings = settings
     city_path_error: str | None = None
@@ -1285,6 +1362,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "e2e": evaluate_e2e_cities,
             },
             "city_path_error": city_path_error,
+            "allow_unlabeled_country": args.allow_unlabeled_country,
             "ocr_provider": runtime_settings.ocr_provider,
             "ocr_model_type": runtime_settings.ocr_model_type,
             "geo_ai_mode": runtime_settings.geo_ai_mode,

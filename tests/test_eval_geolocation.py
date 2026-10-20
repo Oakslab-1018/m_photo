@@ -402,6 +402,7 @@ def test_allow_degraded_country_preflight_failure_disables_model(
     assert captured["city_path_error"] == "country model unavailable; rules-only degraded run"
     assert report["configuration"]["streetclip_enabled"] is False
     assert report["configuration"]["streetclip_requested"] is True
+    assert report["configuration"]["allow_unlabeled_country"] is False
     assert report["configuration"]["model_health"]["country_capability"] is False
     markdown = (tmp_path / "report" / "report.md").read_text(encoding="utf-8")
     assert "Rules-only samples" in markdown
@@ -499,3 +500,202 @@ def test_fail_fast_writes_partial_report(
     assert report["gates"]["passed"] is False
     assert len(samples) == 1
     assert (tmp_path / "report" / "report.md").is_file()
+
+def test_unlabeled_country_still_runs_e2e_prediction_and_distance(tmp_path: Path) -> None:
+    entry = _entry(tmp_path, country_iso=None)
+    gateway = FakeGateway(city_rows={"US": _city_payload("US")})
+    engine = FakeEngine([FakeScore("US", 0.9), FakeScore("JP", 0.1)])
+
+    record = eg._evaluate_sample(
+        entry,
+        pipeline=FakePipeline(),
+        gateway=gateway,
+        engine=engine,
+        reasoner=FakeReasoner(),
+        evaluate_cities=True,
+        evaluate_e2e_cities=True,
+    )
+
+    assert record["ground_truth"]["canonical_country_iso"] is None
+    assert record["country"]["labeled"] is False
+    assert record["country"]["rank"] is None
+    assert gateway.city_calls == ["US"]
+    assert record["city_true_country"] == {
+        "available": False,
+        "skipped": True,
+        "reason": "no_country_label",
+    }
+    assert record["city_e2e"]["available"] is True
+    assert record["city_e2e"]["source_iso"] == "US"
+    assert record["city_e2e"]["top1_km"] > 0
+    assert record["city_e2e"]["top1_city"]["city_id"] == "2"
+    assert "reused_true_country_ranking" not in record["city_e2e"]
+
+
+def test_country_denominator_uses_only_labeled_attempts() -> None:
+    records = [
+        {
+            "id": "labeled-ok",
+            "ground_truth": {"country_iso": "JP"},
+            "country": {"labeled": True, "rank": 1, "degraded": False},
+        },
+        {
+            "id": "unlabeled-ok",
+            "ground_truth": {"country_iso": None},
+            "country": {"labeled": False, "rank": None, "degraded": False},
+        },
+        {
+            "id": "labeled-error",
+            "ground_truth": {"country_iso": "JP"},
+            "error": "RuntimeError: boom",
+        },
+        {
+            "id": "unlabeled-error",
+            "ground_truth": {"country_iso": None},
+            "error": "RuntimeError: boom",
+        },
+    ]
+
+    aggregated = eg._aggregate(
+        records,
+        evaluate_cities=False,
+        evaluate_e2e_cities=False,
+    )
+    country = aggregated["summary"]["country"]
+
+    assert country["labeled_samples"] == 2
+    assert country["unlabeled_samples"] == 2
+    assert country["label_coverage"] == 0.5
+    assert country["overall"]["samples"] == 2
+    assert country["overall"]["top1"] == 0.5
+    assert aggregated["summary"]["errors"] == 2
+
+
+def test_unlabeled_oracle_skip_does_not_fail_strict_or_bias_city_denominator(
+    tmp_path: Path,
+) -> None:
+    entry = _entry(tmp_path, country_iso=None)
+    record = eg._evaluate_sample(
+        entry,
+        pipeline=FakePipeline(),
+        gateway=FakeGateway(city_rows={"US": _city_payload("US")}),
+        engine=FakeEngine([FakeScore("US", 0.9)]),
+        reasoner=FakeReasoner(),
+        evaluate_cities=True,
+        evaluate_e2e_cities=True,
+    )
+    aggregated = eg._aggregate(
+        [record],
+        evaluate_cities=True,
+        evaluate_e2e_cities=True,
+    )
+    city = aggregated["summary"]["city"]
+
+    assert city["true_country"]["samples"] == 0
+    assert city["true_country"]["unavailable"] == 0
+    assert city["e2e"]["samples"] == 1
+    assert aggregated["unavailable_city_samples"] == []
+    assert aggregated["city_errors"] == []
+
+    report = {
+        "summary": aggregated["summary"],
+        "city_errors": aggregated["city_errors"],
+    }
+    args = SimpleNamespace(strict=True, min_country_top1=None)
+    failures = eg._gate_failures(
+        report,
+        args,
+        evaluate_cities=True,
+        evaluate_e2e_cities=True,
+    )
+    assert failures == []
+
+
+def test_unlabeled_degraded_is_global_and_fails_strict() -> None:
+    record = {
+        "id": "unlabeled-degraded",
+        "ground_truth": {"country_iso": None},
+        "country": {"labeled": False, "rank": None, "degraded": True},
+    }
+    aggregated = eg._aggregate(
+        [record],
+        evaluate_cities=False,
+        evaluate_e2e_cities=False,
+    )
+
+    assert aggregated["summary"]["country"]["overall"]["samples"] == 0
+    assert aggregated["summary"]["degraded"] == 1
+
+    report = {
+        "summary": aggregated["summary"],
+        "city_errors": aggregated["city_errors"],
+    }
+    args = SimpleNamespace(strict=True, min_country_top1=None)
+    failures = eg._gate_failures(
+        report,
+        args,
+        evaluate_cities=False,
+        evaluate_e2e_cities=False,
+    )
+    assert failures == ["some samples ran without StreetCLIP evidence"]
+
+
+def test_min_country_gate_cannot_pass_without_country_labels() -> None:
+    record = {
+        "id": "unlabeled",
+        "ground_truth": {"country_iso": None},
+        "country": {"labeled": False, "rank": None, "degraded": False},
+    }
+    aggregated = eg._aggregate(
+        [record],
+        evaluate_cities=False,
+        evaluate_e2e_cities=False,
+    )
+    report = {
+        "summary": aggregated["summary"],
+        "city_errors": aggregated["city_errors"],
+    }
+    args = SimpleNamespace(strict=False, min_country_top1=0.5)
+
+    failures = eg._gate_failures(
+        report,
+        args,
+        evaluate_cities=False,
+        evaluate_e2e_cities=False,
+    )
+
+    assert failures == ["country top-1 (all attempted) n/a < 0.5"]
+
+
+def test_allow_unlabeled_country_cli_is_opt_in() -> None:
+    strict_args = eg._parse_args(["--manifest", "manifest.jsonl"])
+    opt_in_args = eg._parse_args(
+        ["--manifest", "manifest.jsonl", "--allow-unlabeled-country"]
+    )
+
+    assert strict_args.allow_unlabeled_country is False
+    assert opt_in_args.allow_unlabeled_country is True
+
+def test_unlabeled_country_error_keeps_oracle_skip_but_counts_e2e(tmp_path: Path) -> None:
+    entry = _entry(tmp_path, country_iso=None)
+    record = eg._evaluate_sample(
+        entry,
+        pipeline=FakePipeline(),
+        gateway=FakeGateway(),
+        engine=FakeEngine(error=RuntimeError("boom")),
+        reasoner=FakeReasoner(),
+        evaluate_cities=True,
+        evaluate_e2e_cities=True,
+    )
+    aggregated = eg._aggregate(
+        [record],
+        evaluate_cities=True,
+        evaluate_e2e_cities=True,
+    )
+
+    assert record["city_true_country"]["reason"] == "no_country_label"
+    assert record["error"] == "RuntimeError: boom"
+    assert aggregated["summary"]["city"]["true_country"]["samples"] == 0
+    assert aggregated["summary"]["city"]["e2e"]["unavailable"] == 1
+    assert aggregated["summary"]["errors"] == 1
+    assert [row["path"] for row in aggregated["city_errors"]] == ["e2e"]

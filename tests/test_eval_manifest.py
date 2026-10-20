@@ -227,3 +227,59 @@ def test_generated_external_manifest_prints_image_root_override(
     rows[0].update(country_iso="JP", lat=35.68, lng=139.76)
     _write_manifest(output, rows)
     assert load_manifest(output, image_root=root)[0].image_ref == "a.jpg"
+
+@pytest.mark.parametrize("missing", [False, True])
+def test_default_manifest_requires_country_label(tmp_path: Path, missing: bool) -> None:
+    _write_image(tmp_path / "images" / "a.jpg")
+    manifest = tmp_path / "manifest.jsonl"
+    row = _row()
+    if missing:
+        row.pop("country_iso")
+    else:
+        row["country_iso"] = None
+    _write_manifest(manifest, [row])
+
+    with pytest.raises(ManifestError, match="country_iso"):
+        load_manifest(manifest)
+
+
+def test_allow_unlabeled_country_accepts_missing_and_null(tmp_path: Path) -> None:
+    for name in ("a.jpg", "b.jpg", "c.jpg"):
+        _write_image(tmp_path / "images" / name)
+    manifest = tmp_path / "manifest.jsonl"
+    missing_label = _row(id="sample-3", image="images/c.jpg")
+    missing_label.pop("country_iso")
+    _write_manifest(
+        manifest,
+        [
+            _row(),
+            _row(id="sample-2", image="images/b.jpg", country_iso=None),
+            missing_label,
+        ],
+    )
+
+    entries = load_manifest(manifest, valid_isos={"JP"}, allow_unlabeled_country=True)
+
+    assert [entry.country_iso for entry in entries] == ["JP", None, None]
+
+
+@pytest.mark.parametrize(
+    ("country_iso", "valid_isos", "match"),
+    [
+        ("ZZ", {"JP"}, "not in the loaded catalog"),
+        ("JPN", {"JP"}, "two-letter code"),
+        ("1A", {"JP"}, "two-letter code"),
+    ],
+)
+def test_allow_unlabeled_country_still_rejects_bad_nonempty_labels(
+    tmp_path: Path,
+    country_iso: str,
+    valid_isos: set[str],
+    match: str,
+) -> None:
+    _write_image(tmp_path / "images" / "a.jpg")
+    manifest = tmp_path / "manifest.jsonl"
+    _write_manifest(manifest, [_row(country_iso=country_iso)])
+
+    with pytest.raises(ManifestError, match=match):
+        load_manifest(manifest, valid_isos=valid_isos, allow_unlabeled_country=True)

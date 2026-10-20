@@ -82,4 +82,5 @@ static/images/
 # Offline geolocation evaluation: local images and generated reports stay out
 # of Git; the README and example manifest remain tracked.
 data/eval/images/
+data/eval/manifest.img2gps3k*.jsonl
 reports/
