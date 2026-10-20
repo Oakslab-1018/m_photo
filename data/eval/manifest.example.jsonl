@@ -1,0 +1,2 @@
+{"id":"example-tokyo-001","image":"images/example-tokyo-001.jpg","country_iso":"JP","city_id":"1850147","city":"Tokyo","admin1_code":"40","lat":35.6895,"lng":139.6917,"tags":["urban","signage"],"license":"CC BY-SA 4.0","source":"https://example.org/photo","notes":"示例：请替换为你有权使用的图片"}
+{"id":"example-taipei-001","image":"images/example-taipei-001.jpg","country_iso":"TW","city_source_iso":"TW","city_id":"1668341","city":"Taipei","lat":25.033,"lng":121.5654,"tags":["urban","night"],"license":"CC BY-SA 4.0","source":"https://example.org/photo","notes":"示例：台湾照片显式填写 city_source_iso"}
