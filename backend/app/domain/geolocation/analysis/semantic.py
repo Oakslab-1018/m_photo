@@ -19,10 +19,11 @@
   绝不叠加置信度。
 
 证据分级：
-- ``place_name``：目录 ``name``/``name_zh`` 规范化完整边界匹配，或已校验的
-  城市名（含有限中文别名；北京市/東京駅允许一个行政后缀）。跨国家同名
-  城市 fail closed，只有唯一 ISO 或显式目录别名才提供国家；裸 3 字母大写
-  词元（OPEN/AND/CLOSED 等）不再推断国家。
+- ``place_name``：目录 ``name``/``name_zh`` 规范化完整边界匹配；普通城市名
+  必须由同一 OCR 行唯一显式国家名支撑，且国家 ISO 与城市解析一致。有限中文
+  别名（北京市/東京駅允许一个行政后缀）保持目录显式映射；显式国家冲突时城市
+  证据不输出。目录内同名唯一或整行恰好等于城市名都不等于现实世界唯一；裸
+  3 字母大写词元（OPEN/AND/CLOSED 等）不再推断国家。
   ``validated=True``、``affects_ranking=True``，并携带 ``origin_group``
   以便引擎对同一 OCR 行的相关证据只计最强的一条。
 - ``culture``：精确命中目录 ``features.culture`` 且在目录中只属于 1 个国家。
@@ -46,6 +47,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from ..clue import Clue, DIMENSIONS
 from .. import knowledge_graph as kg
+from ..country_policy import canonical_country_iso
 from ..engine import (
     CITY_NAME_ALIASES,
     build_city_name_index,
@@ -69,6 +71,12 @@ _CONFIDENCE_CAPS = {
     "terrain": 0.55,
     "waterbody": 0.55,
     "infrastructure": 0.6,
+}
+
+# 同一 ISO 来自多条 OCR 行时只用更强的上下文做审计，不覆盖已有强支持。
+_MATCH_CONTEXT_PRIORITY = {
+    "explicit_country": 2,
+    "city_alias": 1,
 }
 
 # 常见英文同形词：只有 ISO3（大写词元）或中文名命中才允许输出国家
@@ -242,16 +250,29 @@ class SemanticClueAnalyzer:
 
     def _collect_places(self, raw_text: str, norm: str, clue: Clue,
                         collected: Dict[Tuple[str, str], Dict[str, Any]]) -> None:
+        country_isos = self._explicit_country_isos(norm)
         for phrase, iso, kind in self._place_phrases:
             if find_place_phrase(norm, phrase):
                 self._add(collected, "place_name", iso, clue,
                           matched_text=self._matched_for(norm, phrase, raw_text),
                           validated=True, affects_ranking=True,
-                          catalog_iso=iso, match_kind=kind)
+                          catalog_iso=iso, match_kind=kind,
+                          match_context="explicit_country")
                 break
         # 不再从裸 3 字母大写词元推断国家（OPEN/AND/CLOSED、CAN/EXIT 等
         # 同形词误报率过高）；ISO3 只在用户显式回答等输入路径中使用。
-        self._collect_city_places(norm, clue, collected)
+        self._collect_city_places(norm, clue, collected, country_isos)
+
+    def _explicit_country_isos(self, norm: str) -> set[str]:
+        """Return canonical product countries explicitly named on this line."""
+        countries: set[str] = set()
+        for phrase, iso, _kind in self._place_phrases:
+            if not find_place_phrase(norm, phrase):
+                continue
+            canonical = canonical_country_iso(iso)
+            if canonical:
+                countries.add(canonical)
+        return countries
 
     def _city_index(self):
         if self._city_index_cache is None:
@@ -262,47 +283,59 @@ class SemanticClueAnalyzer:
         return self._city_index_cache
 
     def _collect_city_places(self, norm: str, clue: Clue,
-                             collected: Dict[Tuple[str, str], Dict[str, Any]]) -> None:
-        """Bounded city evidence: curated CJK aliases + exact English n-grams.
+                             collected: Dict[Tuple[str, str], Dict[str, Any]],
+                             country_isos: set[str]) -> None:
+        """Bounded city evidence: aliases or explicit country context.
 
         Every hit is re-resolved against the SQLite city catalog and fails closed on
         multi-ISO same-name cities; only unique-ISO names or explicit aliases
-        produce a clue, and no coordinate or row is ever invented here.
+        produce a clue. Ordinary city names are not country evidence unless the
+        same line uniquely names that country; a whole-line directory match alone
+        is insufficient. No coordinate or row is ever invented here.
         """
         index = self._city_index()
         if not index:
             return
-        seen_iso: set = set()
+        seen_phrases: set = set()
         for alias in sorted(CITY_NAME_ALIASES):
             alias_norm = normalize_place_text(alias)
-            if not alias_norm or alias in seen_iso:
+            if not alias_norm or alias in seen_phrases:
                 continue
             if not find_place_phrase(norm, alias_norm):
                 continue
             resolution = resolve_city_name(index, alias)
             if resolution is None:
                 continue
-            seen_iso.add(alias)
+            resolved_country = canonical_country_iso(resolution.iso)
+            if country_isos and (
+                len(country_isos) != 1 or resolved_country not in country_isos
+            ):
+                continue
+            seen_phrases.add(alias)
             self._add(collected, "place_name", resolution.iso, clue,
                       matched_text=alias, validated=True, affects_ranking=True,
                       catalog_iso=resolution.iso, match_kind="city_alias",
+                      match_context="city_alias",
                       city_name=resolution.city_name, city_id=resolution.city_id,
                       confidence_factor=resolution.confidence_factor)
         tokens = norm.split()
         for size in (1, 2, 3):
             for start in range(len(tokens) - size + 1):
                 phrase = " ".join(tokens[start:start + size])
-                if phrase in seen_iso:
+                if phrase in seen_phrases:
                     continue
                 resolution = resolve_city_name(index, phrase)
                 if resolution is None or resolution.resolution == "city_unique_country":
                     continue
                 if not find_place_phrase(norm, phrase):
                     continue
-                seen_iso.add(phrase)
+                if country_isos != {canonical_country_iso(resolution.iso)}:
+                    continue
+                seen_phrases.add(phrase)
                 self._add(collected, "place_name", resolution.iso, clue,
                           matched_text=phrase, validated=True, affects_ranking=True,
                           catalog_iso=resolution.iso, match_kind="city_name",
+                          match_context="explicit_country",
                           city_name=resolution.city_name, city_id=resolution.city_id,
                           confidence_factor=resolution.confidence_factor)
 
@@ -352,6 +385,7 @@ class SemanticClueAnalyzer:
              validated: bool, affects_ranking: bool,
              catalog_iso: Optional[str] = None,
              match_kind: Optional[str] = None,
+             match_context: Optional[str] = None,
              city_name: Optional[str] = None,
              city_id: Optional[str] = None,
              confidence_factor: Optional[float] = None) -> None:
@@ -370,6 +404,7 @@ class SemanticClueAnalyzer:
                 "affects_ranking": affects_ranking,
                 "catalog_iso": catalog_iso,
                 "match": match_kind,
+                "match_context": match_context,
                 "city_name": city_name,
                 "city_id": city_id,
                 "confidence_factor": confidence_factor,
@@ -381,10 +416,20 @@ class SemanticClueAnalyzer:
             }
             collected[key] = entry
         else:
+            entry["validated"] = bool(entry["validated"] or validated)
+            entry["affects_ranking"] = bool(entry["affects_ranking"] or affects_ranking)
             if entry.get("catalog_iso") is None and catalog_iso is not None:
                 entry["catalog_iso"] = catalog_iso
             if entry.get("match") is None and match_kind is not None:
                 entry["match"] = match_kind
+            if match_context is not None:
+                current_context = entry.get("match_context")
+                if (
+                    current_context is None
+                    or _MATCH_CONTEXT_PRIORITY.get(match_context, 0)
+                    > _MATCH_CONTEXT_PRIORITY.get(str(current_context), 0)
+                ):
+                    entry["match_context"] = match_context
             if entry.get("origin_group") is None:
                 entry["origin_group"] = origin_group_for_clue(clue)
             if entry.get("city_name") is None and city_name is not None:
@@ -428,6 +473,8 @@ class SemanticClueAnalyzer:
             extra["catalog_iso"] = str(entry["catalog_iso"])
         if entry.get("match"):
             extra["match"] = str(entry["match"])
+        if entry.get("match_context"):
+            extra["match_context"] = str(entry["match_context"])
         if entry.get("city_name"):
             extra["city_name"] = str(entry["city_name"])
         if entry.get("city_id"):

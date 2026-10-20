@@ -10,7 +10,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from ..config import Settings
-from ..domain.geolocation.clue import DIMENSIONS, VALUE_LABELS
+from ..domain.geolocation.clue import DIMENSIONS, DIM_LABELS, VALUE_LABELS
 from .catalog_access import catalog_for_settings
 
 logger = logging.getLogger(__name__)
@@ -29,6 +29,182 @@ StreetCLIP 只是候选国家目录内的相似度排序，余弦和规则权重
 REGION_POLICY_BLOCKED_PHRASES = (
     "台湾国", "台灣國", "台湾是一个国家", "台灣是一個國家", "台湾共和国", "台灣共和國",
 )
+
+_QUESTION_ACTION_KINDS = {"ask", "request_clue"}
+_QUESTION_MARKERS = ("?", "？", "请", "是否", "能否", "哪", "吗", "选择", "补充")
+_QUESTION_DIMENSION_ALIASES = {
+    "language": ("语言", "文字", "路牌文字", "招牌文字", "字母", "文字系统"),
+    "place_name": ("地名", "招牌", "国家", "城市", "地点", "名称"),
+    "driving_side": ("行驶", "驾驶", "通行", "道路方向", "靠左", "靠右", "左", "右", "方向盘"),
+    "signage": ("招牌", "文字", "路牌", "标牌"),
+    "road": ("道路", "路面", "铺装"),
+    "terrain": ("地形", "地势", "山地", "平原"),
+    "waterbody": ("水体", "河流", "湖泊", "海岸"),
+    "vegetation": ("植被", "植物", "森林", "草原"),
+    "building": ("建筑", "楼房", "房屋"),
+    "vehicle": ("车辆", "车辆特征", "汽车"),
+    "climate": ("气候", "天气"),
+    "culture": ("文化", "地标", "文化符号"),
+    "infrastructure": ("基础设施", "铁路", "桥梁", "机场"),
+}
+_ACTION_TEXT_KEYS = {
+    "dimensions", "candidates", "iso", "name_zh", "score", "reason", "stage",
+    "question_id", "question_kind", "requires_explicit_confirmation",
+}
+
+
+def _safe_score_row(value: object) -> dict | None:
+    if not isinstance(value, dict):
+        return None
+    result = {
+        key: value.get(key)
+        for key in ("iso", "name", "name_zh", "score", "raw_cosine", "score_type")
+        if value.get(key) is not None
+    }
+    return result or None
+
+
+def _safe_confidence(value: object) -> dict | None:
+    if not isinstance(value, dict):
+        return None
+    result = {
+        key: value.get(key)
+        for key in (
+            "tier", "action", "model_only_margin", "fused_margin", "effective_margin",
+            "prior_top_iso", "top1_iso", "leader_changed", "reason", "policy_version",
+        )
+        if value.get(key) is not None
+    }
+    top3 = value.get("top3")
+    if isinstance(top3, list):
+        result["top3"] = [row for row in (_safe_score_row(item) for item in top3[:3]) if row]
+    return result or None
+
+
+def _safe_action_payload(payload: object) -> dict:
+    if not isinstance(payload, dict):
+        return {}
+    result: dict = {
+        key: payload[key]
+        for key in _ACTION_TEXT_KEYS
+        if key in payload and payload[key] is not None
+    }
+    dimensions = payload.get("dimensions")
+    if isinstance(dimensions, list):
+        result["dimensions"] = [str(item)[:64] for item in dimensions[:8] if isinstance(item, str)]
+    candidates = payload.get("candidates")
+    if isinstance(candidates, list):
+        result["candidates"] = [str(item)[:32] for item in candidates[:5] if isinstance(item, str)]
+    options = payload.get("options")
+    if isinstance(options, list):
+        result["options"] = [
+            {"value": str(item.get("value"))[:200], "label": str(item.get("label"))[:200]}
+            for item in options[:6]
+            if isinstance(item, dict) and item.get("value") is not None and item.get("label") is not None
+        ]
+    target = payload.get("target")
+    if isinstance(target, dict):
+        result["target"] = {
+            key: target[key]
+            for key in ("level", "id", "label", "country_iso", "source_iso")
+            if target.get(key) is not None
+        }
+    candidate_details = payload.get("candidate_details")
+    if isinstance(candidate_details, list):
+        result["candidate_details"] = [
+            row for row in (_safe_score_row(item) for item in candidate_details[:3]) if row
+        ]
+    result["confidence"] = _safe_confidence(payload.get("confidence"))
+    if result["confidence"] is None:
+        result.pop("confidence", None)
+    return result
+
+
+def _question_theme_terms(action: dict) -> set[str]:
+    payload = action.get("payload") if isinstance(action.get("payload"), dict) else {}
+    dimensions: set[str] = set()
+    for key in ("dimension", "dimensions"):
+        value = payload.get(key)
+        if isinstance(value, str):
+            dimensions.add(value)
+        elif isinstance(value, list):
+            dimensions.update(item for item in value if isinstance(item, str))
+    options = payload.get("options")
+    if isinstance(options, list):
+        for item in options:
+            if not isinstance(item, dict):
+                continue
+            dimension = item.get("dimension")
+            if isinstance(dimension, str):
+                dimensions.add(dimension)
+    terms: set[str] = set()
+    for dimension in dimensions:
+        terms.add(dimension)
+        label = DIM_LABELS.get(dimension)
+        if label:
+            terms.add(label)
+        terms.update(_QUESTION_DIMENSION_ALIASES.get(dimension, ()))
+    if isinstance(options, list):
+        for item in options:
+            if not isinstance(item, dict):
+                continue
+            for key in ("label", "value"):
+                value = item.get(key)
+                if not isinstance(value, str) or not value:
+                    continue
+                terms.add(value)
+                label = VALUE_LABELS.get(value)
+                if label:
+                    terms.add(label)
+    return {term for term in terms if term}
+
+
+def _narration_anchors(action: dict) -> list[str]:
+    payload = action.get("payload") if isinstance(action.get("payload"), dict) else {}
+    anchors: list[str] = []
+    for key in ("iso", "name_zh"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            anchors.append(value)
+    target = payload.get("target")
+    if isinstance(target, dict):
+        for key in ("id", "label"):
+            value = target.get(key)
+            if isinstance(value, str) and value:
+                anchors.append(value)
+    options = payload.get("options")
+    if isinstance(options, list):
+        for item in options:
+            if isinstance(item, dict) and isinstance(item.get("label"), str):
+                anchors.append(item["label"])
+    candidate_details = payload.get("candidate_details")
+    if isinstance(candidate_details, list):
+        for item in candidate_details[:3]:
+            if isinstance(item, dict):
+                for key in ("iso", "name_zh"):
+                    value = item.get(key)
+                    if isinstance(value, str) and value:
+                        anchors.append(value)
+    return list(dict.fromkeys(anchors))
+
+
+def narration_matches_action(message: str | None, action: object) -> bool:
+    """Require narration to preserve the deterministic action's surface semantics."""
+
+    if not isinstance(message, str) or not message.strip():
+        return False
+    payload = action if isinstance(action, dict) else {}
+    kind = str(payload.get("kind") or "")
+    if kind in _QUESTION_ACTION_KINDS:
+        if not any(marker in message for marker in _QUESTION_MARKERS):
+            return False
+        themes = _question_theme_terms(payload)
+        return bool(themes) and any(theme in message for theme in themes)
+    if kind in {"result", "confirm", "done"}:
+        anchors = _narration_anchors(payload)
+        if anchors and not any(anchor in message for anchor in anchors):
+            return False
+    return True
 
 
 EXTRACT_SYSTEM_PROMPT = """你是照片定位对话的线索抽取器，只做结构化抽取，不寒暄、不解释。
@@ -86,11 +262,16 @@ class DeepSeekClient:
                      for c in context.get("clues", [])[-20:]
                      if isinstance(c, dict) and c.get("dimension") in DIMENSIONS and isinstance(c.get("value"), str)]
             action = context.get("action") or {}
-            payload = action.get("payload") or {}
-            safe = {"action": {"kind": action.get("kind"), "message": self._redact(action.get("message", ""), 1000),
-                               "payload": {k: payload[k] for k in ("dimensions", "candidates", "iso", "name_zh", "score") if k in payload}},
-                    "scores": [{k: c.get(k) for k in ("iso", "name_zh", "score", "raw_cosine", "score_type")}
-                               for c in context.get("scores", [])[:5] if isinstance(c, dict)],
+            safe = {"action": {
+                        "kind": action.get("kind"),
+                        "message": self._redact(action.get("message", ""), 1000),
+                        "payload": _safe_action_payload(action.get("payload")),
+                    },
+                    "scores": [
+                        row for row in (
+                            _safe_score_row(c) for c in context.get("scores", [])[:5]
+                        ) if row
+                    ],
                     "clues": clues,
                     "feedback": self._redact(context.get("feedback", "")),
                     "history": [{"role": m.get("role"), "content": self._redact(m.get("content", ""), 600)}

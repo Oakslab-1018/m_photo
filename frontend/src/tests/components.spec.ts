@@ -131,6 +131,28 @@ describe('FeedbackBar rendering (SSR)', () => {
     expect(html).toContain('不是这里')
     expect(html).not.toContain('option-chip')
   })
+
+  it('renders confidence tier and direct-result state', async () => {
+    const confidence = {
+      tier: 'high',
+      action: 'direct_top1',
+      model_only_margin: 0.03,
+      fused_margin: 0.02,
+      effective_margin: 0.02,
+      prior_top_iso: 'JP',
+      top1_iso: 'JP',
+      top3: [],
+      leader_changed: false,
+      reason: 'stable',
+      policy_version: 'test',
+    }
+    const html = await render(FeedbackBar, {
+      action: { kind: 'result', payload: { iso: 'JP', confidence } },
+      busy: false,
+    })
+    expect(html).toContain('高置信：已给出最佳匹配')
+    expect(html).toContain('已给出高置信国家判断，仍需您明确确认')
+  })
 })
 
 describe('ChatLog rendering (SSR)', () => {

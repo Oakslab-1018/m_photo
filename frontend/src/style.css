@@ -481,6 +481,71 @@ textarea.chat-input { resize: none; max-height: 96px; overflow-y: auto; line-hei
   padding: 8px 10px; display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 11px;
 }
 .guided-backtrack-confirm > div { display: flex; gap: 5px; flex-shrink: 0; }
+.guided-confidence-result {
+  border: 1px solid var(--primary);
+  border-radius: var(--radius-sm);
+  background: linear-gradient(180deg, var(--primary-soft), #fff);
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  box-shadow: 0 0 0 2px var(--primary-soft);
+}
+.guided-confidence-result.is-candidates {
+  border-color: var(--city);
+  background: linear-gradient(180deg, var(--city-soft), #fff);
+  box-shadow: 0 0 0 2px rgba(217, 119, 6, 0.1);
+}
+.guided-confidence-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+.guided-confidence-head > div { display: flex; flex-direction: column; gap: 2px; }
+.guided-confidence-kicker {
+  color: var(--primary);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+.guided-confidence-result.is-candidates .guided-confidence-kicker { color: var(--warn); }
+.guided-confidence-head strong { color: var(--ink); font-size: 15px; }
+.guided-confidence-note {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: #fff;
+  color: var(--ink-soft);
+  font-size: 10px;
+  padding: 2px 8px;
+  white-space: nowrap;
+}
+.guided-confidence-explanation {
+  color: var(--ink-soft);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.guided-confidence-card { background: #fff; }
+.guided-confidence-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 9px;
+  border-top: 1px dashed var(--border);
+  padding-top: 7px;
+}
+.guided-confidence-actions span { color: var(--muted); font-size: 10px; line-height: 1.5; }
+.guided-low-confidence-note {
+  border: 1px solid #f0d9b5;
+  border-radius: var(--radius-sm);
+  background: var(--city-soft);
+  padding: 8px 9px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.guided-low-confidence-note strong { color: var(--warn); font-size: 12px; }
+.guided-low-confidence-note span { color: var(--ink-soft); font-size: 11px; line-height: 1.5; }
 .guided-question {
   border: 1px solid var(--primary); border-radius: var(--radius-sm); background: #fff;
   padding: 10px; display: flex; flex-direction: column; gap: 6px; box-shadow: 0 0 0 2px var(--primary-soft);

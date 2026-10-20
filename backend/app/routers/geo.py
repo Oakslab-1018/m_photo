@@ -165,6 +165,7 @@ def upload_image(
                 clues=clues,
                 scores=scores,
                 action=result.get("action"),
+                confidence=result.get("confidence"),
                 inference_notice=inference_notice,
                 messages=geo.list_messages(geo_session.id),
             )
@@ -205,6 +206,7 @@ def submit_feedback(
         response = FeedbackResponse(
             scores=result.get("scores") or [],
             action=result.get("action"),
+            confidence=result.get("confidence"),
             messages=geo.list_messages(session_id),
             clues=session.clues if session else [],
             exclusions=session.exclusions if session else [],
@@ -551,11 +553,13 @@ def _point_response_from_report(
     applied: bool,
 ) -> AnalyzePointResponse:
     scores, action = _latest_ai_state(messages)
+    confidence = ((action or {}).get("payload") or {}).get("confidence")
     report_payload = {**report, "dedupe": dedupe}
     response = AnalyzePointResponse(
         new_clues=[],
         scores=scores,
         action=action,
+        confidence=confidence,
         messages=messages,
         clues=session.clues if session else [],
         exclusions=session.exclusions if session else [],
@@ -731,6 +735,7 @@ def analyze_point(
             new_clues=new_clues,
             scores=result.get("scores") or [],
             action=result.get("action"),
+            confidence=result.get("confidence"),
             messages=geo.list_messages(session_id),
             clues=session.clues if session else [],
             exclusions=session.exclusions if session else [],

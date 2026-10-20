@@ -3,6 +3,7 @@ import {
   type AnalyzePointRequest,
   type ChatMessage,
   type CitiesResponse,
+  type ConfidenceRoute,
   type CountriesResponse,
   type Country,
   type FeedbackPayload,
@@ -28,6 +29,19 @@ function isRecord(value: unknown): value is JsonRecord {
 
 function asArray<T>(value: unknown): T[] {
   return Array.isArray(value) ? (value as T[]) : []
+}
+
+function asConfidenceRoute(value: unknown): ConfidenceRoute | null {
+  if (!isRecord(value) || !Array.isArray(value.top3)) return null
+  if (value.tier !== 'high' && value.tier !== 'medium' && value.tier !== 'low') return null
+  if (
+    value.action !== 'direct_top1' &&
+    value.action !== 'confirm_candidates' &&
+    value.action !== 'ask_clue'
+  ) {
+    return null
+  }
+  return value as unknown as ConfidenceRoute
 }
 
 function asMessage(value: unknown): ChatMessage | null {
@@ -106,6 +120,7 @@ export class GeoApi {
       clues: asArray(raw.clues),
       scores: asArray(raw.scores),
       action: isRecord(raw.action) ? (raw.action as unknown as UploadResponse['action']) : null,
+      confidence: asConfidenceRoute(raw.confidence),
       messages: asArray(raw.messages).map(asMessage).filter((item): item is ChatMessage => item !== null),
       inference_notice:
         typeof raw.inference_notice === 'string' && raw.inference_notice.trim()

@@ -2,7 +2,13 @@ import { createSSRApp } from 'vue'
 import { renderToString } from '@vue/server-renderer'
 import { describe, expect, it } from 'vitest'
 import GuidedDialoguePanel from '@/components/GuidedDialoguePanel.vue'
-import type { GuidedDialogue, LocationCandidate, LocationTarget, ReviewedClue } from '@/types'
+import type {
+  ConfidenceRoute,
+  GuidedDialogue,
+  LocationCandidate,
+  LocationTarget,
+  ReviewedClue,
+} from '@/types'
 import { safeGuidedReceipt, safeGuidedText } from '@/utils/guided'
 
 const japan: LocationTarget = { level: 'country', id: 'JP', label: '日本', country_iso: 'JP' }
@@ -46,6 +52,27 @@ function dialogue(overrides: Partial<GuidedDialogue> = {}): GuidedDialogue {
     clues: [],
     pending_question: null,
     ...overrides,
+  }
+}
+
+function confidence(
+  tier: ConfidenceRoute['tier'],
+  action: ConfidenceRoute['action'],
+  isos: string[],
+): ConfidenceRoute {
+  return {
+    tier,
+    action,
+    top3: isos.map((iso, index) => ({
+      iso,
+      name: iso,
+      name_zh: iso,
+      score: 0.9 - index * 0.01,
+      score_type: 'country_rank',
+    })),
+    leader_changed: false,
+    reason: '不应在界面展示的内部排序说明',
+    policy_version: 'test',
   }
 }
 
@@ -513,5 +540,231 @@ describe('guided audit text', () => {
     expect(safeGuidedText('已回退到city阶段。')).toContain('城市')
     expect(safeGuidedText('请复核线索：building=generic。')).toContain('普通 / 不明显')
     expect(safeGuidedText('请复核线索：building=generic。')).not.toContain('generic')
+  })
+})
+
+describe('GuidedDialoguePanel country confidence tiers', () => {
+  it('renders high top1 with the authoritative explanation and explicit confirmation only', async () => {
+    const html = await render(
+      dialogue({
+        clues: [clue('routine', 'ja')],
+        pending_question: {
+          id: 'routine-review',
+          kind: 'review_clue',
+          clue_id: 'routine',
+          message: '这条常规观察准确吗？',
+        },
+      }),
+      [],
+      {
+        action: { kind: 'result', message: '服务器说明：首选日本，请结合照片确认。' },
+        confidence: confidence('high', 'direct_top1', ['JP', 'CN', 'US']),
+        confidenceShortcut: 'high',
+        confidenceCandidates: [
+          { target: japan, score: 0.9, reason: '国家模型排序第一' },
+          { target: { level: 'country', id: 'CN', label: '中国', country_iso: 'CN' }, score: 0.89 },
+          { target: { level: 'country', id: 'US', label: '美国', country_iso: 'US' }, score: 0.7 },
+        ],
+        locationConfirmationReady: true,
+      },
+    )
+
+    expect(html).toContain('推荐国家 / 地区')
+    expect(html).toContain('服务器说明：首选日本，请结合照片确认。')
+    expect(html).toContain('可继续细化省市')
+    expect(html).toContain('日本')
+    expect(html).toContain('国家模型排序第一')
+    expect(html).toContain('补充线索细化')
+    expect(html).toContain('确认国家 / 地区')
+    expect(html).toContain('这是当前国家预测；如需继续定位省市，可确认该国家后进入下一步。')
+    expect(html).not.toContain('仍需要您明确确认')
+    expect(html).not.toContain('这条常规观察准确吗')
+    expect(html).not.toContain('下一步：查看国家 / 地区候选')
+    expect(html).not.toContain('中国')
+    expect(html).not.toContain('美国')
+    expect(html).not.toContain('不应在界面展示的内部排序说明')
+    expect(html).not.toContain('model-only')
+    expect(html).not.toContain('0.02')
+    expect(html.match(/guided-confidence-card/g)).toHaveLength(1)
+  })
+
+  it('renders up to three medium candidates with the server explanation and explicit actions', async () => {
+    const html = await render(
+      dialogue({
+        pending_question: {
+          id: 'routine-review',
+          kind: 'review_clue',
+          clue_id: 'routine',
+          message: '这条常规观察准确吗？',
+        },
+      }),
+      [],
+      {
+        action: { kind: 'confirm', message: '服务器说明：日本、中国、美国较接近。' },
+        confidence: confidence('medium', 'confirm_candidates', ['JP', 'CN', 'US', 'FR']),
+        confidenceShortcut: 'candidates',
+        confidenceCandidates: [
+          { target: japan, score: 0.8 },
+          { target: { level: 'country', id: 'CN', label: '中国', country_iso: 'CN' }, score: 0.79 },
+          { target: { level: 'country', id: 'US', label: '美国', country_iso: 'US' }, score: 0.7 },
+          { target: { level: 'country', id: 'FR', label: '法国', country_iso: 'FR' }, score: 0.6 },
+        ],
+        locationConfirmationReady: true,
+      },
+    )
+
+    expect(html).toContain('国家 / 地区候选待确认')
+    expect(html).toContain('服务器说明：日本、中国、美国较接近。')
+    expect(html).toContain('日本')
+    expect(html).toContain('中国')
+    expect(html).toContain('美国')
+    expect(html).not.toContain('法国')
+    expect(html).not.toContain('这条常规观察准确吗')
+    expect(html.match(/guided-confidence-card/g)).toHaveLength(3)
+    expect(html.match(/class="mini-btn confirm"/g)).toHaveLength(3)
+    expect(html).toContain('请从以上候选中明确确认国家；确认后会进入下一级，未确认前不会推进。')
+  })
+
+  it('keeps low confidence on the single question and free-text path', async () => {
+    const html = await render(
+      dialogue({
+        pending_question: {
+          id: 'low-question',
+          kind: 'ask',
+          dimension: 'signage',
+          message: '画面中是否有清晰的招牌文字？',
+          options: [
+            { value: 'clear_sign', label: '有清晰招牌文字' },
+            { value: 'no_sign', label: '没有清晰文字' },
+          ],
+        },
+      }),
+      [],
+      {
+        action: {
+          kind: 'ask',
+          message: '我注意到画面里可能有文字，请先确认能否看清招牌内容。',
+          payload: {
+            question_id: 'low-question',
+            question_kind: 'ask',
+            dimension: 'signage',
+          },
+        },
+        confidence: confidence('low', 'ask_clue', ['JP', 'CN', 'US']),
+        confidenceShortcut: null,
+        confidenceCandidates: [],
+      },
+    )
+
+    expect(html).toContain('当前信息不足，先补充可观察线索')
+    expect(html).toContain('问题说明：')
+    expect(html).not.toContain('LLM 解释当前问题')
+    expect(html).toContain('我注意到画面里可能有文字，请先确认能否看清招牌内容。')
+    expect(html).toContain('画面中是否有清晰的招牌文字？')
+    expect(html).toContain('有清晰招牌文字')
+    expect(html).toContain('没有清晰文字')
+    expect(html).toContain('提交后会重新比较国家候选')
+    expect(html).toContain('搜索 / 提交文字')
+    expect(html).toContain('type="text"')
+    expect(html).not.toContain('guided-confidence-card')
+    expect(html).not.toContain('class="mini-btn confirm"')
+  })
+
+  it('falls back to the deterministic low question when action metadata does not match', async () => {
+    const pending = {
+      id: 'low-question',
+      kind: 'ask' as const,
+      dimension: 'signage',
+      message: '画面中是否有清晰的招牌文字？',
+    }
+    const staleId = await render(dialogue({ pending_question: pending }), [], {
+      action: {
+        kind: 'ask',
+        message: '这条来自旧问题的 LLM 说明不应显示。',
+        payload: {
+          question_id: 'stale-question',
+          question_kind: 'ask',
+          dimension: 'signage',
+        },
+      },
+      confidence: confidence('low', 'ask_clue', ['JP', 'CN', 'US']),
+    })
+    const mismatchedKind = await render(dialogue({ pending_question: pending }), [], {
+      action: {
+        kind: 'ask',
+        message: '这条类型不匹配的 LLM 说明不应显示。',
+        payload: {
+          question_id: 'low-question',
+          question_kind: 'request_clue',
+          dimension: 'signage',
+        },
+      },
+      confidence: confidence('low', 'ask_clue', ['JP', 'CN', 'US']),
+    })
+    const nonLow = await render(dialogue({ pending_question: pending }), [], {
+      action: {
+        kind: 'ask',
+        message: '高置信路由不应显示低置信问题说明。',
+        payload: {
+          question_id: 'low-question',
+          question_kind: 'ask',
+          dimension: 'signage',
+        },
+      },
+      confidence: confidence('medium', 'confirm_candidates', ['JP', 'CN', 'US']),
+    })
+
+    expect(staleId).not.toContain('这条来自旧问题的 LLM 说明不应显示。')
+    expect(staleId).toContain('画面中是否有清晰的招牌文字？')
+    expect(mismatchedKind).not.toContain('这条类型不匹配的 LLM 说明不应显示。')
+    expect(mismatchedKind).toContain('画面中是否有清晰的招牌文字？')
+    expect(nonLow).not.toContain('高置信路由不应显示低置信问题说明。')
+    expect(nonLow).not.toContain('问题说明：')
+  })
+
+  it('offers backend-authorized exhausted-low top3 as optional manual confirmation', async () => {
+    const html = await render(
+      dialogue(),
+      [],
+      {
+        action: { kind: 'confirm', message: '线索不足时的候选，请仅在能够确认时选择。' },
+        confidence: confidence('low', 'confirm_candidates', ['JP', 'CN', 'US']),
+        confidenceShortcut: 'candidates',
+        confidenceCandidates: [
+          { target: japan, score: 0.7 },
+          { target: { level: 'country', id: 'CN', label: '中国', country_iso: 'CN' }, score: 0.69 },
+          { target: { level: 'country', id: 'US', label: '美国', country_iso: 'US' }, score: 0.5 },
+        ],
+        locationConfirmationReady: true,
+      },
+    )
+
+    expect(html).toContain('候选仅供参考')
+    expect(html).toContain('仅在能够确认时选择')
+    expect(html).toContain('线索不足时的候选，请仅在能够确认时选择。')
+    expect(html.match(/guided-confidence-card/g)).toHaveLength(3)
+    expect(html.match(/class="mini-btn confirm"/g)).toHaveLength(3)
+    expect(html).toContain('这些只是线索不足时的可选候选；仅在能够确认时选择，未确认前不会推进。')
+  })
+
+  it('does not inherit a country confidence shortcut below country stage', async () => {
+    const html = await render(
+      dialogue({
+        stage: 'admin1',
+        confirmed: { country: japan, admin1: null, city: null },
+      }),
+      [],
+      {
+        action: { kind: 'result', message: '不应继承的国家结果。' },
+        confidence: confidence('high', 'direct_top1', ['JP', 'CN', 'US']),
+        confidenceShortcut: 'high',
+        confidenceCandidates: [{ target: japan, score: 0.9 }],
+        locationConfirmationReady: true,
+      },
+    )
+
+    expect(html).not.toContain('推荐国家 / 地区')
+    expect(html).not.toContain('不应继承的国家结果')
+    expect(html).not.toContain('guided-confidence-card')
   })
 })

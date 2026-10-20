@@ -2,6 +2,7 @@ import { computed, ref, watch, type Ref } from 'vue'
 import { api } from '@/api'
 import { ApiError, normalizeApiError } from '@/api/errors'
 import type {
+  ConfidenceRoute,
   GuidedDialogue,
   GuidedDialogueResponse,
   GuidedEventPayload,
@@ -10,6 +11,7 @@ import type {
   GuidedPhase,
   GuidedQuestion,
   GuidedTargetRef,
+  HypothesisAction,
   LocationCandidate,
   LocationTarget,
   ReviewedClue,
@@ -17,6 +19,8 @@ import type {
 import { normalizeIsoCode } from '@/utils/geo'
 import {
   canUnlockReviewedRankings,
+  confidenceCountryCandidates,
+  countryConfidenceShortcut,
   guidedCurrentReviewClue,
   guidedPreviousLevel,
   guidedReviewProgress,
@@ -129,6 +133,8 @@ export function useGuidedDialogue(
   const conflict = ref<string | null>(null)
   const dialogue = ref<GuidedDialogue | null>(null)
   const candidates = ref<LocationCandidate[]>([])
+  const action = ref<HypothesisAction | null>(null)
+  const confidence = ref<ConfidenceRoute | null>(null)
   const receipt = ref<GuidedEventReceipt | null>(null)
   const failedEvent = ref<GuidedEventPayload | null>(null)
   const failedQuestion = ref<GuidedQuestion | null>(null)
@@ -146,6 +152,8 @@ export function useGuidedDialogue(
   const phase = ref<GuidedPhase>('review')
   /** Successfully reviewed clue ids in review order; drives 返回上一条观察. */
   const reviewHistory = ref<string[]>([])
+  /** Explicit user re-review must not be bypassed by a country confidence route. */
+  const explicitReviewIntent = ref(false)
 
   const pendingQuestion = computed<GuidedQuestion | null>(
     () => dialogue.value?.pending_question ?? null,
@@ -178,14 +186,44 @@ export function useGuidedDialogue(
       phase.value === 'candidates' &&
       rankingsUnlocked.value,
   )
-  const locationConfirmationReady = computed(
-    () => candidatesVisible.value && !hasPendingClues.value,
-  )
   /** Only the five visible server candidates can be selected or confirmed. */
   const topCandidates = computed(() => {
     const current = dialogue.value
     if (!current || current.stage === 'resolved' || !candidatesVisible.value) return []
     return selectTopGuidedCandidates(candidates.value, current.stage)
+  })
+  const confidenceShortcut = computed(() =>
+    countryConfidenceShortcut(
+      dialogue.value,
+      action.value,
+      confidence.value,
+      Boolean(conflict.value || explicitReviewIntent.value),
+    ),
+  )
+  const confidenceCandidates = computed(() => {
+    const mode = confidenceShortcut.value
+    if (!mode) return []
+    return confidenceCountryCandidates(
+      confidence.value,
+      candidates.value,
+      mode === 'high' ? 1 : 3,
+    )
+  })
+  const locationConfirmationReady = computed(
+    () =>
+      !conflict.value &&
+      (
+        (confidenceShortcut.value !== null && confidenceCandidates.value.length > 0) ||
+        (candidatesVisible.value && !hasPendingClues.value)
+      ),
+  )
+  /** Every explicit country action surface, including immediate confidence cards. */
+  const actionableCandidates = computed(() => {
+    const byKey = new Map<string, LocationCandidate>()
+    for (const candidate of [...topCandidates.value, ...confidenceCandidates.value]) {
+      byKey.set(candidate.target.level + ':' + candidate.target.id, candidate)
+    }
+    return [...byKey.values()]
   })
   /** Level targeted by the prominent admin1/city/resolved 返回上一步 button. */
   const previousLevel = computed<GuidedLocationLevel | null>(() =>
@@ -212,6 +250,8 @@ export function useGuidedDialogue(
     conflict.value = null
     dialogue.value = null
     candidates.value = []
+    action.value = null
+    confidence.value = null
     receipt.value = null
     failedEvent.value = null
     failedQuestion.value = null
@@ -221,6 +261,7 @@ export function useGuidedDialogue(
     recentClueIds.value = []
     phase.value = 'review'
     reviewHistory.value = []
+    explicitReviewIntent.value = false
   }
 
   function unlockCompletedStages(value: GuidedDialogue): void {
@@ -259,6 +300,8 @@ export function useGuidedDialogue(
     const previousIds = new Set(previous?.clues.map((clue) => clue.id) ?? [])
     dialogue.value = response.dialogue
     candidates.value = [...(response.candidates ?? [])]
+    action.value = response.action ?? null
+    confidence.value = response.confidence ?? null
     recentClueIds.value = previous
       ? response.dialogue.clues
           .filter((clue) => !previousIds.has(clue.id))
@@ -269,6 +312,13 @@ export function useGuidedDialogue(
     // back into the single-box review; candidates stay hidden until ready again.
     if (response.dialogue.stage !== 'resolved' && !guidedReviewReady(response.dialogue)) {
       phase.value = 'review'
+    }
+    if (
+      explicitReviewIntent.value &&
+      response.dialogue.stage === 'country' &&
+      guidedReviewReady(response.dialogue)
+    ) {
+      explicitReviewIntent.value = false
     }
     receipt.value = response.receipt ?? null
     options.onSnapshot?.(response)
@@ -327,12 +377,14 @@ export function useGuidedDialogue(
       return false
     }
     phase.value = 'candidates'
+    explicitReviewIntent.value = false
     error.value = null
     return true
   }
 
   /** Candidate phase → review completion (candidates are hidden again). */
   function returnToReview(): void {
+    explicitReviewIntent.value = true
     phase.value = 'review'
     error.value = null
   }
@@ -347,6 +399,7 @@ export function useGuidedDialogue(
       error.value = '还没有可返回的核对记录。'
       return false
     }
+    explicitReviewIntent.value = true
     return retractClue(clueId)
   }
 
@@ -376,6 +429,8 @@ export function useGuidedDialogue(
     conflict.value = null
     dialogue.value = null
     candidates.value = []
+    action.value = null
+    confidence.value = null
     receipt.value = null
     failedEvent.value = null
     failedQuestion.value = null
@@ -384,6 +439,7 @@ export function useGuidedDialogue(
     recentClueIds.value = []
     phase.value = 'review'
     reviewHistory.value = []
+    explicitReviewIntent.value = false
 
     try {
       const response = await client.dialogueStart(target)
@@ -574,7 +630,7 @@ export function useGuidedDialogue(
       }
       if (
         input.target &&
-        !topCandidates.value.some((candidate) => sameTarget(candidate.target, input.target as GuidedTargetRef))
+        !actionableCandidates.value.some((candidate) => sameTarget(candidate.target, input.target as GuidedTargetRef))
       ) {
         error.value = '该地点不在当前前五候选中，请从页面显示的候选重新选择。'
         return Promise.resolve(false)
@@ -628,7 +684,7 @@ export function useGuidedDialogue(
   function targetForCountry(iso: string): LocationTarget | null {
     const code = normalizeIsoCode(iso)
     if (!code) return null
-    const candidate = topCandidates.value.find((item) => {
+    const candidate = actionableCandidates.value.find((item) => {
       if (item.target.level !== 'country') return false
       return [item.target.id, item.target.country_iso, item.target.source_iso]
         .some((value) => normalizeIsoCode(value ?? '') === code)
@@ -751,6 +807,8 @@ export function useGuidedDialogue(
     conflict,
     dialogue,
     candidates,
+    action,
+    confidence,
     receipt,
     pendingQuestion,
     pendingClueCount,
@@ -766,6 +824,9 @@ export function useGuidedDialogue(
     canReviewBack,
     locationConfirmationReady,
     topCandidates,
+    confidenceShortcut,
+    confidenceCandidates,
+    actionableCandidates,
     recentClueIds,
     canRetry,
     start,
