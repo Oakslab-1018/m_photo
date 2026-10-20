@@ -8,8 +8,9 @@ from types import SimpleNamespace
 
 from services.chat import ChatService as LegacyChatService, format_feedback_receipt
 from ..config import Settings
+from ..domain.geolocation.confidence import route_confidence
 from ..domain.geolocation.model_ranking import ModelAwareEngine, ModelAwareHypotheses
-from .deepseek import DeepSeekClient
+from .deepseek import DeepSeekClient, narration_matches_action
 from .model_gateway import StreetClipGateway
 
 logger = logging.getLogger(__name__)
@@ -104,13 +105,86 @@ class ChatService(LegacyChatService):
         self._free_text_plan = None
         return result
 
+    @staticmethod
+    def _apply_confidence_route(result, model_evidence):
+        scores = result.get("scores") or []
+        route = route_confidence(scores, model_evidence).to_dict()
+        action = dict(result.get("action") or {})
+        payload = dict(action.get("payload") or {})
+        top3 = list(route.get("top3") or [])
+        top = top3[0] if top3 else {}
+        payload.update({
+            "confidence": route,
+            "candidate_details": top3,
+            "candidates": [str(item.get("iso")) for item in top3 if item.get("iso")],
+        })
+        if route["tier"] == "high":
+            action = {
+                "kind": "result",
+                "message": (
+                    f"高置信判断：{top.get('name_zh') or top.get('iso') or '候选国家'}。"
+                    "模型全图排序与融合排序方向一致；这是候选排序，不是概率。"
+                ),
+                "payload": {
+                    **payload,
+                    "iso": top.get("iso"),
+                    "name_zh": top.get("name_zh"),
+                    "score": top.get("score"),
+                },
+            }
+        elif route["tier"] == "medium":
+            action = {
+                "kind": "confirm",
+                "message": (
+                    f"候选最可能是「{top.get('name_zh') or top.get('iso') or '未知'}」，"
+                    "但也存在接近候选，请确认或从候选中选择。"
+                ),
+                "payload": {
+                    **payload,
+                    "iso": top.get("iso"),
+                    "name_zh": top.get("name_zh"),
+                    "score": top.get("score"),
+                },
+            }
+        else:
+            dimensions = payload.get("dimensions") or ["language", "place_name", "driving_side"]
+            options = payload.get("options")
+            action = {
+                "kind": "ask" if action.get("kind") in {"ask", "request_clue"} else "request_clue",
+                "message": "当前候选接近，暂不自动确定国家。请补充画面中的语言、招牌文字、道路方向或其他可见线索。",
+                "payload": {
+                    **payload,
+                    "dimensions": dimensions,
+                    "options": options,
+                    "reason": route["reason"],
+                },
+            }
+        result["action"] = action
+        result["confidence"] = route
+        return result
+
+    def _route_and_sync(self, result, session_id):
+        action = result.get("action") or {}
+        if result.get("done") or action.get("kind") == "done" or not self.engine.evidence:
+            result["confidence"] = None
+            return result
+        result = self._apply_confidence_route(result, self.engine.evidence)
+        if self._prepared is None:
+            action = result.get("action") or {}
+            replace = getattr(self.session_service, "replace_last_ai_message", None)
+            if callable(replace) and action.get("message"):
+                replace(session_id, str(action["message"]), action)
+        return result
+
     def initial_analysis(self, session_id):
         self._set_prior(session_id)
-        return self._finish(super().initial_analysis(session_id), session_id)
+        result = super().initial_analysis(session_id)
+        return self._finish(self._route_and_sync(result, session_id), session_id)
 
     def handle_feedback(self, session_id, feedback):
         self._set_prior(session_id)
-        return self._finish(super().handle_feedback(session_id, feedback), session_id)
+        result = super().handle_feedback(session_id, feedback)
+        return self._finish(self._route_and_sync(result, session_id), session_id)
 
     def reason_only(
         self,
@@ -123,8 +197,7 @@ class ChatService(LegacyChatService):
         point_analysis_provider_signature=None,
     ):
         self._set_prior(session_id)
-        return self._finish(
-            super().reason_only(
+        result = super().reason_only(
                 session_id,
                 new_clues,
                 click_pos,
@@ -132,9 +205,8 @@ class ChatService(LegacyChatService):
                 point_analysis_input=point_analysis_input,
                 point_analysis_cacheable=point_analysis_cacheable,
                 point_analysis_provider_signature=point_analysis_provider_signature,
-            ),
-            session_id,
-        )
+            )
+        return self._finish(self._route_and_sync(result, session_id), session_id)
 
     def _prepare(self, snapshot, history, method, *, feedback=None, new_clues=None, click_pos=None):
         self._prepared = None
@@ -157,10 +229,16 @@ class ChatService(LegacyChatService):
             for clue in new_clues or []:
                 memory.add_clue(0, clue)
             result = preview.reason_only(0, new_clues=new_clues, click_pos=click_pos)
+        if snapshot.model_evidence:
+            result = self._apply_confidence_route(result, snapshot.model_evidence)
+        else:
+            result["confidence"] = None
+        if str((result.get("confidence") or {}).get("tier") or "") == "high":
+            return
         message = self.provider.narrate({"action": result.get("action"), "scores": result.get("scores", []),
                                        "clues": memory.row.clues, "history": history,
                                        "feedback": (feedback or {}).get("text", "")})
-        if message:
+        if message and narration_matches_action(message, result.get("action") or {}):
             self._prepared = (_signature(result), message)
 
     def prepare_initial(self, clues, evidence):

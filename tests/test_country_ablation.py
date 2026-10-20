@@ -28,6 +28,7 @@ class Entry:
 @dataclass
 class FakeScore:
     iso: str
+    score: float | None = None
 
 
 class FakePipeline:
@@ -46,6 +47,14 @@ class FakePipeline:
             "provider": "rapidocr",
             "state": "ok",
             "available": True,
+            "engine": "onnxruntime",
+            "model_type": "server",
+            "model_version": "PP-OCRv5",
+            "models": {
+                "det": "det-server",
+                "rec": "rec-server",
+                "cls": "cls-server",
+            },
             "line_count": 1,
         }
 
@@ -89,7 +98,10 @@ class FakeEngine:
         predicted = self.plan[sample_id][arm]
         if predicted == "FAIL":
             raise RuntimeError("synthetic failure")
-        return [FakeScore(iso) for iso in predicted]
+        return [
+            FakeScore(iso, round(0.9 - index * 0.1, 6))
+            for index, iso in enumerate(predicted)
+        ]
 
 
 def _versions(**overrides: Any) -> dict[str, Any]:
@@ -112,6 +124,7 @@ def _evidence(versions: dict[str, Any], sample_id: str) -> dict[str, Any]:
         "prompt_version": versions["prompt_version"],
         "catalog_revision": versions["catalog_revision"],
         "image_sha256": SHA_A,
+        "provider_status": "ok",
         "rankings": [
             {"iso": "AA", "raw_cosine": 0.9},
             {"iso": "BB", "raw_cosine": 0.8},
@@ -656,3 +669,517 @@ def test_capture_failure_keeps_completed_partial_records(
     assert "1 completed samples preserved" in capsys.readouterr().err
     assert pipeline.analyze_calls == 2
     assert gateway.calls == 1
+
+
+def _recovery_context(
+    entries: list[Entry],
+    versions: dict[str, Any],
+    *,
+    manifest_path: Path,
+    manifest_sha256: str,
+    catalog_sha256: str,
+) -> ea.RecoveryContext:
+    provenance = {
+        "origin": "derived_from_sealed_partial_records",
+        "legacy_semantic_sha256": SHA_A,
+        "legacy_scorer_sha256": SHA_B,
+        "legacy_engine_sha256": SHA_A,
+        "verified_source_root": "D:/source",
+        "verified_eval_helper_sha256": SHA_B,
+    }
+    return ea.RecoveryContext(
+        versions=versions,
+        provenance=provenance,
+        manifest_info={
+            "path": str(manifest_path),
+            "sha256": manifest_sha256,
+            "image_root": str(entries[0].image_path.parent),
+            "selected_ids": [entry.id for entry in entries],
+            "selected_ids_origin": "derived_from_validated_record_order",
+            "selected_ids_sha256": ea._ids_sha256([entry.id for entry in entries]),
+            "manifest_order_prefix": True,
+        },
+        config={
+            "ocr_provider": "rapidocr",
+            "ocr_state": "ok",
+            "ocr_model_type": "server",
+            "ocr_model_version": "PP-OCRv5",
+        },
+        verification={
+            "record_count": len(entries),
+            "unique_ids": len(entries),
+            "sealed_records": len(entries),
+            "raw_image_hashes_verified": len(entries),
+            "model_evidence_verified": len(entries),
+            "manifest_order_prefix": True,
+            "manifest_sha256": manifest_sha256,
+            "catalog_file_sha256": catalog_sha256,
+            "source_root": "D:/source",
+            "source_hashes": {
+                "semantic": SHA_A,
+                "scorer": SHA_B,
+                "engine": SHA_A,
+                "eval_helper": SHA_B,
+            },
+            "current_versions": versions,
+            "observed_config": {},
+            "limitations": ["derived test cache"],
+        },
+    )
+
+
+def test_recover_partial_writes_derived_cache_and_preserves_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    entries = [_make_entry(tmp_path, "s1", "US"), _make_entry(tmp_path, "s2", "JP")]
+    records, _, _, versions = _capture(tmp_path, entries)
+    partial = tmp_path / "cache.jsonl.partial"
+    partial.write_text(
+        "".join(json.dumps(record, sort_keys=True) + "\n" for record in records),
+        encoding="utf-8",
+    )
+    source_before = partial.read_bytes()
+    manifest_path = tmp_path / "manifest.jsonl"
+    manifest_path.write_text('{"id":"s1"}\n', encoding="utf-8")
+    catalog_path = tmp_path / "catalog.sqlite3"
+    catalog_path.write_bytes(b"catalog")
+    context = _recovery_context(
+        entries,
+        versions,
+        manifest_path=manifest_path,
+        manifest_sha256=ea._sha256_file(manifest_path),
+        catalog_sha256=ea._sha256_file(catalog_path),
+    )
+    monkeypatch.setattr(ea, "_load_recovery_context", lambda args, rows: context)
+    monkeypatch.setattr(
+        ea,
+        "_source_hashes",
+        lambda root: context.verification["source_hashes"],
+    )
+    output = tmp_path / "recovered"
+    args = SimpleNamespace(
+        partial=str(partial),
+        expected_sha256=ea._sha256_file(partial),
+        expected_count=2,
+        source_root="D:/source",
+        manifest=str(manifest_path),
+        image_root=None,
+        catalog_db=str(catalog_path),
+        output=str(output),
+    )
+
+    assert ea._recover_command(args) == 0
+    assert partial.read_bytes() == source_before
+    assert (output / ea.CACHE_FILENAME).read_bytes() == source_before
+    recovered, meta = ea.load_cache(output)
+    assert len(recovered) == 2
+    assert meta["kind"] == ea.RECOVERED_META_KIND
+    assert meta["recovery"]["derived_meta"] is True
+    assert meta["recovery"]["original_meta_available"] is False
+    assert "source_root" not in meta
+    audit = json.loads((output / ea.RECOVERY_AUDIT_FILENAME).read_text(encoding="utf-8"))
+    assert audit["source"]["line_count"] == 2
+    assert audit["source"]["original_meta_available"] is False
+
+
+def test_recovered_cache_rejects_tampered_audit_and_bad_expectations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    entry = _make_entry(tmp_path, "s1", "US")
+    records, _, _, versions = _capture(tmp_path, [entry])
+    partial = tmp_path / "cache.jsonl.partial"
+    partial.write_text(json.dumps(records[0], sort_keys=True) + "\n", encoding="utf-8")
+    manifest_path = tmp_path / "manifest.jsonl"
+    manifest_path.write_text('{"id":"s1"}\n', encoding="utf-8")
+    catalog_path = tmp_path / "catalog.sqlite3"
+    catalog_path.write_bytes(b"catalog")
+    context = _recovery_context(
+        [entry],
+        versions,
+        manifest_path=manifest_path,
+        manifest_sha256=ea._sha256_file(manifest_path),
+        catalog_sha256=ea._sha256_file(catalog_path),
+    )
+    monkeypatch.setattr(ea, "_load_recovery_context", lambda args, rows: context)
+    monkeypatch.setattr(ea, "_source_hashes", lambda root: context.verification["source_hashes"])
+    args = SimpleNamespace(
+        partial=str(partial),
+        expected_sha256=ea._sha256_file(partial),
+        expected_count=1,
+        source_root="D:/source",
+        manifest=str(manifest_path),
+        image_root=None,
+        catalog_db=str(catalog_path),
+        output=str(tmp_path / "recovered"),
+    )
+    assert ea._recover_command(args) == 0
+    audit_path = tmp_path / "recovered" / ea.RECOVERY_AUDIT_FILENAME
+    audit_path.write_text(audit_path.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    with pytest.raises(ea.AblationError, match="audit hash"):
+        ea.load_cache(tmp_path / "recovered")
+
+    bad = SimpleNamespace(**vars(args))
+    bad.output = str(tmp_path / "wrong-hash")
+    bad.expected_sha256 = "0" * 64
+    with pytest.raises(ea.AblationError, match="sha256 does not match"):
+        ea._recover_command(bad)
+    assert not (tmp_path / "wrong-hash").exists()
+
+    bad_count = SimpleNamespace(**vars(args))
+    bad_count.output = str(tmp_path / "wrong-count")
+    bad_count.expected_count = 2
+    with pytest.raises(ea.AblationError, match="does not match expected"):
+        ea._recover_command(bad_count)
+    assert not (tmp_path / "wrong-count").exists()
+
+
+def test_margin_diagnostics_reports_false_high_and_leader_change() -> None:
+    def arm(rank: int, top: str, margin: float) -> dict[str, Any]:
+        return {"rank": rank, "top5": [top], "margin": margin}
+
+    rows = [
+        {
+            "id": "correct",
+            "arms": {
+                "model_only": arm(1, "US", 0.05),
+                "legacy_ocr": arm(1, "US", 0.04),
+                "revised_ocr": arm(1, "US", 0.04),
+            },
+        },
+        {
+            "id": "false-high",
+            "arms": {
+                "model_only": arm(2, "CA", 0.05),
+                "legacy_ocr": arm(2, "CA", 0.03),
+                "revised_ocr": arm(2, "CA", 0.03),
+            },
+        },
+        {
+            "id": "leader-change",
+            "arms": {
+                "model_only": arm(1, "US", 0.05),
+                "legacy_ocr": arm(2, "CA", 0.05),
+                "revised_ocr": arm(2, "CA", 0.05),
+            },
+        },
+    ]
+
+    diagnostics = ea._margin_diagnostics(rows, high=0.02, medium=0.005)
+    legacy = diagnostics["arms"]["legacy_ocr"]
+    assert legacy["high_eligible"] == 2
+    assert legacy["false_high"] == 1
+    assert legacy["false_high_ids"] == ["false-high"]
+    assert legacy["high_leader_changed_excluded"] == 1
+    assert legacy["medium_or_better"] == 3
+
+
+def _resume_capture_context(
+    entries: list[Entry],
+    versions: dict[str, Any],
+    pipeline: FakePipeline,
+    gateway: FakeGateway,
+) -> ea.CaptureContext:
+    return ea.CaptureContext(
+        entries=entries,
+        pipeline=pipeline,
+        gateway=gateway,
+        version_info=versions,
+        provenance=_provenance(),
+        manifest_info={
+            "path": "manifest.jsonl",
+            "sha256": "c" * 64,
+            "image_root": str(entries[0].image_path.parent),
+            "selected_ids": [entry.id for entry in entries],
+        },
+        config_info={
+            "ocr_provider": "rapidocr",
+            "ocr_model_type": "server",
+            "geo_ai_mode": "mock",
+            "streetclip_enabled": True,
+            "allow_unlabeled_country": True,
+            "deepseek_api_key_blank": True,
+        },
+        preflight=None,
+    )
+
+
+def _stable_capture_snapshot() -> dict[str, Any]:
+    return {
+        "captured_at": "2026-10-20T00:00:00+00:00",
+        "source_root": "D:/source",
+        "source_files": {"scripts/eval_country_ablation.py": SHA_A},
+        "catalog": {"path": "catalog.sqlite3", "sha256": SHA_B},
+        "manifest": {"path": "manifest.jsonl", "sha256": "c" * 64},
+    }
+
+
+def test_resume_reuses_prefix_without_calls_and_final_cache_replays(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    entries = [_make_entry(tmp_path, "s1", "US"), _make_entry(tmp_path, "s2", "JP")]
+    prefix_records, _, _, versions = _capture(tmp_path, entries[:1])
+    source_cache = tmp_path / "source-cache"
+    _write_cache(source_cache, entries[:1], prefix_records, versions)
+    source_before = (source_cache / ea.CACHE_FILENAME).read_bytes()
+
+    pipeline = FakePipeline(_legacy_clues())
+    gateway = FakeGateway(lambda image_path: _evidence(versions, image_path.stem))
+    context = _resume_capture_context(entries, versions, pipeline, gateway)
+    monkeypatch.setattr(ea, "_load_capture_context", lambda args: context)
+    monkeypatch.setattr(ea, "_capture_input_snapshot", lambda args, root: _stable_capture_snapshot())
+    output = tmp_path / "resumed"
+    args = SimpleNamespace(
+        output=str(output),
+        progress_json=str(output / ea.PROGRESS_FILENAME),
+        resume_from=str(source_cache),
+        source_root="D:/source",
+        manifest="manifest.jsonl",
+        catalog_db="catalog.sqlite3",
+        ids=None,
+        limit=None,
+    )
+
+    assert ea._capture_command(args) == 0
+    assert pipeline.analyze_calls == 1
+    assert pipeline.status_calls == 1
+    assert gateway.calls == 1
+    assert (source_cache / ea.CACHE_FILENAME).read_bytes() == source_before
+    records, meta = ea.load_cache(output)
+    assert [record["id"] for record in records] == ["s1", "s2"]
+    assert records[0] == prefix_records[0]
+    assert meta["resume"]["reused_original_llm_mode"] == "unknown"
+    assert meta["config"]["applies_to_records"] == "new_records_only"
+    assert meta["provenance"]["capture_script_applies_to_records"] == "new_records_only"
+    progress = json.loads((output / ea.PROGRESS_FILENAME).read_text(encoding="utf-8"))
+    assert progress["status"] == "completed"
+    assert progress["completed"] == 2
+    checkpoint = json.loads((output / ea.RESUME_CHECKPOINT_FILENAME).read_text(encoding="utf-8"))
+    assert checkpoint["snapshot_comparison"]["unchanged"] is True
+
+    plan = {
+        "s1": {arm: [entries[0].country_iso or "US"] for arm in ea.ARM_NAMES},
+        "s2": {arm: [entries[1].country_iso or "JP"] for arm in ea.ARM_NAMES},
+    }
+    report = ea.replay_records(records, meta, _replay_context(entries, versions, plan))
+    assert report["denominator"]["attempted_labelled"] == 2
+    assert report["metrics"]["model_only"]["top1"] == 1.0
+
+
+def test_resume_bad_prefix_fails_before_inference(
+    tmp_path: Path,
+) -> None:
+    entries = [_make_entry(tmp_path, "s1", "US"), _make_entry(tmp_path, "s2", "JP")]
+    records, _, _, versions = _capture(tmp_path, entries[:1])
+    pipeline = FakePipeline(_legacy_clues())
+    gateway = FakeGateway(lambda image_path: _evidence(versions, image_path.stem))
+    context = _resume_capture_context(entries, versions, pipeline, gateway)
+
+    duplicate = [records[0], copy.deepcopy(records[0])]
+    with pytest.raises(ea.AblationError, match="duplicate ids"):
+        ea._validate_resume_records(context, duplicate)
+
+    wrong_model = copy.deepcopy(records)
+    wrong_model[0]["model_revision"] = "different"
+    with pytest.raises(ea.AblationError, match="model_revision"):
+        ea._validate_resume_records(context, wrong_model)
+
+    wrong_ocr = copy.deepcopy(records)
+    wrong_ocr[0]["ocr_status"]["model_type"] = "mobile"
+    with pytest.raises(ea.AblationError, match="OCR model type"):
+        ea._validate_resume_records(context, wrong_ocr)
+
+    wrong_source = copy.deepcopy(records)
+    wrong_source[0]["legacy_semantic_sha256"] = SHA_B
+    with pytest.raises(ea.AblationError, match="legacy_semantic_sha256"):
+        ea._validate_resume_records(context, wrong_source)
+
+    assert pipeline.analyze_calls == 0
+    assert pipeline.status_calls == 0
+    assert gateway.calls == 0
+
+
+def test_resume_failure_retains_partial_progress_and_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    entries = [
+        _make_entry(tmp_path, "s1", "US"),
+        _make_entry(tmp_path, "s2", "JP"),
+        _make_entry(tmp_path, "s3", "FR"),
+    ]
+    prefix_records, _, _, versions = _capture(tmp_path, entries[:1])
+    source_cache = tmp_path / "source-cache"
+    _write_cache(source_cache, entries[:1], prefix_records, versions)
+    source_before = (source_cache / ea.CACHE_FILENAME).read_bytes()
+
+    class FailThirdGateway(FakeGateway):
+        def rank_image(self, image_path: str | Path) -> dict[str, Any]:
+            if Path(image_path).stem == "s3":
+                raise RuntimeError("stop for resume test")
+            return super().rank_image(image_path)
+
+    pipeline = FakePipeline(_legacy_clues())
+    gateway = FailThirdGateway(lambda image_path: _evidence(versions, image_path.stem))
+    context = _resume_capture_context(entries, versions, pipeline, gateway)
+    monkeypatch.setattr(ea, "_load_capture_context", lambda args: context)
+    monkeypatch.setattr(ea, "_capture_input_snapshot", lambda args, root: _stable_capture_snapshot())
+    output = tmp_path / "interrupted"
+    args = SimpleNamespace(
+        output=str(output),
+        progress_json=str(output / ea.PROGRESS_FILENAME),
+        resume_from=str(source_cache),
+        source_root="D:/source",
+        manifest="manifest.jsonl",
+        catalog_db="catalog.sqlite3",
+        ids=None,
+        limit=None,
+    )
+
+    with pytest.raises(RuntimeError, match="stop for resume test"):
+        ea._capture_command(args)
+    partial = output / (ea.CACHE_FILENAME + ".partial")
+    assert partial.is_file()
+    assert len(partial.read_text(encoding="utf-8").splitlines()) == 2
+    assert not (output / ea.CACHE_FILENAME).exists()
+    assert not (output / ea.META_FILENAME).exists()
+    checkpoint = json.loads((output / ea.RESUME_CHECKPOINT_FILENAME).read_text(encoding="utf-8"))
+    progress = json.loads((output / ea.PROGRESS_FILENAME).read_text(encoding="utf-8"))
+    assert checkpoint["status"] == "failed"
+    assert checkpoint["completed"] == 2
+    assert checkpoint["snapshot_before"] is not None
+    assert progress["status"] == "failed"
+    assert progress["completed"] == 2
+    assert (source_cache / ea.CACHE_FILENAME).read_bytes() == source_before
+
+
+def test_capture_settings_require_mock_and_blank_deepseek() -> None:
+    ea._validate_capture_settings(SimpleNamespace(geo_ai_mode="mock", deepseek_api_key=""))
+    with pytest.raises(ea.AblationError, match="GEO_AI_MODE=mock"):
+        ea._validate_capture_settings(SimpleNamespace(geo_ai_mode="real", deepseek_api_key=""))
+    with pytest.raises(ea.AblationError, match="blank DEEPSEEK_API_KEY"):
+        ea._validate_capture_settings(SimpleNamespace(geo_ai_mode="mock", deepseek_api_key="set"))
+
+
+def test_resume_keyboard_interrupt_marks_checkpoint_interrupted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    entries = [_make_entry(tmp_path, "s1", "US"), _make_entry(tmp_path, "s2", "JP")]
+    prefix_records, _, _, versions = _capture(tmp_path, entries[:1])
+    source_cache = tmp_path / "source-cache"
+    _write_cache(source_cache, entries[:1], prefix_records, versions)
+
+    class InterruptingGateway(FakeGateway):
+        def rank_image(self, image_path: str | Path) -> dict[str, Any]:
+            raise KeyboardInterrupt
+
+    pipeline = FakePipeline(_legacy_clues())
+    gateway = InterruptingGateway(lambda image_path: _evidence(versions, image_path.stem))
+    context = _resume_capture_context(entries, versions, pipeline, gateway)
+    monkeypatch.setattr(ea, "_load_capture_context", lambda args: context)
+    monkeypatch.setattr(ea, "_capture_input_snapshot", lambda args, root: _stable_capture_snapshot())
+    output = tmp_path / "interrupted-signal"
+    args = SimpleNamespace(
+        output=str(output),
+        progress_json=str(output / ea.PROGRESS_FILENAME),
+        resume_from=str(source_cache),
+        source_root="D:/source",
+        manifest="manifest.jsonl",
+        catalog_db="catalog.sqlite3",
+        ids=None,
+        limit=None,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        ea._capture_command(args)
+    assert len((output / (ea.CACHE_FILENAME + ".partial")).read_text(encoding="utf-8").splitlines()) == 1
+    checkpoint = json.loads((output / ea.RESUME_CHECKPOINT_FILENAME).read_text(encoding="utf-8"))
+    progress = json.loads((output / ea.PROGRESS_FILENAME).read_text(encoding="utf-8"))
+    assert checkpoint["status"] == "interrupted"
+    assert checkpoint["snapshot_before"] is not None
+    assert progress["status"] == "interrupted"
+
+
+def test_source_snapshot_uses_stable_posix_keys(tmp_path: Path) -> None:
+    required = (
+        "scripts/eval_geolocation.py",
+        "scripts/eval_country_ablation.py",
+        "backend/app/services/pipeline.py",
+        "backend/app/services/model_gateway.py",
+        "backend/app/domain/geolocation/model_ranking.py",
+        "backend/app/domain/geolocation/engine.py",
+        "backend/app/domain/geolocation/analysis/semantic.py",
+        "catalog_db.py",
+    )
+    for relative in required:
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("pass\n", encoding="utf-8")
+
+    snapshot = ea._source_snapshot(tmp_path)
+    assert "backend/app/domain/geolocation/analysis/semantic.py" in snapshot
+    assert "scripts/eval_country_ablation.py" in snapshot
+    assert all("\\" not in key for key in snapshot)
+
+
+def test_progress_replace_permission_error_retries_then_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "progress.json"
+    real_replace = ea.os.replace
+    failures = 0
+
+    def flaky_replace(source: str | Path, target: str | Path) -> None:
+        nonlocal failures
+        if Path(target) == path and failures == 0:
+            failures += 1
+            raise PermissionError("temporary lock")
+        real_replace(source, target)
+
+    monkeypatch.setattr(ea.os, "replace", flaky_replace)
+    ok, error_type = ea._progress_json_write(path, {"status": "running", "completed": 1})
+
+    assert ok is True
+    assert error_type is None
+    assert failures == 1
+    assert json.loads(path.read_text(encoding="utf-8"))["completed"] == 1
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_capture_continues_when_progress_replace_permanently_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    entries = [_make_entry(tmp_path, "s1", "US"), _make_entry(tmp_path, "s2", "JP")]
+    prefix_records, _, _, versions = _capture(tmp_path, entries[:1])
+    source_cache = tmp_path / "source-cache"
+    _write_cache(source_cache, entries[:1], prefix_records, versions)
+    pipeline = FakePipeline(_legacy_clues())
+    gateway = FakeGateway(lambda image_path: _evidence(versions, image_path.stem))
+    context = _resume_capture_context(entries, versions, pipeline, gateway)
+    monkeypatch.setattr(ea, "_load_capture_context", lambda args: context)
+    monkeypatch.setattr(ea, "_capture_input_snapshot", lambda args, root: _stable_capture_snapshot())
+    real_replace = ea.os.replace
+
+    def progress_locked(source: str | Path, target: str | Path) -> None:
+        if Path(target).name == ea.PROGRESS_FILENAME:
+            raise PermissionError("reader lock")
+        real_replace(source, target)
+
+    monkeypatch.setattr(ea.os, "replace", progress_locked)
+    output = tmp_path / "telemetry-failure"
+    args = SimpleNamespace(
+        output=str(output),
+        progress_json=str(output / ea.PROGRESS_FILENAME),
+        resume_from=str(source_cache),
+        source_root="D:/source",
+        manifest="manifest.jsonl",
+        catalog_db="catalog.sqlite3",
+        ids=None,
+        limit=None,
+    )
+
+    assert ea._capture_command(args) == 0
+    records, _ = ea.load_cache(output)
+    assert [record["id"] for record in records] == ["s1", "s2"]
+    assert gateway.calls == 1
+    assert "progress warning: telemetry write failed" in capsys.readouterr().err

@@ -1,10 +1,12 @@
 <script setup lang="ts">
 import { computed, nextTick, ref, watch } from 'vue'
 import type {
+  ConfidenceRoute,
   GuidedDialogue,
   GuidedEventReceipt,
   GuidedLocationLevel,
   GuidedPhase,
+  HypothesisAction,
   LocationCandidate,
   LocationTarget,
 } from '@/types'
@@ -27,14 +29,24 @@ import {
   locationLevelLabel,
   reviewedClueText,
   safeGuidedReceipt,
+  safeGuidedText,
   selectTopGuidedCandidates,
   targetLabel,
+  type CountryConfidenceShortcut,
 } from '@/utils/guided'
 
 const props = withDefaults(
   defineProps<{
     dialogue: GuidedDialogue | null
     candidates: LocationCandidate[]
+    /** Country-only confidence route from the same authoritative snapshot. */
+    confidence?: ConfidenceRoute | null
+    /** Action kind must match the confidence action; the panel never re-routes tiers. */
+    action?: HypothesisAction | null
+    /** Precomputed country shortcut from the composable. */
+    confidenceShortcut?: CountryConfidenceShortcut | null
+    /** Server-backed targets selected by the confidence top3 order. */
+    confidenceCandidates?: LocationCandidate[]
     loading?: boolean
     applying?: boolean
     /** Legacy point/feedback/upload work that also mutates server evidence. */
@@ -60,6 +72,10 @@ const props = withDefaults(
     recentClueIds?: string[]
   }>(),
   {
+    confidence: null,
+    action: null,
+    confidenceShortcut: null,
+    confidenceCandidates: () => [],
     loading: false,
     applying: false,
     externalBusy: false,
@@ -99,6 +115,7 @@ const searchText = ref('')
 const backtrackPrompt = ref<GuidedLocationLevel | null>(null)
 const composing = ref(false)
 const panelRef = ref<HTMLElement | null>(null)
+const searchInputRef = ref<HTMLInputElement | null>(null)
 const questionSectionRef = ref<HTMLElement | null>(null)
 const candidateSectionRef = ref<HTMLElement | null>(null)
 
@@ -123,6 +140,69 @@ const blockingQuestion = computed(() =>
 const candidatesPhase = computed(
   () => props.phase === 'candidates' && props.candidatesUnlocked && !isResolved.value,
 )
+/** Immediate country route; lower stages never inherit country confidence. */
+const countryShortcut = computed(() =>
+  stage.value === 'country' ? props.confidenceShortcut ?? null : null,
+)
+const shortcutCandidates = computed(() => {
+  const mode = countryShortcut.value
+  if (!mode || stage.value !== 'country') return []
+  return props.confidenceCandidates.slice(0, mode === 'high' ? 1 : 3)
+})
+const shortcutExplanation = computed(() => {
+  const message = safeGuidedText(props.action?.message)
+  if (message) return message
+  return countryShortcut.value === 'high'
+    ? '模型给出了首选国家，请结合照片确认后再进入下一层级。'
+    : '以下候选较为接近，请结合照片明确选择。'
+})
+const shortcutTitle = computed(() => {
+  if (countryShortcut.value === 'high') return '推荐国家 / 地区'
+  if (props.confidence?.tier === 'low') return '候选仅供参考'
+  return '国家 / 地区候选待确认'
+})
+const shortcutNote = computed(() => {
+  if (countryShortcut.value === 'high') return '可继续细化省市'
+  if (props.confidence?.tier === 'low') return '仅在能够确认时选择'
+  return '请确认最符合照片的候选'
+})
+const shortcutFooter = computed(() => {
+  if (countryShortcut.value === 'high') {
+    return '这是当前国家预测；如需继续定位省市，可确认该国家后进入下一步。'
+  }
+  if (props.confidence?.tier === 'low') {
+    return '这些只是线索不足时的可选候选；仅在能够确认时选择，未确认前不会推进。'
+  }
+  return '请从以上候选中明确确认国家；确认后会进入下一级，未确认前不会推进。'
+})
+const showLowCluePrompt = computed(() => {
+  const kind = pendingQuestion.value?.kind
+  return (
+    stage.value === 'country' &&
+    props.confidence?.tier === 'low' &&
+    !countryShortcut.value &&
+    (kind === 'ask' || kind === 'request_clue')
+  )
+})
+/** Low-country narration is shown only for the exact authoritative question. */
+const narratedLowQuestion = computed(() => {
+  if (
+    countryShortcut.value ||
+    stage.value !== 'country' ||
+    props.confidence?.tier !== 'low'
+  ) {
+    return ''
+  }
+  const question = pendingQuestion.value
+  const action = props.action
+  if (!question || !action) return ''
+  if (question.kind !== 'ask' && question.kind !== 'request_clue') return ''
+  if (action.kind !== question.kind) return ''
+  const payload = action.payload
+  if (payload?.question_id !== question.id || payload?.question_kind !== question.kind) return ''
+  const message = safeGuidedText(action.message).trim()
+  return message && message !== questionMessage.value ? message : ''
+})
 /** Prominent backend backtrack target for admin1/city/resolved. */
 const previousLevel = computed(() => guidedPreviousLevel(props.dialogue?.stage))
 const nextStepLabel = computed(() =>
@@ -179,6 +259,7 @@ const candidateTitle = computed(() => {
 })
 
 const searchLabel = computed(() => {
+  if (countryShortcut.value) return '补充可见线索以细化判断（可选）'
   if (!props.candidatesUnlocked) return '补充可观察线索'
   if (stage.value === 'country') return '输入国家 / 地区名称进行目录检索'
   if (stage.value === 'admin1') return '输入省份 / 地区名称进行目录检索'
@@ -186,6 +267,7 @@ const searchLabel = computed(() => {
 })
 
 const searchPlaceholder = computed(() => {
+  if (countryShortcut.value) return '例如：招牌文字、道路方向、语言或地名'
   if (!props.candidatesUnlocked) return '描述照片中可见的招牌、地名或文字'
   if (stage.value === 'country') return '例如：日本 / Japan'
   if (stage.value === 'admin1') {
@@ -263,6 +345,10 @@ function onSearchEnter(event: KeyboardEvent): void {
 function requestRetry(): void {
   if (busy.value) return
   emit('retry')
+}
+
+function focusFreeText(): void {
+  void nextTick(() => searchInputRef.value?.focus())
 }
 
 function selectCandidate(target: LocationTarget): void {
@@ -391,8 +477,86 @@ watch(stage, (nextStage, previousStage) => {
         </div>
       </div>
 
-      <section v-if="!isResolved" ref="questionSectionRef" class="guided-question">
+      <section
+        v-if="!isResolved && countryShortcut"
+        class="guided-confidence-result"
+        :class="'is-' + countryShortcut"
+      >
+        <div class="guided-confidence-head">
+          <div>
+            <span class="guided-confidence-kicker">国家 / 地区预测</span>
+            <strong>{{ shortcutTitle }}</strong>
+          </div>
+          <span class="guided-confidence-note">{{ shortcutNote }}</span>
+        </div>
+        <p class="guided-confidence-explanation">{{ shortcutExplanation }}</p>
+
+        <article
+          v-for="candidate in shortcutCandidates"
+          :key="candidateTargetKey(candidate.target)"
+          class="guided-candidate-card guided-confidence-card"
+          :class="{ selected: isCandidateSelected(candidate.target) }"
+          :tabindex="busy ? -1 : 0"
+          :aria-current="isCandidateSelected(candidate.target) ? 'true' : undefined"
+          @click="selectCandidate(candidate.target)"
+          @keydown.enter.prevent="selectCandidate(candidate.target)"
+          @keydown.space.prevent="selectCandidate(candidate.target)"
+        >
+          <div class="guided-candidate-main">
+            <strong>{{ targetLabel(candidate.target) }}</strong>
+            <span class="guided-candidate-meta">{{ candidateScoreLabel(candidate) }}</span>
+            <span v-if="candidatePointLabel(candidate.target)" class="guided-candidate-point">
+              {{ candidatePointLabel(candidate.target) }}
+            </span>
+            <p v-if="candidate.reason" class="guided-candidate-reason">{{ candidate.reason }}</p>
+          </div>
+          <div class="guided-candidate-actions">
+            <button
+              type="button"
+              class="mini-btn confirm"
+              :disabled="busy || !locationConfirmationReady"
+              @click.stop="emit('confirm-location', candidate.target)"
+            >
+              确认{{ locationLevelLabel(candidate.target.level) }}
+            </button>
+            <button
+              type="button"
+              class="mini-btn reject"
+              :disabled="busy || !locationConfirmationReady"
+              @click.stop="emit('reject-location', candidate.target)"
+            >
+              排除{{ locationLevelLabel(candidate.target.level) }}
+            </button>
+          </div>
+        </article>
+
+        <div v-if="!shortcutCandidates.length" class="guided-empty">
+          服务器候选暂未就绪，请重新加载；页面不会自行拼装地点。
+        </div>
+        <div class="guided-confidence-actions">
+          <button
+            v-if="countryShortcut === 'high'"
+            type="button"
+            class="ghost-btn"
+            :disabled="busy"
+            @click="focusFreeText"
+          >
+            补充线索细化
+          </button>
+          <span>{{ shortcutFooter }}</span>
+        </div>
+      </section>
+
+      <section
+        v-if="!isResolved && !countryShortcut"
+        ref="questionSectionRef"
+        class="guided-question"
+      >
         <template v-if="phase === 'review'">
+          <div v-if="showLowCluePrompt" class="guided-low-confidence-note">
+            <strong>当前信息不足，先补充可观察线索</strong>
+            <span>请回答下面的问题，或在下方输入文字线索；提交后会重新比较国家候选，不会自动确认地点。</span>
+          </div>
           <div v-if="isReviewClueQuestion" class="guided-review-box">
             <div class="guided-section-head">
               <span class="guided-section-title">核对观察</span>
@@ -448,6 +612,9 @@ watch(stage, (nextStage, previousStage) => {
               <span class="guided-section-title">{{ guidedQuestionTitle(blockingQuestion) }}</span>
               <span class="guided-one-question">本轮仅此一问</span>
             </div>
+            <p v-if="narratedLowQuestion" class="guided-question-reason">
+              <strong>问题说明：</strong>{{ narratedLowQuestion }}
+            </p>
             <p class="guided-question-message">{{ questionMessage }}</p>
             <p class="guided-question-reason">{{ guidedQuestionReason(blockingQuestion) }}</p>
             <div v-if="answerChoiceOptions.length" class="guided-answer-options">
@@ -509,7 +676,11 @@ watch(stage, (nextStage, previousStage) => {
         </template>
       </section>
 
-      <section v-if="candidatesPhase" ref="candidateSectionRef" class="guided-candidates">
+      <section
+        v-if="candidatesPhase && !countryShortcut"
+        ref="candidateSectionRef"
+        class="guided-candidates"
+      >
         <div class="guided-section-head">
           <span class="guided-section-title">{{ candidateTitle }}</span>
           <span class="guided-section-note">候选可信度前五</span>
@@ -604,6 +775,7 @@ watch(stage, (nextStage, previousStage) => {
         <div class="guided-search-row">
           <input
             id="guided-catalog-search"
+            ref="searchInputRef"
             v-model="searchText"
             type="text"
             :placeholder="searchPlaceholder"

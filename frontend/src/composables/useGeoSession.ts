@@ -5,6 +5,7 @@ import type {
   CitiesResponse,
   CityScore,
   Clue,
+  ConfidenceRoute,
   CountryScore,
   FeedbackResponse,
   GuidedDialogueResponse,
@@ -33,6 +34,7 @@ export function useGeoSession() {
   const scores = ref<CountryScore[]>([])
   const messages = ref<ChatMessage[]>([])
   const action = ref<HypothesisAction | null>(null)
+  const confidence = ref<ConfidenceRoute | null>(null)
   const exclusions = ref<string[]>([])
   const confirmedIso = ref<string | null>(null)
   const done = ref(false)
@@ -56,6 +58,7 @@ export function useGeoSession() {
     scores.value = sortScores(normalizeCountryScores(response.scores ?? []))
     messages.value = [...(response.messages ?? [])]
     action.value = response.action ?? null
+    confidence.value = response.confidence ?? null
     exclusions.value = []
     confirmedIso.value = null
     done.value = false
@@ -75,6 +78,7 @@ export function useGeoSession() {
       done.value = true
       confirmedIso.value = response.iso ? normalizeCountryIso(response.iso) : confirmedIso.value
       action.value = { kind: 'done', payload: response.iso ? { iso: confirmedIso.value ?? undefined } : {} }
+      confidence.value = response.confidence ?? confidence.value
       return
     }
 
@@ -84,6 +88,7 @@ export function useGeoSession() {
     if (response.exclusions) exclusions.value = normalizeExclusionCodes(response.exclusions)
     // A missing action means no pending question: never keep stale answer buttons.
     action.value = response.action ?? null
+    confidence.value = response.confidence ?? null
   }
 
   /** Apply a cities response; empty results clear any previous city candidates. */
@@ -115,6 +120,7 @@ export function useGeoSession() {
     }
     if (response.exclusions) exclusions.value = normalizeExclusionCodes(response.exclusions)
     action.value = response.action ?? null
+    confidence.value = response.confidence ?? null
     confirmedIso.value = null
     done.value = false
     // An updated snapshot may clear the degraded notice; an older payload
@@ -136,6 +142,7 @@ export function useGeoSession() {
     if (response.exclusions) exclusions.value = normalizeExclusionCodes(response.exclusions)
     // Point analysis replaces the pending question, or clears it when absent.
     action.value = response.action ?? null
+    confidence.value = response.confidence ?? null
   }
 
   /** Local echo for a reconciled user turn the server did not echo itself. */
@@ -150,6 +157,7 @@ export function useGeoSession() {
     scores.value = []
     messages.value = []
     action.value = null
+    confidence.value = null
     exclusions.value = []
     confirmedIso.value = null
     done.value = false
@@ -166,6 +174,7 @@ export function useGeoSession() {
     scores,
     messages,
     action,
+    confidence,
     exclusions,
     confirmedIso,
     done,

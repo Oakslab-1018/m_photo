@@ -4,8 +4,10 @@ import { ApiError } from '@/api/errors'
 import { useGeoSession } from '@/composables/useGeoSession'
 import { useGuidedDialogue, type GuidedDialogueApi } from '@/composables/useGuidedDialogue'
 import type {
+  ConfidenceRoute,
   GuidedDialogue,
   GuidedDialogueResponse,
+  HypothesisAction,
   LocationCandidate,
   LocationTarget,
   ReviewedClue,
@@ -56,6 +58,31 @@ function snapshot(
     clues: [],
     exclusions: [],
   }
+}
+
+function countryConfidence(
+  tier: ConfidenceRoute['tier'],
+  action: ConfidenceRoute['action'],
+  isos: string[],
+): ConfidenceRoute {
+  return {
+    tier,
+    action,
+    top3: isos.map((iso, index) => ({
+      iso,
+      name: iso,
+      name_zh: iso,
+      score: 0.9 - index * 0.01,
+      score_type: 'country_rank',
+    })),
+    leader_changed: false,
+    reason: '不应直接展示的内部排序说明',
+    policy_version: 'test',
+  }
+}
+
+function countryAction(kind: HypothesisAction['kind'], message: string): HypothesisAction {
+  return { kind, message, payload: { iso: 'JP' } }
 }
 
 function apiMock(): GuidedDialogueApi & {
@@ -1145,6 +1172,322 @@ describe('useGuidedDialogue', () => {
     expect(guided.reviewHistory.value).toEqual([])
     expect(guided.canReviewBack.value).toBe(false)
     expect(guided.candidatesVisible.value).toBe(false)
+  })
+
+  it('exposes high country top1 for explicit confirmation without review, next, or inherited stage state', async () => {
+    const sessionId = ref<number | null>(7)
+    const api = apiMock()
+    const china: LocationTarget = { level: 'country', id: 'CN', label: '中国', country_iso: 'CN' }
+    const usa: LocationTarget = { level: 'country', id: 'US', label: '美国', country_iso: 'US' }
+    const initial = dialogue({
+      revision: 2,
+      clues: [
+        {
+          id: 'routine-clue',
+          dimension: 'language',
+          value: 'ja',
+          description: '常规机器观察',
+          source: 'model',
+          confidence: 0.8,
+          status: 'pending',
+        },
+      ],
+      pending_question: {
+        id: 'routine-review',
+        kind: 'review_clue',
+        clue_id: 'routine-clue',
+        message: '这条观察准确吗？',
+      },
+    })
+    const candidates = [
+      { target: japan, score: 0.9, reason: '国家排序第一' },
+      { target: china, score: 0.89 },
+      { target: usa, score: 0.7 },
+    ]
+    api.dialogueStart.mockResolvedValue({
+      ...snapshot(initial, candidates),
+      action: countryAction('result', '高置信判断：日本。'),
+      confidence: countryConfidence('high', 'direct_top1', ['JP', 'CN', 'US']),
+    })
+    const guided = useGuidedDialogue(sessionId, { api, eventIdFactory: () => 'high-confirm' })
+
+    await guided.start()
+
+    expect(guided.phase.value).toBe('review')
+    expect(guided.candidatesVisible.value).toBe(false)
+    expect(guided.topCandidates.value).toEqual([])
+    expect(guided.confidenceShortcut.value).toBe('high')
+    expect(guided.confidenceCandidates.value.map((item) => item.target.id)).toEqual(['JP'])
+    expect(guided.locationConfirmationReady.value).toBe(true)
+    expect(guided.dialogue.value?.stage).toBe('country')
+    expect(guided.dialogue.value?.confirmed.country).toBeNull()
+
+    api.dialogueEvent.mockResolvedValue(snapshot(
+      dialogue({
+        revision: 3,
+        stage: 'admin1',
+        confirmed: { country: japan, admin1: null, city: null },
+      }),
+      [{ target: hokkaido, score: 0.7 }],
+    ))
+
+    expect(await guided.confirmLocation(japan)).toBe(true)
+    expect(api.dialogueEvent).toHaveBeenCalledWith(7, {
+      type: 'confirm_location',
+      event_id: 'high-confirm',
+      expected_revision: 2,
+      target: { level: 'country', id: 'JP' },
+    })
+    expect(guided.dialogue.value?.stage).toBe('admin1')
+    expect(guided.confidenceShortcut.value).toBeNull()
+  })
+
+  it('exposes medium top3 without resolving routine review and still requires explicit confirmation', async () => {
+    const sessionId = ref<number | null>(7)
+    const api = apiMock()
+    const china: LocationTarget = { level: 'country', id: 'CN', label: '中国', country_iso: 'CN' }
+    const usa: LocationTarget = { level: 'country', id: 'US', label: '美国', country_iso: 'US' }
+    const france: LocationTarget = { level: 'country', id: 'FR', label: '法国', country_iso: 'FR' }
+    const initial = dialogue({
+      revision: 4,
+      clues: [
+        {
+          id: 'routine-clue',
+          dimension: 'signage',
+          value: '出口',
+          description: '常规机器观察',
+          source: 'ocr',
+          confidence: 0.7,
+          status: 'pending',
+        },
+      ],
+      pending_question: {
+        id: 'routine-review',
+        kind: 'review_clue',
+        clue_id: 'routine-clue',
+        message: '这条观察准确吗？',
+      },
+    })
+    api.dialogueStart.mockResolvedValue({
+      ...snapshot(initial, [
+        { target: japan, score: 0.8 },
+        { target: china, score: 0.79 },
+        { target: usa, score: 0.7 },
+        { target: france, score: 0.6 },
+      ]),
+      action: countryAction('confirm', '三个候选较为接近，请确认。'),
+      confidence: countryConfidence('medium', 'confirm_candidates', ['JP', 'CN', 'US', 'FR']),
+    })
+    const guided = useGuidedDialogue(sessionId, { api, eventIdFactory: () => 'medium-confirm' })
+
+    await guided.start()
+
+    expect(guided.confidenceShortcut.value).toBe('candidates')
+    expect(guided.confidenceCandidates.value.map((item) => item.target.id)).toEqual(['JP', 'CN', 'US'])
+    expect(guided.dialogue.value?.confirmed.country).toBeNull()
+    expect(guided.dialogue.value?.stage).toBe('country')
+    expect(guided.locationConfirmationReady.value).toBe(true)
+
+    api.dialogueEvent.mockResolvedValue(snapshot(dialogue({
+      revision: 5,
+      stage: 'admin1',
+      confirmed: { country: japan, admin1: null, city: null },
+    })))
+
+    expect(await guided.confirmLocation(japan)).toBe(true)
+    expect(api.dialogueEvent).toHaveBeenCalledTimes(1)
+    expect(api.dialogueEvent.mock.calls[0]?.[1]).toMatchObject({
+      type: 'confirm_location',
+      target: { level: 'country', id: 'JP' },
+    })
+  })
+
+  it('keeps correction questions blocking even when the response advertises high confidence', async () => {
+    const sessionId = ref<number | null>(7)
+    const api = apiMock()
+    api.dialogueStart.mockResolvedValue({
+      ...snapshot(dialogue({
+        revision: 6,
+        pending_question: {
+          id: 'correction',
+          kind: 'ask',
+          message: '是否应用这条纠正？',
+          options: [{ value: 'apply', label: '应用纠正' }],
+        },
+      }), [{ target: japan, score: 0.9 }]),
+      action: countryAction('result', '高置信判断：日本。'),
+      confidence: countryConfidence('high', 'direct_top1', ['JP', 'CN', 'US']),
+    })
+    const guided = useGuidedDialogue(sessionId, { api })
+
+    await guided.start()
+
+    expect(guided.confidenceShortcut.value).toBeNull()
+    expect(guided.locationConfirmationReady.value).toBe(false)
+    expect(await guided.confirmLocation(japan)).toBe(false)
+    expect(api.dialogueEvent).not.toHaveBeenCalled()
+  })
+
+  it('blocks the shortcut after explicit re-review and while a conflict is unresolved', async () => {
+    const sessionId = ref<number | null>(7)
+    const api = apiMock()
+    const highResponse: GuidedDialogueResponse = {
+      ...snapshot(dialogue({ revision: 8 }), [{ target: japan, score: 0.9 }]),
+      action: countryAction('result', '高置信判断：日本。'),
+      confidence: countryConfidence('high', 'direct_top1', ['JP', 'CN', 'US']),
+    }
+    api.dialogueStart.mockResolvedValue(highResponse)
+    const guided = useGuidedDialogue(sessionId, { api, eventIdFactory: () => 'conflict-high' })
+
+    await guided.start()
+    expect(guided.confidenceShortcut.value).toBe('high')
+    expect(guided.nextPhase()).toBe(true)
+    guided.returnToReview()
+    expect(guided.confidenceShortcut.value).toBeNull()
+    expect(guided.locationConfirmationReady.value).toBe(false)
+    expect(await guided.confirmLocation(japan)).toBe(false)
+    expect(api.dialogueEvent).not.toHaveBeenCalled()
+
+    api.dialogueEvent.mockRejectedValueOnce(new ApiError({ message: 'conflict', status: 409 }))
+    api.dialogue.mockResolvedValueOnce(highResponse)
+    guided.nextPhase()
+    expect(await guided.confirmLocation(japan)).toBe(false)
+    expect(guided.conflict.value).not.toBeNull()
+    expect(guided.confidenceShortcut.value).toBeNull()
+    expect(guided.locationConfirmationReady.value).toBe(false)
+  })
+
+  it('submits low-confidence free text and applies the rescored clue/question snapshot', async () => {
+    const sessionId = ref<number | null>(7)
+    const api = apiMock()
+    const onSnapshot = vi.fn()
+    api.dialogueStart.mockResolvedValue({
+      ...snapshot(dialogue({
+        revision: 9,
+        pending_question: {
+          id: 'low-question',
+          kind: 'request_clue',
+          message: '请补充画面中的招牌文字。',
+        },
+      }), [{ target: japan, score: 0.51 }]),
+      action: { kind: 'request_clue', message: '请补充画面中的招牌文字。' },
+      confidence: countryConfidence('low', 'ask_clue', ['JP', 'CN', 'US']),
+    })
+    const guided = useGuidedDialogue(sessionId, {
+      api,
+      onSnapshot,
+      eventIdFactory: () => 'low-free-text',
+    })
+
+    await guided.start()
+    api.dialogueEvent.mockResolvedValue({
+      ...snapshot(dialogue({
+        revision: 10,
+        clues: [
+          {
+            id: 'user-clue',
+            dimension: 'signage',
+            value: '红底白字招牌',
+            description: '用户补充的可见文字',
+            source: 'user',
+            confidence: 0.9,
+            status: 'pending',
+          },
+        ],
+        pending_question: {
+          id: 'review-user-clue',
+          kind: 'review_clue',
+          clue_id: 'user-clue',
+          message: '这条新观察准确吗？',
+        },
+      }), [{ target: japan, score: 0.7 }]),
+      action: { kind: 'ask', message: '请核对新补充的观察。' },
+      confidence: countryConfidence('medium', 'confirm_candidates', ['JP', 'CN', 'US']),
+      clues: [
+        {
+          id: undefined,
+          dimension: 'signage',
+          value: '红底白字招牌',
+          confidence: 0.9,
+          source: 'user',
+        },
+      ],
+    })
+
+    expect(await guided.freeText('  红底白字招牌  ')).toBe(true)
+    expect(api.dialogueEvent.mock.calls[0]?.[1]).toMatchObject({
+      type: 'free_text',
+      text: '红底白字招牌',
+      expected_revision: 9,
+    })
+    expect(guided.recentClueIds.value).toEqual(['user-clue'])
+    expect(guided.currentReviewClue.value?.id).toBe('user-clue')
+    expect(guided.dialogue.value?.confirmed.country).toBeNull()
+    expect(guided.phase.value).toBe('review')
+    expect(guided.candidatesVisible.value).toBe(false)
+    expect(onSnapshot).toHaveBeenLastCalledWith(expect.objectContaining({
+      clues: [expect.objectContaining({ value: '红底白字招牌', source: 'user' })],
+    }))
+  })
+
+  it('replaces confidence and action atomically on refresh and never inherits below country', async () => {
+    const sessionId = ref<number | null>(7)
+    const api = apiMock()
+    const candidates: LocationCandidate[] = [
+      { target: japan, score: 0.9 },
+      { target: { level: 'country', id: 'CN', label: '中国', country_iso: 'CN' }, score: 0.89 },
+      { target: { level: 'country', id: 'US', label: '美国', country_iso: 'US' }, score: 0.8 },
+    ]
+    api.dialogueStart.mockResolvedValue({
+      ...snapshot(dialogue({ revision: 1 }), candidates),
+      action: countryAction('result', '高置信判断：日本。'),
+      confidence: countryConfidence('high', 'direct_top1', ['JP', 'CN', 'US']),
+    })
+    const guided = useGuidedDialogue(sessionId, { api })
+
+    await guided.start()
+    expect(guided.confidenceShortcut.value).toBe('high')
+
+    api.dialogue.mockResolvedValueOnce({
+      ...snapshot(dialogue({ revision: 2 }), candidates),
+      action: countryAction('confirm', '候选接近，请确认。'),
+      confidence: countryConfidence('medium', 'confirm_candidates', ['JP', 'CN', 'US']),
+    })
+    await guided.reload()
+    expect(guided.confidence.value?.tier).toBe('medium')
+    expect(guided.action.value?.kind).toBe('confirm')
+    expect(guided.confidenceShortcut.value).toBe('candidates')
+    expect(guided.confidenceCandidates.value).toHaveLength(3)
+
+    api.dialogue.mockResolvedValueOnce({
+      ...snapshot(dialogue({
+        revision: 3,
+        pending_question: {
+          id: 'low-question',
+          kind: 'request_clue',
+          message: '请补充可见文字。',
+        },
+      }), candidates),
+      action: { kind: 'request_clue', message: '请补充可见文字。' },
+      confidence: countryConfidence('low', 'ask_clue', ['JP', 'CN', 'US']),
+    })
+    await guided.reload()
+    expect(guided.confidence.value?.tier).toBe('low')
+    expect(guided.confidenceShortcut.value).toBeNull()
+    expect(guided.confidenceCandidates.value).toEqual([])
+
+    api.dialogue.mockResolvedValueOnce({
+      ...snapshot(dialogue({
+        revision: 4,
+        stage: 'admin1',
+        confirmed: { country: japan, admin1: null, city: null },
+      }), [{ target: hokkaido, score: 0.7 }]),
+      action: countryAction('result', '不应继承的高置信国家结果。'),
+      confidence: countryConfidence('high', 'direct_top1', ['JP', 'CN', 'US']),
+    })
+    await guided.reload()
+    expect(guided.confidenceShortcut.value).toBeNull()
+    expect(guided.confidenceCandidates.value).toEqual([])
   })
 
   it('keeps guided evidence separate from the legacy terminal country state', () => {

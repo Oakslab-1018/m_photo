@@ -132,6 +132,8 @@ const questionPending = computed(() => {
   if (!guided.active.value) return isQuestionAction(session.action.value)
   const question = guided.pendingQuestion.value
   if (!question) return false
+  // A matched country confidence route presents routine review as non-blocking.
+  if (guided.confidenceShortcut.value) return false
   // The default confirm_location prompt is not an unmet review item: it is
   // answered by the explicit candidate step, never by an answer chip.
   return question.kind !== 'confirm_location'
@@ -150,10 +152,18 @@ const guidedRankingsUnlocked = computed(() => guided.rankingsUnlocked.value)
 const guidedCandidatesVisible = computed(() => guided.candidatesVisible.value)
 const guidedConfirmationReady = computed(() => guided.locationConfirmationReady.value)
 const guidedDataReady = computed(() => guided.dialogue.value !== null)
+const guidedVisibleCandidates = computed(() =>
+  guided.confidenceShortcut.value
+    ? guided.confidenceCandidates.value
+    : guided.topCandidates.value,
+)
+const guidedCandidateSurfaceVisible = computed(
+  () => guidedCandidatesVisible.value || guided.confidenceShortcut.value !== null,
+)
 const guidedMapStage = computed(() => {
   if (!guided.active.value || !guided.dialogue.value) return null
   if (guided.dialogue.value.stage === 'resolved') return 'resolved'
-  return guidedCandidatesVisible.value ? guided.dialogue.value.stage : null
+  return guidedCandidateSurfaceVisible.value ? guided.dialogue.value.stage : null
 })
 const guidedPendingQuestionText = computed(() => {
   const dialogue = guided.dialogue.value
@@ -168,16 +178,16 @@ const guidedPendingQuestionText = computed(() => {
 /** Never fall back to legacy score rows while guided data is loading or locked. */
 const guidedCountryScores = computed(() => {
   if (!guided.active.value) return session.scores.value
-  if (!guidedDataReady.value || !guidedCandidatesVisible.value) return []
+  if (!guidedDataReady.value || !guidedCandidateSurfaceVisible.value) return []
   const visible = new Set(
-    guided.topCandidates.value
+    guidedVisibleCandidates.value
       .filter((candidate) => candidate.target.level === 'country')
       .map((candidate) => normalizeIsoCode(candidate.target.id)),
   )
   return session.scores.value.filter((score) => visible.has(normalizeIsoCode(score.iso)))
 })
 const visibleCityScores = computed(() =>
-  guided.active.value && !guidedCandidatesVisible.value ? [] : session.cityScores.value,
+  guided.active.value && !guidedCandidateSurfaceVisible.value ? [] : session.cityScores.value,
 )
 
 const countryOptions = computed(() => {
@@ -209,7 +219,7 @@ const sessionStatus = computed(() => {
     if (current.stage === 'resolved') {
       return `已完成：${targetLabel(current.confirmed.city)}`
     }
-    if (!guidedCandidatesVisible.value) {
+    if (!guidedCandidateSurfaceVisible.value) {
       if (guided.reviewReady.value) return '观察已核对 · 点击“下一步”查看候选'
       const review = guided.reviewProgress.value
       return review
@@ -219,7 +229,7 @@ const sessionStatus = computed(() => {
     if (!guidedConfirmationReady.value) {
       return `${guidedStageTitle(current.stage)} · 候选已解锁 · 新增观察待核对`
     }
-    return `${guidedStageTitle(current.stage)} · 候选 ${guided.topCandidates.value.length} 个`
+    return `${guidedStageTitle(current.stage)} · 候选 ${guidedVisibleCandidates.value.length} 个`
   }
   if (session.confirmedIso.value) {
     const country = session.scores.value.find((item) => item.iso === session.confirmedIso.value)
@@ -245,7 +255,7 @@ const liveStatus = computed<{ tone: FeedbackReceiptTone | 'info'; text: string }
     const current = guided.dialogue.value
     if (!current) return { tone: 'muted', text: '等待引导状态' }
     if (current.stage === 'resolved') return { tone: 'ok', text: `已确认城市：${targetLabel(current.confirmed.city)}` }
-    if (!guidedCandidatesVisible.value) {
+    if (!guidedCandidateSurfaceVisible.value) {
       if (guided.reviewReady.value) {
         return { tone: 'ok', text: '观察已核对 · 点击“下一步”查看候选' }
       }
@@ -258,11 +268,11 @@ const liveStatus = computed<{ tone: FeedbackReceiptTone | 'info'; text: string }
             : `请先核对观察 · 待处理 ${guided.pendingClueCount.value} 条`),
       }
     }
-    if (current.pending_question) {
-      return { tone: 'info', text: guidedPendingQuestionText.value || '请继续完成观察核对。' }
-    }
     if (!guidedConfirmationReady.value) {
       return { tone: 'muted', text: '新增观察待核对，暂不能确认地点' }
+    }
+    if (current.pending_question && !guided.confidenceShortcut.value) {
+      return { tone: 'info', text: guidedPendingQuestionText.value || '请继续完成观察核对。' }
     }
     return { tone: 'muted', text: `${guidedStageTitle(current.stage)} · 请确认或排除候选` }
   }
@@ -680,7 +690,7 @@ function currentGuidedCandidateTarget(target: LocationTarget): LocationTarget | 
   if (!guided.active.value) return null
   const stage = guided.dialogue.value?.stage
   if (!stage || stage === 'resolved' || target.level !== stage) return null
-  const candidate = guided.topCandidates.value.find(
+  const candidate = guided.actionableCandidates.value.find(
     (item) => item.target.level === target.level && item.target.id === target.id,
   )
   return candidate?.target ?? null
@@ -690,7 +700,7 @@ function guidedCountryTargetForIso(iso: string | null | undefined): LocationTarg
   if (guided.dialogue.value?.stage !== 'country') return null
   const code = normalizeIsoCode(iso ?? '')
   if (!code) return null
-  const candidate = guided.topCandidates.value.find((item) => {
+  const candidate = guided.actionableCandidates.value.find((item) => {
     if (item.target.level !== 'country') return false
     return [item.target.id, item.target.country_iso, item.target.source_iso].some(
       (value) => normalizeIsoCode(value ?? '') === code,
@@ -725,7 +735,7 @@ function rejectGuidedTarget(target: LocationTarget): void {
 }
 
 watch(
-  [guided.active, guided.dialogue, guided.candidates],
+  [guided.active, guided.dialogue, guided.candidates, guided.actionableCandidates],
   () => {
     const key = selectedGuidedTargetKey.value
     if (!key) return
@@ -734,7 +744,7 @@ watch(
       selectedGuidedTargetKey.value = null
       return
     }
-    const stillCurrent = guided.topCandidates.value.some(
+    const stillCurrent = guided.actionableCandidates.value.some(
       (candidate) => candidate.target.level === stage && guidedTargetKey(candidate.target) === key,
     )
     if (!stillCurrent) selectedGuidedTargetKey.value = null
@@ -1107,6 +1117,10 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
               v-if="guided.active.value"
               :dialogue="guided.dialogue.value"
               :candidates="guided.topCandidates.value"
+              :action="guided.action.value"
+              :confidence="guided.confidence.value"
+              :confidence-shortcut="guided.confidenceShortcut.value"
+              :confidence-candidates="guided.confidenceCandidates.value"
               :loading="guided.loading.value"
               :applying="guided.applying.value"
               :external-busy="uploading || feedbackBusy || pointBusy || cityBusy"
@@ -1153,7 +1167,7 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
               :disabled="!hasSession"
               @feedback="onFeedback"
             />
-            <details v-else-if="guidedCandidatesVisible" class="guided-history">
+            <details v-else-if="guidedCandidateSurfaceVisible" class="guided-history">
               <summary>查看推理记录（{{ session.messages.value.length }} 条）</summary>
               <ChatLog
                 :messages="session.messages.value"
@@ -1181,8 +1195,8 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
             :busy="busy"
             :guided-mode="guided.active.value"
             :guided-country-allowed="!guided.active.value || guided.dialogue.value?.stage === 'country'"
-            :guided-candidates="guided.topCandidates.value"
-            :guided-candidates-unlocked="guidedCandidatesVisible"
+            :guided-candidates="guidedVisibleCandidates"
+            :guided-candidates-unlocked="guidedCandidateSurfaceVisible"
             :guided-confirmation-ready="guidedConfirmationReady"
             :guided-data-ready="guidedDataReady"
             :guided-stage="guided.dialogue.value?.stage ?? null"
@@ -1213,8 +1227,8 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
                 :selected-iso="selectedIso"
                 :guided="guided.active.value"
                 :guided-stage="guidedMapStage"
-                :guided-candidates="guided.topCandidates.value"
-                :guided-candidates-visible="guidedCandidatesVisible"
+                :guided-candidates="guidedVisibleCandidates"
+                :guided-candidates-visible="guidedCandidateSurfaceVisible"
                 :guided-confirmed="guided.dialogue.value?.confirmed ?? null"
                 :selected-guided-target-key="selectedGuidedTargetKey"
                 :guided-confirmation-ready="guidedConfirmationReady"

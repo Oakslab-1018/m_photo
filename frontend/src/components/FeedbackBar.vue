@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, ref, watch } from 'vue'
-import type { FeedbackPayload, HypothesisAction } from '@/types'
+import type { ConfidenceRoute, FeedbackPayload, HypothesisAction } from '@/types'
 import { dimensionLabel } from '@/utils/clues'
 import { answerPayload, groupActionOptions, type DialogueOption } from '@/utils/dialogue'
 
@@ -28,6 +28,16 @@ const composing = ref(false)
 const text = computed(() => (props.draft !== undefined ? props.draft : localText.value))
 const optionGroups = computed(() => groupActionOptions(props.action))
 const canSend = computed(() => text.value.trim().length > 0 && !props.busy && !props.disabled)
+const confidence = computed<ConfidenceRoute | null>(() => {
+  const value = props.action?.payload?.confidence
+  return value && typeof value === 'object' ? (value as ConfidenceRoute) : null
+})
+const confidenceLabel = computed(() => {
+  if (!confidence.value) return ''
+  if (confidence.value.tier === 'high') return '🟢 高置信：已给出最佳匹配'
+  if (confidence.value.tier === 'medium') return '🟡 候选接近：请确认'
+  return '🟠 信息不足：继续补充线索'
+})
 
 async function focusInput(): Promise<void> {
   await nextTick()
@@ -90,6 +100,7 @@ defineExpose({ focusInput })
 
 <template>
   <div class="feedback-area">
+    <div v-if="confidence" class="action-note confidence-note">{{ confidenceLabel }}</div>
     <div v-if="action" class="action-buttons">
       <button
         v-if="action.kind === 'confirm' && action.payload?.iso"
@@ -118,6 +129,7 @@ defineExpose({ focusInput })
         ✍️ 我来补充{{ action.payload?.dimensions?.length ? `（${action.payload.dimensions.map(dimensionLabel).join('、')}）` : '' }}
       </button>
       <span v-if="action.kind === 'done'" class="action-note">🎉 推理已完成</span>
+      <span v-if="action.kind === 'result'" class="action-note">📍 已给出高置信国家判断，仍需您明确确认</span>
     </div>
 
     <div v-if="optionGroups.length" class="answer-options">

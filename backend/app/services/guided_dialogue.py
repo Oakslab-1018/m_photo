@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from copy import deepcopy
 from dataclasses import dataclass
@@ -28,6 +29,7 @@ from services.chat import ChineseFreeTextParser, PendingQuestion
 from ..config import Settings
 from ..database import GeoSession, GuidedDialogue, GuidedEvent
 from ..domain.geolocation.clue import Clue, DIM_LABELS, VALUE_LABELS, dicts_to_clues
+from ..domain.geolocation.confidence import route_confidence
 from ..domain.geolocation.country_policy import (
     canonical_country_iso,
     country_members,
@@ -36,12 +38,13 @@ from ..domain.geolocation.country_policy import (
     source_region_iso,
 )
 from ..domain.geolocation.engine import find_exact_phrase, normalize_place_text
-from ..domain.geolocation.model_ranking import ModelAwareEngine
+from ..domain.geolocation.model_ranking import ModelAwareEngine, ModelAwareHypotheses
 from ..schemas import (
     ActionModel,
     ChatMessageModel,
     ClueModel,
     ConfirmedPathModel,
+    ConfidenceRouteModel,
     CountryScoreModel,
     GuidedCandidateModel,
     GuidedDialogueModel,
@@ -56,8 +59,11 @@ from ..schemas import (
 )
 from .city_catalog import CityRow
 from .city_reasoning import CityClueReasoner
+from .deepseek import DeepSeekClient, narration_matches_action
 from .geo_session import GeoSessionService
 from .model_gateway import StreetClipGateway, build_inference_notice
+
+logger = logging.getLogger(__name__)
 
 DIALOGUE_VERSION = 1
 COUNTRY_CANDIDATE_LIMIT = 20
@@ -65,6 +71,7 @@ COUNTRY_CATALOG_FALLBACK_LIMIT = 50
 CITY_CANDIDATE_LIMIT = 20
 PROPOSAL_LIMIT = 20
 MAX_QUESTION_OPTIONS = 5
+MAX_COUNTRY_CLUE_QUESTIONS = 3
 
 _CITY_ID_RE = re.compile(r"^[1-9][0-9]*$")
 _ADMIN1_ID_RE = re.compile(r"^([A-Z]{2})\.(.+)$")
@@ -126,6 +133,8 @@ def _empty_state() -> dict[str, Any]:
         "clues": [],
         "pending_question": None,
         "asked_question_ids": [],
+        "asked_clue_questions": [],
+        "confidence_confirm_isos": [],
         "proposals": [],
         "conflict": None,
         "pending_correction": None,
@@ -143,7 +152,10 @@ def _normalise_state(value: object) -> dict[str, Any]:
         for level in ("country", "admin1", "city"):
             target = confirmed.get(level)
             result["confirmed"][level] = dict(target) if isinstance(target, Mapping) else None
-    for key in ("exclusions", "clues", "asked_question_ids", "proposals"):
+    for key in (
+        "exclusions", "clues", "asked_question_ids", "asked_clue_questions",
+        "confidence_confirm_isos", "proposals",
+    ):
         raw = value.get(key)
         if isinstance(raw, list):
             result[key] = [dict(item) if isinstance(item, Mapping) else item for item in raw]
@@ -302,6 +314,7 @@ class _Prepared:
     candidates: list[dict[str, Any]]
     scores: list[Any]
     action: ActionModel
+    confidence: dict[str, Any] | None
     legacy_confirmed_iso: str | None
     legacy_status: str
     inference_notice: str | None = None
@@ -315,6 +328,7 @@ class GuidedDialogueService:
         self.settings = settings
         self.parser = ChineseFreeTextParser()
         self.gateway = StreetClipGateway(settings)
+        self.provider = DeepSeekClient(settings)
         self._store_instance: Any | None = None
         self._country_records_cache: list[dict[str, Any]] | None = None
 
@@ -329,6 +343,7 @@ class GuidedDialogueService:
 
         state, _ = self._reconcile_session_evidence(_empty_state(), session)
         prepared = self._prepare(state, session, query=None, ensure_question=True)
+        prepared = self._maybe_narrate(prepared, session_id)
         now = datetime.utcnow()
         row = GuidedDialogue(
             session_id=session_id,
@@ -432,6 +447,11 @@ class GuidedDialogueService:
             session,
             query=query,
             ensure_question=bool(outcome["effective"]),
+        )
+        prepared = self._maybe_narrate(
+            prepared,
+            session_id,
+            feedback=(event.text or event.value or outcome["summary"]),
         )
         receipt = {
             "event_id": event.event_id,
@@ -982,13 +1002,15 @@ class GuidedDialogueService:
         state: Mapping[str, Any],
         session: GeoSession,
         clues: Sequence[Clue],
-    ) -> tuple[list[Any], str | None]:
+    ) -> tuple[list[Any], str | None, dict[str, Any] | None]:
         engine = ModelAwareEngine()
         evidence = session.model_evidence
+        validated_evidence = None
         validation_failed = False
         if evidence is not None:
             try:
-                engine.evidence = self.gateway.validate(evidence)
+                validated_evidence = self.gateway.validate(evidence)
+                engine.evidence = validated_evidence
             except Exception:
                 engine.evidence = None
                 validation_failed = True
@@ -1005,7 +1027,7 @@ class GuidedDialogueService:
             validation_failed=validation_failed,
             has_trusted_evidence=bool(scores),
         )
-        return scores, notice
+        return scores, notice, validated_evidence
 
     # ------------------------------------------------------------- candidates
     @staticmethod
@@ -1364,6 +1386,281 @@ class GuidedDialogueService:
         return str(country.get("id")), ("done" if isinstance(city, Mapping) else "active")
 
     # ---------------------------------------------------------------- prepare
+    @staticmethod
+    def _route_blocked(state: Mapping[str, Any]) -> bool:
+        """Keep correction/conflict/pinned re-review ahead of confidence routing."""
+
+        if isinstance(state.get("pending_correction"), Mapping):
+            return True
+        if isinstance(state.get("conflict"), Mapping):
+            return True
+        pending = state.get("pending_question")
+        if not isinstance(pending, Mapping):
+            return False
+        if pending.get("_pinned") is True:
+            return True
+        return bool(pending.get("correction_id") or pending.get("conflict_id"))
+
+    @staticmethod
+    def _asked_clue_history(state: Mapping[str, Any]) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        for item in state.get("asked_clue_questions") or []:
+            if not isinstance(item, Mapping):
+                continue
+            question_id = str(item.get("id") or "")
+            if not question_id:
+                continue
+            result.append({
+                "id": question_id,
+                "dimension": str(item.get("dimension") or ""),
+            })
+        return result
+
+    @staticmethod
+    def _pending_low_clue_question(state: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        if isinstance(state.get("pending_correction"), Mapping) or isinstance(state.get("conflict"), Mapping):
+            return None
+        pending = state.get("pending_question")
+        if not isinstance(pending, Mapping):
+            return None
+        if not str(pending.get("id") or "").startswith("clue:country:"):
+            return None
+        if pending.get("correction_id") or pending.get("conflict_id"):
+            return None
+        return pending
+
+    @staticmethod
+    def _uncertain_free_text(text: str) -> bool:
+        lowered = text.strip().lower()
+        return any(token in lowered for token in (
+            "不知道", "不确定", "看不清", "看不见", "无法判断", "无法确定",
+            "说不清", "不清楚", "拿不准", "没法判断", "猜不出", "辨不清",
+        ))
+
+    @classmethod
+    def _record_clue_question(
+        cls,
+        state: dict[str, Any],
+        question: Mapping[str, Any],
+    ) -> None:
+        question_id = str(question.get("id") or "")
+        if not question_id.startswith("clue:country:"):
+            return
+        history = cls._asked_clue_history(state)
+        if not any(item.get("id") == question_id for item in history):
+            history.append({
+                "id": question_id,
+                "dimension": str(question.get("dimension") or ""),
+            })
+            state["asked_clue_questions"] = history
+        asked = [str(item) for item in state.get("asked_question_ids") or []]
+        if question_id not in asked:
+            asked.append(question_id)
+            state["asked_question_ids"] = asked
+
+    @staticmethod
+    def _evidence_rationale(clues: Sequence[Clue], top_iso: str | None) -> str:
+        """Label only trusted clues that actually matched the predicted country."""
+
+        engine = ModelAwareEngine()
+        trusted = engine._trusted_clues(list(clues))
+        if not trusted or not top_iso:
+            return "全图模型与线索融合首选一致"
+        country = next(
+            (item for item in engine.countries if item.get("iso") == top_iso),
+            None,
+        )
+        if country is None:
+            return "全图模型与线索融合首选一致"
+        scored = engine._score_country(country, trusted, [])
+        labels: list[str] = []
+        for item in (scored.matched_clues if scored is not None else []):
+            if not isinstance(item, Mapping):
+                continue
+            raw_value = str(item.get("value") or "")
+            label = _value_label(raw_value)
+            if str(item.get("dimension") or "") == "place_name" and raw_value:
+                resolved_iso = engine.resolve_country_key(raw_value)
+                resolved = engine._country_by_iso.get(resolved_iso or "")
+                if resolved:
+                    label = str(resolved.get("name_zh") or resolved.get("name") or label)
+            if label and label not in labels:
+                labels.append(label)
+            if len(labels) >= 3:
+                break
+        return "可信线索：" + "、".join(labels) if labels else "全图模型与线索融合首选一致"
+
+    @staticmethod
+    def _guided_options(options: Any) -> list[dict[str, str]]:
+        result: list[dict[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for item in options or []:
+            if not isinstance(item, Mapping):
+                continue
+            value = str(item.get("value") or "").strip()[:200]
+            label = str(item.get("label") or value).strip()[:200]
+            if not value or not label:
+                continue
+            key = (value, label)
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append({"value": value, "label": label})
+            if len(result) >= MAX_QUESTION_OPTIONS:
+                break
+        return result
+
+    @staticmethod
+    def _route_candidates(
+        candidates: Sequence[Mapping[str, Any]],
+        route: Mapping[str, Any],
+    ) -> list[dict[str, Any]]:
+        by_iso: dict[str, dict[str, Any]] = {}
+        for item in candidates:
+            target = item.get("target") if isinstance(item, Mapping) else None
+            if not isinstance(target, Mapping):
+                continue
+            iso = canonical_country_iso(target.get("id") or target.get("country_iso"))
+            if iso and iso not in by_iso:
+                by_iso[iso] = dict(item)
+        result: list[dict[str, Any]] = []
+        for row in route.get("top3") or []:
+            if not isinstance(row, Mapping):
+                continue
+            iso = canonical_country_iso(row.get("iso"))
+            item = by_iso.get(iso)
+            if item is not None and item not in result:
+                result.append(item)
+        return result
+
+    @staticmethod
+    def _confirm_question(
+        candidates: Sequence[Mapping[str, Any]],
+        *,
+        low_uncertainty: bool = False,
+        rationale: str = "",
+    ) -> dict[str, Any] | None:
+        ordered = list(candidates)[:3]
+        if not ordered:
+            return None
+        target = ordered[0].get("target") if isinstance(ordered[0], Mapping) else None
+        if not isinstance(target, Mapping):
+            return None
+        options: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for item in ordered:
+            item_target = item.get("target") if isinstance(item, Mapping) else None
+            if not isinstance(item_target, Mapping):
+                continue
+            value = str(item_target.get("id") or "").strip()
+            label = str(item_target.get("label") or value).strip()
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            options.append({"value": value, "label": label})
+        reason = f"（{rationale}）" if rationale else ""
+        if low_uncertainty:
+            message = (
+                "已询问 3 个线索问题，当前证据仍不足以自动判断国家，也不会自动猜测。"
+                f"{reason}你可以从下方三个候选中手动选择一个并明确确认，或继续补充文字/重新上传。"
+            )
+        else:
+            message = (
+                f"候选最可能是「{target.get('label') or target.get('id')}」{reason}。"
+                "你可以直接确认，也可从下方三个候选中选择；只有确认地点后才会进入下一步。"
+            )
+        question_id = _json_hash("confidence-confirm", {
+            "targets": [option["value"] for option in options],
+            "low": low_uncertainty,
+        })
+        return {
+            "id": question_id,
+            "kind": "confirm_location",
+            "message": message,
+            "target": dict(target),
+            "options": options or None,
+        }
+
+    def _low_clue_question(
+        self,
+        state: Mapping[str, Any],
+        scores: Sequence[Any],
+        clues: Sequence[Clue],
+        candidates: Sequence[Mapping[str, Any]],
+        validated_evidence: Mapping[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        history = self._asked_clue_history(state)
+        if len(history) >= MAX_COUNTRY_CLUE_QUESTIONS:
+            return None
+        asked_dimensions = [item["dimension"] for item in history if item.get("dimension")]
+        engine = ModelAwareEngine()
+        engine.evidence = dict(validated_evidence) if isinstance(validated_evidence, Mapping) else None
+        hypothesis = ModelAwareHypotheses(engine).next_action(
+            list(scores),
+            list(clues),
+            asked=asked_dimensions,
+        )
+        payload = dict(hypothesis.payload or {})
+        dimensions = [
+            str(item) for item in payload.get("dimensions") or []
+            if isinstance(item, str) and item
+        ]
+        dimension = dimensions[0] if dimensions else "place_name"
+        options = self._guided_options(payload.get("options"))
+        candidate_isos = [str(item) for item in payload.get("candidates") or [] if item]
+        if not candidate_isos:
+            for item in candidates:
+                target = item.get("target") if isinstance(item, Mapping) else None
+                if isinstance(target, Mapping) and target.get("id"):
+                    candidate_isos.append(str(target.get("id")))
+        if dimension == "place_name" and not options:
+            place_options = []
+            for item in candidates:
+                target = item.get("target") if isinstance(item, Mapping) else None
+                if isinstance(target, Mapping) and target.get("id"):
+                    place_options.append({
+                        "value": str(target.get("id")),
+                        "label": str(target.get("label") or target.get("id")),
+                    })
+            options = self._guided_options(place_options)
+        question_id = _json_hash("clue:country", {
+            "index": len(history),
+            "dimension": dimension,
+            "candidates": candidate_isos[:3],
+        })
+        return {
+            "id": question_id,
+            "kind": "ask" if len(candidate_isos) > 1 else "request_clue",
+            "message": str(hypothesis.message or f"请补充{dimension}线索。"),
+            "dimension": dimension,
+            "options": options or None,
+        }
+
+    def _maybe_narrate(
+        self,
+        prepared: _Prepared,
+        session_id: int,
+        *,
+        feedback: str = "",
+    ) -> _Prepared:
+        """Narrate on POST only; never let narration alter action or state."""
+
+        if self.provider is None:
+            return prepared
+        if str((prepared.confidence or {}).get("tier") or "") == "high":
+            return prepared
+        action = prepared.action.model_dump(mode="json")
+        message = self.provider.narrate({
+            "action": action,
+            "scores": [score.to_dict() for score in prepared.scores],
+            "clues": prepared.state.get("clues") or [],
+            "history": self.geo.list_messages(session_id),
+            "feedback": feedback,
+        })
+        if message and narration_matches_action(message, action):
+            prepared.action = prepared.action.model_copy(update={"message": message})
+        return prepared
+
     def _prepare(
         self,
         state: dict[str, Any],
@@ -1374,8 +1671,12 @@ class GuidedDialogueService:
     ) -> _Prepared:
         state = _normalise_state(state)
         clues = self._ranking_clues(state)
-        scores, inference_notice = self._country_scores(state, session, clues)
+        scores, inference_notice, validated_evidence = self._country_scores(state, session, clues)
         stage = self._stage_for_state(state)
+        route_blocked = stage == "country" and self._route_blocked(state)
+        confidence = None
+        if stage == "country" and validated_evidence is not None and not route_blocked:
+            confidence = route_confidence(scores, validated_evidence).to_dict()
         proposals = [dict(item) for item in state.get("proposals") or [] if isinstance(item, Mapping)]
         country_candidates = self._country_candidates(
             state,
@@ -1398,9 +1699,6 @@ class GuidedDialogueService:
             else []
         )
         if inference_notice and not scores:
-            # Older rule-fallback sessions may have persisted a catalog-only
-            # confirm question. Do not keep presenting a location choice when
-            # this session has no usable model or trusted text evidence.
             pending = state.get("pending_question")
             if isinstance(pending, Mapping) and str(pending.get("kind") or "") == "confirm_location":
                 state["pending_question"] = None
@@ -1410,12 +1708,119 @@ class GuidedDialogueService:
                     if not str(item).startswith(f"request:{stage}")
                 ]
                 ensure_question = True
-        question = (
-            self._ensure_question(state, country_candidates, admin1_candidates, city_candidates)
-            if ensure_question
-            else state.get("pending_question")
+
+        question = None
+        action = None
+        state["confidence_confirm_isos"] = []
+        rationale = (
+            self._evidence_rationale(clues, str(confidence.get("top1_iso") or "") or None)
+            if confidence is not None else ""
         )
-        action = self._action_for_state(state, question)
+        if confidence is not None and not route_blocked:
+            routed_candidates = self._route_candidates(country_candidates, confidence)
+            if not routed_candidates:
+                routed_candidates = list(country_candidates[:3])
+            confirm_isos = [
+                str(item.get("iso")) for item in confidence.get("top3") or []
+                if isinstance(item, Mapping) and item.get("iso")
+            ]
+            tier = str(confidence.get("tier") or "low")
+            if tier == "high":
+                state["pending_question"] = None
+                state["confidence_confirm_isos"] = confirm_isos
+                top = (confidence.get("top3") or [{}])[0]
+                action = ActionModel(
+                    kind="result",
+                    message=(
+                        f"高置信预测：{top.get('name_zh') or top.get('iso') or '候选国家'}。"
+                        f"{rationale}。这是模型候选排序，不是已确认地点；"
+                        "你可以直接确认，或选择其他候选继续定位。"
+                    ),
+                    payload={
+                        "stage": stage,
+                        "iso": top.get("iso"),
+                        "name_zh": top.get("name_zh"),
+                        "score": top.get("score"),
+                        "evidence_rationale": rationale,
+                        "requires_explicit_confirmation": True,
+                    },
+                )
+                country_candidates = routed_candidates
+            elif tier == "medium":
+                question = self._confirm_question(routed_candidates, rationale=rationale)
+                if question is not None:
+                    state["pending_question"] = question
+                    state["confidence_confirm_isos"] = confirm_isos
+                    action = self._action_for_state(state, question)
+                    country_candidates = routed_candidates
+            else:
+                history = self._asked_clue_history(state)
+                if len(history) >= MAX_COUNTRY_CLUE_QUESTIONS:
+                    confidence["action"] = "confirm_candidates"
+                    confidence["reason"] = "问题预算已用完；当前仍为低置信，只能由用户显式选择候选。"
+                    question = self._confirm_question(
+                        routed_candidates,
+                        low_uncertainty=True,
+                        rationale=rationale,
+                    )
+                    if question is not None:
+                        state["pending_question"] = question
+                        state["confidence_confirm_isos"] = confirm_isos
+                        action = self._action_for_state(state, question)
+                        country_candidates = routed_candidates
+                    else:
+                        state["pending_question"] = None
+                        action = ActionModel(
+                            kind="uncertain",
+                            message=(
+                                "当前证据不足，无法给出候选国家，也不会自动猜测。"
+                                "请继续补充可辨认文字/地名，或重新上传图片。"
+                            ),
+                            payload={"stage": stage},
+                        )
+                else:
+                    existing = state.get("pending_question")
+                    if (
+                        isinstance(existing, Mapping)
+                        and str(existing.get("id") or "").startswith("clue:country:")
+                        and self._question_is_valid(state, existing)
+                    ):
+                        question = dict(existing)
+                    else:
+                        question = self._low_clue_question(
+                            state,
+                            scores,
+                            clues,
+                            country_candidates,
+                            validated_evidence,
+                        )
+                    if question is not None:
+                        state["pending_question"] = question
+                        action = self._action_for_state(state, question)
+
+        if action is None:
+            question = (
+                self._ensure_question(state, country_candidates, admin1_candidates, city_candidates)
+                if ensure_question
+                else state.get("pending_question")
+            )
+            action = self._action_for_state(state, question)
+
+        if confidence is not None:
+            top3 = list(confidence.get("top3") or [])
+            action = action.model_copy(
+                update={
+                    "payload": {
+                        **dict(action.payload or {}),
+                        "confidence": confidence,
+                        "candidate_details": top3,
+                        "candidates": [item.get("iso") for item in top3 if item.get("iso")],
+                        "reason": confidence.get("reason"),
+                        "evidence_rationale": rationale,
+                        "requires_explicit_confirmation": True,
+                    }
+                }
+            )
         if inference_notice:
             action = action.model_copy(
                 update={"message": f"{inference_notice}\n{action.message}"}
@@ -1431,6 +1836,7 @@ class GuidedDialogueService:
             ),
             scores=scores,
             action=action,
+            confidence=confidence,
             legacy_confirmed_iso=legacy_iso,
             legacy_status=legacy_status,
             inference_notice=inference_notice,
@@ -1752,6 +2158,8 @@ class GuidedDialogueService:
         pending = state.get("pending_question")
         if isinstance(pending, Mapping) and str(pending.get("kind") or "") == "ask":
             raise GuidedConflict("请先处理当前澄清问题，再确认地点。")
+        if isinstance(state.get("pending_correction"), Mapping) or isinstance(state.get("conflict"), Mapping):
+            raise GuidedConflict("请先处理当前修正或冲突问题，再确认地点。")
         self._check_question_reference(
             state,
             event,
@@ -1759,7 +2167,17 @@ class GuidedDialogueService:
             target={"level": event.target.level, "id": event.target.id},
         )
         if self._has_pending_clue_review(state):
-            raise GuidedConflict("请先完成当前线索核对，再确认地点。")
+            confirm_iso = canonical_country_iso(event.target.id)
+            routed_isos = {
+                canonical_country_iso(item) for item in state.get("confidence_confirm_isos") or []
+            }
+            pinned_review = (
+                isinstance(pending, Mapping)
+                and pending.get("kind") == "review_clue"
+                and pending.get("_pinned") is True
+            )
+            if event.target.level != "country" or not confirm_iso or confirm_iso not in routed_isos or pinned_review:
+                raise GuidedConflict("请先完成当前线索核对，再确认地点。")
         target = self._resolve_target(event.target)
         self._validate_confirmation(state, target)
         excluded = self._excluded_by_state(state, target)
@@ -1786,6 +2204,7 @@ class GuidedDialogueService:
             new_confirmed["city"] = dict(target)
         state["confirmed"] = new_confirmed
         state["pending_question"] = None
+        state["confidence_confirm_isos"] = []
         state["proposals"] = []
         state["pending_correction"] = None
         self._refresh_conflict(state)
@@ -1849,7 +2268,9 @@ class GuidedDialogueService:
                 # Pin the restored clue as the current review question. The
                 # generic priority scan could otherwise return a different
                 # pending clue while the correction/conflict remains queued.
-                state["pending_question"] = _review_question(updated)
+                pinned = _review_question(updated)
+                pinned["_pinned"] = True
+                state["pending_question"] = pinned
                 self._refresh_conflict(state)
                 return self._outcome(state, True, "applied", "线索已恢复为待复核。")
             raise GuidedValidationError("未知线索 ID")
@@ -1911,8 +2332,43 @@ class GuidedDialogueService:
         text = (event.text or "").strip()
         if not text:
             raise GuidedValidationError("缺少自由文本内容")
-        parsed = self.parser.parse(text, pending=self._parser_pending(state.get("pending_question")))
+        pending_state = self._pending_low_clue_question(state)
+        if pending_state is not None and self._uncertain_free_text(text):
+            self._record_clue_question(state, pending_state)
+            state["pending_question"] = None
+            state["conflict"] = None
+            state["proposals"] = []
+            return self._outcome(
+                state,
+                True,
+                "applied",
+                "已记录为无法判断并计入本轮问题；不会自动推进地点。",
+            )
+        pending = self._parser_pending(state.get("pending_question"))
+        parsed = self.parser.parse(text, pending=pending)
+        if self.provider is not None:
+            try:
+                raw_plan = self.provider.extract({
+                    "text": text,
+                    "history": self.geo.list_messages(session.id),
+                    "pending": pending.to_dict() if pending is not None else None,
+                    "catalog": self.parser.remote_catalog(),
+                })
+                remote_plan = self.parser.validate_remote(raw_plan, text, pending)
+                if remote_plan.clues or remote_plan.reject_isos:
+                    parsed = parsed.merged(remote_plan)
+            except Exception as exc:
+                logger.warning("Guided DeepSeek extraction unavailable; using rules (%s)", type(exc).__name__)
         added: list[str] = []
+        parsed_answer = bool(
+            pending_state is not None
+            and not parsed.question
+            and any(
+                str(raw.get("dimension") or "") == str(pending_state.get("dimension") or "")
+                for raw in parsed.clues
+                if isinstance(raw, Mapping)
+            )
+        )
         existing_ids = {
             str(record.get("id")) for record in state.get("clues") or []
             if isinstance(record, Mapping) and record.get("id")
@@ -1925,7 +2381,7 @@ class GuidedDialogueService:
                 continue
             record["source"] = "user"
             extra = dict(record.get("_extra") or {})
-            extra["parser"] = "guided_rules"
+            extra["parser"] = str(extra.get("parser") or "guided_rules")
             record["_extra"] = extra
             record["_origin"] = "guided_user"
             state.setdefault("clues", []).append(record)
@@ -1945,6 +2401,15 @@ class GuidedDialogueService:
             or correction is not None
             or old_correction is not None
         )
+        if (
+            pending_state is not None
+            and parsed_answer
+            and correction is None
+            and conflict is None
+        ):
+            self._record_clue_question(state, pending_state)
+            state["pending_question"] = None
+            effective = True
         if not effective:
             return self._outcome(state, False, "unrecognized", "没有识别到新的目录证据、地点提议或修正计划。")
         state["proposals"] = proposals
@@ -1975,6 +2440,7 @@ class GuidedDialogueService:
             raise GuidedValidationError("回答事件缺少 value")
         if question.get("correction_id") or question.get("dimension") == "correction":
             return self._apply_correction_decision(state, question, value)
+        self._record_clue_question(state, question)
         if question.get("kind") == "ask" and isinstance(state.get("conflict"), Mapping):
             state["conflict"] = None
             state["proposals"] = []
@@ -2128,9 +2594,15 @@ class GuidedDialogueService:
                         ]
                         effective = True
                     break
+        history_before = len(self._asked_clue_history(state))
+        asked_before = {str(item) for item in state.get("asked_question_ids") or []}
+        self._record_clue_question(state, question)
+        if len(self._asked_clue_history(state)) > history_before:
+            effective = True
         asked = list(state.get("asked_question_ids") or [])
-        if question_id and question_id not in asked:
-            asked.append(question_id)
+        if question_id and question_id not in asked_before:
+            if question_id not in asked:
+                asked.append(question_id)
             effective = True
         state["asked_question_ids"] = asked
         state["pending_question"] = None
@@ -2431,6 +2903,49 @@ class GuidedDialogueService:
         }
 
     # -------------------------------------------------------------- response
+    @staticmethod
+    def _public_clue_rows(state: Mapping[str, Any], session: GeoSession) -> list[dict[str, Any]]:
+        """Merge immutable machine clues with reviewable guided-user clues."""
+
+        rows: list[dict[str, Any]] = []
+        seen: set[tuple[str, str, str, str]] = set()
+
+        def add(row: Mapping[str, Any]) -> None:
+            dimension = str(row.get("dimension") or "")
+            value = str(row.get("value") or "")
+            if not dimension or not value:
+                return
+            key = (
+                dimension,
+                value,
+                str(row.get("source") or ""),
+                str(row.get("evidence") or ""),
+            )
+            if key in seen:
+                return
+            seen.add(key)
+            rows.append(dict(row))
+
+        for item in session.clues or []:
+            if isinstance(item, Mapping):
+                add(item)
+        for record in state.get("clues") or []:
+            if not isinstance(record, Mapping) or str(record.get("_origin") or "") != "guided_user":
+                continue
+            clue = _reviewed_to_clue(record)
+            if clue is None:
+                continue
+            row = clue.to_dict()
+            extra = dict(row.get("extra") or {})
+            extra.update({
+                "guided": True,
+                "guided_clue_id": str(record.get("id") or ""),
+                "guided_status": str(record.get("status") or "pending"),
+            })
+            row["extra"] = extra
+            add(row)
+        return rows
+
     def _response(
         self,
         session_id: int,
@@ -2493,8 +3008,7 @@ class GuidedDialogueService:
         ]
         clue_models = [
             ClueModel(**dict(item))
-            for item in session.clues or []
-            if isinstance(item, Mapping) and item.get("dimension") and item.get("value") is not None
+            for item in self._public_clue_rows(state, session)
         ]
         candidate_models = []
         for item in prepared.candidates:
@@ -2506,6 +3020,7 @@ class GuidedDialogueService:
             dialogue=dialogue,
             candidates=candidate_models,
             action=prepared.action,
+            confidence=ConfidenceRouteModel(**prepared.confidence) if prepared.confidence else None,
             messages=[ChatMessageModel(**item) for item in self.geo.list_messages(session_id)],
             scores=score_models,
             clues=clue_models,

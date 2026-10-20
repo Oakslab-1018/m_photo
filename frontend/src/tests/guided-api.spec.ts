@@ -58,6 +58,80 @@ describe('GeoApi upload mapping', () => {
     expect(degraded.inference_notice).toBe('模型结果不可用，已回退到规则排序。')
     expect(healthy.inference_notice).toBeNull()
   })
+
+  it('forwards a valid upload confidence route and normalizes null or invalid values', async () => {
+    const confidence = {
+      tier: 'high',
+      action: 'direct_top1',
+      model_only_margin: 0.03,
+      fused_margin: 0.02,
+      effective_margin: 0.02,
+      prior_top_iso: 'JP',
+      top1_iso: 'JP',
+      top3: [
+        {
+          iso: 'JP',
+          name: 'Japan',
+          name_zh: '日本',
+          score: 0.9,
+          score_type: 'country_rank',
+          matched_clues: [{ dimension: 'language', value: 'ja' }],
+        },
+      ],
+      leader_changed: false,
+      reason: '稳定候选',
+      policy_version: 'test-policy',
+    }
+    const bodies = [
+      {
+        session_id: 5,
+        image_url: '/media/confidence.png',
+        clues: [],
+        scores: [],
+        action: { kind: 'result', payload: { iso: 'JP', confidence } },
+        confidence,
+        messages: [],
+      },
+      {
+        session_id: 6,
+        image_url: '/media/null.png',
+        clues: [],
+        scores: [],
+        action: null,
+        confidence: null,
+        messages: [],
+      },
+      {
+        session_id: 7,
+        image_url: '/media/invalid.png',
+        clues: [],
+        scores: [],
+        action: null,
+        confidence: { tier: 'unknown', action: 'direct_top1', top3: [] },
+        messages: [],
+      },
+    ]
+    let call = 0
+    const fetchImpl = vi.fn<typeof fetch>(async () =>
+      new Response(JSON.stringify(bodies[call++]), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    )
+    const client = new GeoApi({ fetchImpl })
+    const file = new File([new Uint8Array([1])], 'confidence.png', { type: 'image/png' })
+
+    const valid = await client.upload(file)
+    const nullValue = await client.upload(file)
+    const invalid = await client.upload(file)
+
+    expect(valid.confidence).toEqual(confidence)
+    expect(valid.confidence?.top3[0]?.matched_clues).toEqual([
+      { dimension: 'language', value: 'ja' },
+    ])
+    expect(nullValue.confidence).toBeNull()
+    expect(invalid.confidence).toBeNull()
+  })
 })
 
 describe('GeoApi guided dialogue routes', () => {

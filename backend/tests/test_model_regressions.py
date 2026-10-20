@@ -13,9 +13,26 @@ from backend.app.domain.geolocation.engine import CountryScore
 from backend.app.domain.geolocation.model_ranking import ModelAwareEngine
 from backend.app.main import create_app
 from backend.app.services.deepseek import DeepSeekClient
-from backend.app.services.model_gateway import StreetClipGateway
+from backend.app.services.model_gateway import (
+    MODEL_ID, MODEL_REVISION, StreetClipGateway, catalog_revision,
+)
+from backend.app.services.catalog_access import catalog_for_settings
 from backend.tests.support import make_settings, make_test_image_bytes
-from backend.tests.test_model_integration import evidence
+
+
+def evidence(settings):
+    """Complete SQLite-catalog prior with a medium margin for conversation tests."""
+    countries = catalog_for_settings(settings).countries()
+    rows = [
+        {"iso": item["iso"], "raw_cosine": 0.40 if item["iso"] == "AU" else 0.39 if item["iso"] == "FR" else 0.10}
+        for item in countries
+    ]
+    rows.sort(key=lambda row: (-row["raw_cosine"], row["iso"]))
+    return {
+        "model": MODEL_ID, "model_revision": MODEL_REVISION,
+        "catalog_revision": catalog_revision(countries), "rankings": rows,
+        "margin": rows[0]["raw_cosine"] - rows[1]["raw_cosine"], "uncertain": True,
+    }
 
 
 def _upload(client: TestClient) -> dict:
@@ -29,11 +46,14 @@ def _upload(client: TestClient) -> dict:
 
 @pytest.fixture
 def settings(tmp_path):
-    return replace(
+    config = replace(
         make_settings(tmp_path),
         streetclip_enabled=True,
         streetclip_api_key="local-secret",
     )
+    # Standalone provider tests also need the SQLite seed initialized.
+    with TestClient(create_app(config)):
+        yield config
 
 
 @pytest.mark.parametrize("shape", ["incomplete", "nan", "corrupt"])
@@ -112,7 +132,29 @@ def test_deepseek_redacts_ocr_user_and_history_secrets(settings):
         return httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {"content": json.dumps({"message": "请补充文字语言线索。"}, ensure_ascii=False)}}]})
 
     context = {
-        "action": {"kind": "ask", "message": "请补充线索", "payload": {"dimensions": ["language"]}},
+        "action": {
+            "kind": "ask",
+            "message": "请补充线索",
+            "payload": {
+                "dimensions": ["language"],
+                "candidate_details": [{
+                    "iso": "JP",
+                    "name_zh": "日本",
+                    "score": 0.5,
+                    "matched_clues": [{"evidence": "nested-secret@example.com"}],
+                }],
+                "confidence": {
+                    "tier": "medium",
+                    "action": "confirm_candidates",
+                    "top3": [{
+                        "iso": "JP",
+                        "name_zh": "日本",
+                        "score": 0.5,
+                        "matched_clues": [{"evidence": "nested-secret@example.com"}],
+                    }],
+                },
+            },
+        },
         "scores": [],
         "clues": [
             {"dimension": "signage", "value": "https://private.example/a?token=visible", "evidence": "user@example.com", "source": "ocr"},
@@ -128,7 +170,7 @@ def test_deepseek_redacts_ocr_user_and_history_secrets(settings):
     result = DeepSeekClient(cfg, transport=httpx.MockTransport(handler)).narrate(context)
     assert result == "请补充文字语言线索。"
     assert "东京" not in json.dumps(seen["body"], ensure_ascii=False)
-    for secret in ("https://private.example", "user@example.com", "sk-abcdefgh12345678", "Bearer abc.def", "ds-secret", "hf_abcdefgh12345678"):
+    for secret in ("https://private.example", "user@example.com", "sk-abcdefgh12345678", "Bearer abc.def", "ds-secret", "hf_abcdefgh12345678", "nested-secret@example.com"):
         assert secret not in json.dumps(seen["body"], ensure_ascii=False)
     assert "ja" in json.dumps(seen["body"], ensure_ascii=False)
     assert "[原始文字已隐藏]" in json.dumps(seen["body"], ensure_ascii=False)

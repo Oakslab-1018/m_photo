@@ -168,6 +168,8 @@ export interface HypothesisAction {
     candidates?: string[]
     /** Answer choices for the pending question; the AI may question or reason. */
     options?: ClueAnswerOption[]
+    /** Server-owned country routing metadata mirrored by guided responses. */
+    confidence?: ConfidenceRoute | null
     /**
      * Optional server receipt for the last submitted feedback; status is
      * `applied | unchanged | unrecognized` plus a human summary.
@@ -177,12 +179,34 @@ export interface HypothesisAction {
   }
 }
 
+export type ConfidenceTier = 'high' | 'medium' | 'low'
+export type ConfidenceAction = 'direct_top1' | 'confirm_candidates' | 'ask_clue'
+
+/** Confidence top3 rows are intentionally sparse ranking summaries, not full country rows. */
+export type ConfidenceCountryScore = Partial<CountryScore> & Pick<CountryScore, 'iso'>
+
+/** Deterministic routing metadata; margins are ranking gaps, not probabilities. */
+export interface ConfidenceRoute {
+  tier: ConfidenceTier
+  action: ConfidenceAction
+  model_only_margin?: number | null
+  fused_margin?: number | null
+  effective_margin?: number | null
+  prior_top_iso?: string | null
+  top1_iso?: string | null
+  top3: ConfidenceCountryScore[]
+  leader_changed: boolean
+  reason: string
+  policy_version: string
+}
+
 export interface UploadResponse {
   session_id: number
   image_url: string
   clues: Clue[]
   scores: CountryScore[]
   action: HypothesisAction | null
+  confidence?: ConfidenceRoute | null
   messages: ChatMessage[]
   city_scores?: CityScore[]
   /** Natural Chinese explanation when inference degraded; null/absent when healthy. */
@@ -193,6 +217,7 @@ export interface FeedbackResponse {
   clues?: Clue[]
   scores?: CountryScore[]
   action?: HypothesisAction | null
+  confidence?: ConfidenceRoute | null
   messages?: ChatMessage[]
   exclusions?: string[]
   done?: boolean
@@ -203,6 +228,7 @@ export interface AnalyzePointResponse {
   clues?: Clue[]
   scores?: CountryScore[]
   action?: HypothesisAction | null
+  confidence?: ConfidenceRoute | null
   messages?: ChatMessage[]
   exclusions?: string[]
   new_clues?: Clue[]
@@ -518,6 +544,7 @@ export interface GuidedDialogueResponse {
   dialogue: GuidedDialogue
   candidates: LocationCandidate[]
   action: HypothesisAction | null
+  confidence?: ConfidenceRoute | null
   messages: ChatMessage[]
   scores: CountryScore[]
   clues: Clue[]

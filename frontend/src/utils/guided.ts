@@ -1,15 +1,18 @@
 import type {
+  ConfidenceRoute,
   GuidedDialogue,
   GuidedLocationLevel,
   GuidedQuestion,
   GuidedStage,
   GuidedTargetRef,
+  HypothesisAction,
   LocationCandidate,
   LocationTarget,
   ReviewedClue,
   ReviewedClueStatus,
 } from '@/types'
 import { clueValueLabel, dimensionLabel } from '@/utils/clues'
+import { normalizeIsoCode } from '@/utils/geo'
 
 export interface GuidedStep {
   level: GuidedLocationLevel
@@ -208,6 +211,75 @@ export function hasPendingReviewedClues(dialogue: GuidedDialogue | null | undefi
  */
 export function isBlockingGuidedQuestion(question: GuidedQuestion | null | undefined): boolean {
   return Boolean(question && question.kind !== 'confirm_location')
+}
+
+/** Country-only product route authorized by both the action kind and confidence action. */
+export type CountryConfidenceShortcut = 'high' | 'candidates'
+
+/**
+ * The confidence route may bypass routine initial machine review, but only at
+ * country stage and only when the authoritative action matches. Corrections,
+ * conflicts and explicit user re-review are always supplied as blocked.
+ */
+export function countryConfidenceShortcut(
+  dialogue: GuidedDialogue | null | undefined,
+  action: HypothesisAction | null | undefined,
+  confidence: ConfidenceRoute | null | undefined,
+  blocked = false,
+): CountryConfidenceShortcut | null {
+  if (blocked || !dialogue || dialogue.stage !== 'country' || !action || !confidence) return null
+  const questionKind = dialogue.pending_question?.kind
+  if (questionKind === 'ask' || questionKind === 'request_clue') return null
+  if (
+    action.kind === 'result' &&
+    confidence.tier === 'high' &&
+    confidence.action === 'direct_top1'
+  ) {
+    return 'high'
+  }
+  if (
+    action.kind === 'confirm' &&
+    confidence.action === 'confirm_candidates' &&
+    (confidence.tier === 'medium' || confidence.tier === 'low')
+  ) {
+    return 'candidates'
+  }
+  return null
+}
+
+/**
+ * Join sparse confidence top3 rows back to server-provided catalog targets.
+ * Never synthesize a target; missing catalog rows are omitted.
+ */
+export function confidenceCountryCandidates(
+  confidence: ConfidenceRoute | null | undefined,
+  candidates: readonly LocationCandidate[],
+  limit: 1 | 3,
+): LocationCandidate[] {
+  if (!confidence) return []
+  const seen = new Set<string>()
+  const result: LocationCandidate[] = []
+  for (const summary of confidence.top3.slice(0, limit)) {
+    const code = normalizeIsoCode(summary.iso)
+    if (!code || seen.has(code)) continue
+    const candidate = candidates.find((item) => {
+      if (item.target.level !== 'country') return false
+      return [item.target.id, item.target.country_iso, item.target.source_iso].some(
+        (value) => normalizeIsoCode(value ?? '') === code,
+      )
+    })
+    if (!candidate) continue
+    seen.add(code)
+    result.push({
+      ...candidate,
+      score:
+        typeof summary.score === 'number' && Number.isFinite(summary.score)
+          ? summary.score
+          : candidate.score,
+      score_type: summary.score_type ?? candidate.score_type ?? null,
+    })
+  }
+  return result
 }
 
 /** Every observation handled and no unresolved ask/correction left. */

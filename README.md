@@ -1,40 +1,40 @@
 # m-photo
 
-照片地理定位实验项目：使用本地 StreetCLIP 检索候选，OCR 与引导对话补充线索，在本地国家/城市目录中逐步确认地点。DeepSeek 对话为可选文字辅助。
+照片地理定位实验项目。StreetCLIP 与 OCR 负责提供证据，用户对话补充线索，最终由同一个确定性评分器给出候选。
 
-## 当前状态
+## 交互流程
 
-- 可用：图片分析、国家 → 省级行政区 → 城市引导确认、线索否定/纠错/排除/回退、地图、局部分析和离线评测脚本。
-- 参考索引的国家评分目前仅作诊断，不参与国家排序；纳入统一 scorer 仍属计划。
-- 候选差异已有基础：`ModelAwareHypotheses` 会找 top-2 的不同特征维度并避免重复，但仍按固定维度优先级，暂无 margin/问题预算驱动的停止与弃权；同一 scorer 的有/无对话对比仍在计划中。
-- LLM 当前仅有可选文字抽取/措辞，尚未接入 guided 建议问题；不接收图片、不猜坐标、不独立决定地点。
-- 本地已导入 img2gps3k：2997 条合法坐标与图片（目录共 3000 图，另 3 张未标注）；2737 条有派生国家标签，260 条 `country_iso=null`。已完成 30 张冒烟；全量基线状态和报告见本地 `reports/`。
+上传图片 → StreetCLIP + OCR 融合 → 比较模型原始分差与融合分差：
+
+- **高置信**：直接展示首选国家和依据，可继续细化省市。
+- **中置信**：解释前三个候选，由用户选择确认。
+- **低置信**：按候选差异提问，回答写入线索卡并重新评分；最多三问，仍拿不准就明确说明不确定。
+
+模型预测不等于用户确认。只有显式确认才推进国家 → 省级区域 → 城市；纠错和主动复核始终优先。LLM 仅抽取文字线索、组织提问和解释，不看图、不决定坐标；不可用时回退本地模板。
+
+分差不是概率；当前 `0.02/0.005` 门槛尚未校准。交互代码已接通，最终验收进行中；不能据此宣称对话提高了准确率。
+
+## 评测状态
+
+img2gps3k 已导入 2997 张，其中 2737 张有国家标签。旧基线由用户停止在 1764 张。557 张缓存的三臂回放已完成：纯模型、旧 OCR、新 OCR 的 Top-1 都是 49.2%，暂未证明准确率净收益。
+
+全量三臂正在后台续跑，复用 598 条已完成记录，采集结束后自动离线对比。进度见 [ACTIVE_RUN.json](reports/ocr-evidence-ablation-20261020T205803/ACTIVE_RUN.json)，指标与复现见 [评测文档](data/eval/README.md)。真实参考索引和对话准确率 A/B 尚未完成。
 
 ## 启动
 
 需要 Docker Desktop、Python 3.12 和 uv；本地 StreetCLIP 另需 CUDA GPU。
 
 ```powershell
-Copy-Item .env.example .env            # 仅首次；已有 .env 不要覆盖
-.\scripts\setup-streetclip.ps1          # 首次安装权重
-.\scripts\start-streetclip.ps1          # 启动本地推理
+Copy-Item .env.example .env  # 仅首次；已有 .env 不要覆盖
+.\scripts\setup-streetclip.ps1
+.\scripts\start-streetclip.ps1
 docker compose up -d --build --wait
 ```
 
-启用本地模型时，在 `.env` 中设 `STREETCLIP_ENABLED=true`，并为本机推理服务与后端配置同一个非空 `STREETCLIP_API_KEY`（无需第三方申请）；无 GPU 时设 `STREETCLIP_ENABLED=false`。访问 **http://127.0.0.1:8080**；修改 `.env` 后执行：
-
-```powershell
-docker compose up -d --no-build --force-recreate --wait
-```
-
-## 评测入口
-
-离线评测、最小 manifest、指标口径、严格退出行为和后续“当前 → 计划”安排统一见
-[data/eval/README.md](data/eval/README.md)。评测脚本在宿主机运行；本地 manifest 含未标国家样本，需显式 `--allow-unlabeled-country`。国家指标只覆盖有标签子集，e2e 距离覆盖全部合法坐标；真实 baseline 尚未运行。
+在 `.env` 中设 `STREETCLIP_ENABLED=true`，并为推理服务与后端配置同一个非空 `STREETCLIP_API_KEY`；无 GPU 时设为 `false`。访问 **http://127.0.0.1:8080**。修改环境配置后执行 `docker compose up -d --no-build --force-recreate --wait`。
 
 ## 边界与文档
 
-- 数据库和上传图片保存在 Docker 卷 `m-photo_backend-data`，不要执行 `docker compose down -v`。
-- 默认仅限本机访问，尚无用户鉴权，不要直接暴露到公网。
-- 相似度不是概率；国家和城市坐标是目录代表点，不是照片 GPS。
-- 详细说明：[引导对话](docs/guided-dialogue.md) · [参考索引](docs/reference-index.md) · [目录与 GeoJSON](docs/geo-catalog.md) · [地图与局部分析](docs/interaction-analysis.md) · [后端](backend/README.md)
+- 图片和数据库位于 Docker 卷 `m-photo_backend-data`，不要执行 `docker compose down -v`。
+- 默认仅本机访问，尚无用户鉴权。地图坐标是目录代表点，不是照片 GPS。
+- [引导与置信路由](docs/guided-dialogue.md) · [三臂评测](docs/country-ablation.md) · [参考索引](docs/reference-index.md) · [目录](docs/geo-catalog.md) · [局部分析](docs/interaction-analysis.md) · [后端](backend/README.md)

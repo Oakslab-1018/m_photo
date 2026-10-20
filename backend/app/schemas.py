@@ -106,6 +106,24 @@ class ActionModel(BaseModel):
     model_config = {"extra": "allow"}
 
 
+class ConfidenceRouteModel(BaseModel):
+    """Deterministic product routing; neither margin is a probability."""
+
+    tier: Literal["high", "medium", "low"]
+    action: Literal["direct_top1", "confirm_candidates", "ask_clue"]
+    model_only_margin: float | None = Field(default=None, allow_inf_nan=False)
+    fused_margin: float | None = Field(default=None, allow_inf_nan=False)
+    effective_margin: float | None = Field(default=None, allow_inf_nan=False)
+    prior_top_iso: str | None = None
+    top1_iso: str | None = None
+    top3: list[CountryScoreModel] = Field(default_factory=list)
+    leader_changed: bool = False
+    reason: str = ""
+    policy_version: str
+
+    model_config = {"extra": "forbid"}
+
+
 class ChatMessageModel(BaseModel):
     id: int
     role: MessageRole
@@ -123,6 +141,7 @@ class UploadResponse(BaseModel):
     clues: list[ClueModel] = Field(default_factory=list)
     scores: list[CountryScoreModel] = Field(default_factory=list)
     action: ActionModel | None = None
+    confidence: ConfidenceRouteModel | None = None
     inference_notice: str | None = None
     messages: list[ChatMessageModel] = Field(default_factory=list)
 
@@ -165,6 +184,7 @@ class FeedbackRequest(BaseModel):
 class FeedbackResponse(BaseModel):
     scores: list[CountryScoreModel] = Field(default_factory=list)
     action: ActionModel | None = None
+    confidence: ConfidenceRouteModel | None = None
     messages: list[ChatMessageModel] = Field(default_factory=list)
     clues: list[ClueModel] = Field(default_factory=list)
     exclusions: list[str] = Field(default_factory=list)
@@ -312,6 +332,7 @@ class GuidedDialogueResponse(BaseModel):
     dialogue: GuidedDialogueModel
     candidates: list[GuidedCandidateModel] = Field(default_factory=list)
     action: ActionModel | None = None
+    confidence: ConfidenceRouteModel | None = None
     messages: list[ChatMessageModel] = Field(default_factory=list)
     scores: list[CountryScoreModel] = Field(default_factory=list)
     clues: list[ClueModel] = Field(default_factory=list)
@@ -591,6 +612,7 @@ class AnalyzePointResponse(BaseModel):
     new_clues: list[ClueModel] = Field(default_factory=list)
     scores: list[CountryScoreModel] = Field(default_factory=list)
     action: ActionModel | None = None
+    confidence: ConfidenceRouteModel | None = None
     messages: list[ChatMessageModel] = Field(default_factory=list)
     clues: list[ClueModel] = Field(default_factory=list)
     exclusions: list[str] = Field(default_factory=list)
@@ -616,6 +638,7 @@ __all__ = [
     "CityScopeModel",
     "CityScoreModel",
     "ClueModel",
+    "ConfidenceRouteModel",
     "CountriesResponse",
     "CountryModel",
     "CountryScoreModel",
