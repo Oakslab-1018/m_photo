@@ -11,7 +11,14 @@
 | `VITE_MAPTILER_API_KEY` | MapTiler public key；自动解析为 `https://api.maptiler.com/maps/streets-v4/style.json?key=…` |
 
 - 本地如需覆盖默认底图：复制 `frontend/.env.example` 为 `frontend/.env.local` 后填写。
-- 容器：`Dockerfile.frontend` 已声明同名 build ARG/ENV，Compose build args 由集成阶段接线。
+- Docker Compose：在根目录 `.env` 中设置同名变量；Compose 会将两者转发为前端
+  build args（默认值均为空）。变量在构建期内联，修改后需重建前端镜像：
+  ```bash
+  docker compose build frontend && docker compose up -d frontend
+  ```
+- MapTiler hybrid 样式提供卫星影像和标注；可用显式 style URL 覆盖（将
+  `<public-key>` 替换为受限的公开 key）：
+  `VITE_MAP_STYLE_URL=https://api.maptiler.com/maps/hybrid/style.json?key=<public-key>`
 - 两项都为空时，默认加载随前端构建发布的 Esri World Imagery raster style
   （`frontend/public/esri-world-imagery-style.json`），无需 API key。该样式固定使用
   `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}`、

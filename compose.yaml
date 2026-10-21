@@ -59,6 +59,8 @@ services:
       dockerfile: Dockerfile.frontend
       args:
         NODE_VERSION: "24"
+        VITE_MAP_STYLE_URL: "${VITE_MAP_STYLE_URL:-}"
+        VITE_MAPTILER_API_KEY: "${VITE_MAPTILER_API_KEY:-}"
     image: m-photo-frontend:local
     ports:
       # 第一阶段 geo 无用户鉴权：默认只绑定宿主机回环地址。

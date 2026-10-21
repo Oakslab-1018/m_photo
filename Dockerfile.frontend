@@ -8,7 +8,8 @@ FROM node:${NODE_VERSION}-bookworm-slim AS build
 WORKDIR /app
 
 # 地图样式：public client-side 配置，不是服务端密钥。MapTiler key 必须在
-# MapTiler 控制台配置来源/Referrer 限制；两参数为空时回落到 demo tiles。
+# MapTiler 控制台配置来源/Referrer 限制；两参数为空时回落到随包发布的
+# Esri World Imagery 样式。
 ARG VITE_MAP_STYLE_URL=
 ARG VITE_MAPTILER_API_KEY=
 ENV VITE_MAP_STYLE_URL=${VITE_MAP_STYLE_URL} \
