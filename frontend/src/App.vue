@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { AnimatePresence, motion, useReducedMotion } from 'motion-v'
 import { api } from '@/api'
 import { normalizeApiError } from '@/api/errors'
 import type {
@@ -108,9 +109,9 @@ type MobileSheetState = 'peek' | 'half' | 'full'
 type EvidenceTab = 'photo' | 'clues' | 'references'
 
 const FOCUS_MODES: Array<{ key: FocusMode; label: string; hint: string }> = [
-  { key: 'collab', label: '协同推演', hint: '同时展开证据与推理' },
-  { key: 'map', label: '地图专注', hint: '收起两侧浮层，保留完整地图' },
-  { key: 'photo', label: '照片取证', hint: '展开证据台并收起推理' },
+  { key: 'collab', label: '协同', hint: '同时展开证据与推理' },
+  { key: 'map', label: '地图', hint: '收起两侧浮层，保留完整地图' },
+  { key: 'photo', label: '照片', hint: '展开证据台并收起推理' },
 ]
 
 const commandBarRef = ref<HTMLElement | null>(null)
@@ -127,6 +128,10 @@ const mobileEvidenceTab = ref<EvidenceTab>('photo')
 const historyOpen = ref(false)
 const historyDialogRef = ref<HTMLElement | null>(null)
 const mobileEvidenceDialogRef = ref<HTMLElement | null>(null)
+const reduceMotion = useReducedMotion()
+const enterFrom = computed(() => (reduceMotion.value ? false : { opacity: 0, y: 8 }))
+const enterSettle = { opacity: 1, y: 0 }
+const enterEase = { duration: 0.24, ease: [0.2, 0.7, 0.2, 1] as const }
 
 const { mapInsets, isMobile, isCompact } = useImmersiveLayout({
   commandBar: commandBarRef,
@@ -254,33 +259,33 @@ const countryOptions = computed(() => {
 const inferenceNotice = computed(() => safeGuidedText(session.inferenceNotice.value) || null)
 
 const sessionStatus = computed(() => {
-  if (uploading.value) return '正在分析图像…'
+  if (uploading.value) return '分析中…'
   if (guided.active.value) {
     const current = guided.dialogue.value
-    if (!current) return guided.loading.value ? '正在启动引导定位…' : '引导定位待重试'
+    if (!current) return guided.loading.value ? '启动推理…' : '推理待重试'
     if (current.stage === 'resolved') {
-      return `已完成：${targetLabel(current.confirmed.city)}`
+      return `完成 · ${targetLabel(current.confirmed.city)}`
     }
     if (!guidedCandidateSurfaceVisible.value) {
-      if (guided.reviewReady.value) return '观察已核对 · 点击“下一步”查看候选'
+      if (guided.reviewReady.value) return '观察已核对'
       const review = guided.reviewProgress.value
       return review
-        ? `先核对观察 · 第 ${review.current} / ${review.total}`
-        : `先核对观察 · 待处理 ${guided.pendingClueCount.value} 条`
+        ? `核对观察 ${review.current}/${review.total}`
+        : `待核对 ${guided.pendingClueCount.value} 条`
     }
     if (!guidedConfirmationReady.value) {
-      return `${guidedStageTitle(current.stage)} · 候选已解锁 · 新增观察待核对`
+      return `${guidedStageTitle(current.stage)} · 新增观察待核对`
     }
-    return `${guidedStageTitle(current.stage)} · 候选 ${guidedVisibleCandidates.value.length} 个`
+    return `${guidedStageTitle(current.stage)} · ${guidedVisibleCandidates.value.length} 个候选`
   }
   if (session.confirmedIso.value) {
     const country = session.scores.value.find((item) => item.iso === session.confirmedIso.value)
     const scope = country ? regionScopeLabel(country) : null
     const name = country ? displayCountryName(country) : session.confirmedIso.value
-    return `已由用户确认：${name}${scope ? `（区域命中 ${scope}）` : ''}`
+    return `已确认 · ${name}${scope ? `（${scope}）` : ''}`
   }
-  if (!hasSession.value) return '未开始 · 请上传一张照片'
-  return `候选国家 ${session.scores.value.length} 个 · 均为代表点`
+  if (!hasSession.value) return '未开始'
+  return `${session.scores.value.length} 个国家候选`
 })
 
 const countryBreadcrumb = computed(() => {
@@ -1386,15 +1391,15 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
           </svg>
         </span>
         <span class="command-brand__copy">
-          <h1 class="command-brand__title">地理定位推理台</h1>
-          <span class="command-brand__sub">证据 · 推演 · 人工确认</span>
+          <h1 class="command-brand__title">M-PHOTO</h1>
+          <span class="command-brand__sub">影像地理定位推理台</span>
         </span>
       </div>
 
       <nav class="session-breadcrumb" aria-label="当前推理路径">
         <span class="breadcrumb-step">
           <span class="breadcrumb-index">01</span>
-          <span class="breadcrumb-label">国家</span>
+          <span class="sr-only">国家</span>
           <strong :title="countryBreadcrumb">{{ countryBreadcrumb }}</strong>
         </span>
         <span class="breadcrumb-arrow" aria-hidden="true">
@@ -1404,7 +1409,7 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
         </span>
         <span class="breadcrumb-step breadcrumb-step--city">
           <span class="breadcrumb-index">02</span>
-          <span class="breadcrumb-label">城市</span>
+          <span class="sr-only">城市</span>
           <strong :title="cityBreadcrumb">{{ cityBreadcrumb }}</strong>
         </span>
       </nav>
@@ -1456,14 +1461,14 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
           <path d="M3 12a9 9 0 1 0 3-6.7L3 8" />
           <path d="M3 3v5h5M12 7v5l3 2" />
         </svg>
-        <span class="command-action__label">历史</span>
+        <span class="command-action__label">记录</span>
       </button>
 
       <button type="button" class="command-action command-action--strong" @click="newAnalysis">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" aria-hidden="true">
           <path d="M12 5v14M5 12h14" />
         </svg>
-        <span class="command-action__label">新建分析</span>
+        <span class="command-action__label">新建</span>
       </button>
     </header>
 
@@ -1493,14 +1498,19 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
       </div>
     </main>
 
-    <transition name="fade">
-      <div
+    <AnimatePresence>
+      <motion.div
         v-if="isMobile && mobileEvidenceOpen"
+        key="mobile-evidence-backdrop"
         class="mobile-evidence-backdrop"
         aria-hidden="true"
+        :initial="reduceMotion ? false : { opacity: 0 }"
+        :animate="{ opacity: 1 }"
+        :exit="{ opacity: 0 }"
+        :transition="{ duration: reduceMotion ? 0 : 0.18 }"
         @click="closeMobileEvidence"
       />
-    </transition>
+    </AnimatePresence>
 
     <aside
       v-show="evidenceAnchorVisible"
@@ -1510,11 +1520,14 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
       :inert="historyOpen"
       aria-label="照片与证据"
     >
-      <button
+      <motion.button
         v-if="showEvidenceThumbnail"
         type="button"
         class="dock-thumbnail evidence-thumbnail"
         aria-label="展开证据台"
+        :initial="enterFrom"
+        :animate="enterSettle"
+        :transition="enterEase"
         @click="expandEvidenceDock"
       >
         <span class="dock-thumbnail__media">
@@ -1531,7 +1544,7 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
           <strong>证据台</strong>
           <small>{{ clueCount }} 条线索</small>
         </span>
-      </button>
+      </motion.button>
 
       <section
         v-else
@@ -1545,10 +1558,10 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
         <header class="dock-head">
           <div class="dock-heading">
             <span class="section-kicker">EVIDENCE</span>
-            <h2 id="evidence-dock-title">照片与证据</h2>
+            <h2 id="evidence-dock-title">证据台</h2>
           </div>
           <div class="dock-head__actions">
-            <span v-if="session.imageUrl.value" class="dock-state-chip">{{ regionReports.length }} 份区域报告</span>
+            <span v-if="session.imageUrl.value" class="dock-state-chip">{{ regionReports.length }} 份报告</span>
             <button
               v-if="!isMobile"
               type="button"
@@ -1587,9 +1600,9 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
             <div class="dock-section-heading">
               <div>
                 <span class="section-kicker">PHOTO</span>
-                <h3>原始照片与区域分析</h3>
+                <h3>照片</h3>
               </div>
-              <span v-if="session.imageUrl.value" class="dock-muted">点击照片可更换</span>
+              <span v-if="session.imageUrl.value" class="dock-muted">点击更换</span>
             </div>
 
             <UploadPanel
@@ -1624,9 +1637,9 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
                   <circle cx="11" cy="11" r="6.5" />
                   <path d="m16 16 4 4M8 11h6M11 8v6" />
                 </svg>
-                打开区域分析
+                区域分析
               </button>
-              <span class="evidence-footnote">点选 / 框选后人工确认；坐标不代表照片 GPS</span>
+              <span class="evidence-footnote">框选后人工确认 · 坐标非照片 GPS</span>
             </div>
           </section>
 
@@ -1634,9 +1647,9 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
             <div class="dock-section-heading">
               <div>
                 <span class="section-kicker">OBSERVATIONS</span>
-                <h3>线索卡 <span class="dock-count">{{ clueCount }}</span></h3>
+                <h3>线索 <span class="dock-count">{{ clueCount }}</span></h3>
               </div>
-              <span class="dock-muted">按证据强度排序</span>
+              <span class="dock-muted">按强度</span>
             </div>
             <ClueList
               :clues="session.clues.value"
@@ -1652,7 +1665,7 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
                 <span class="section-kicker">REFERENCES</span>
                 <h3>参考街景</h3>
               </div>
-              <span class="dock-muted">相似度仅作诊断</span>
+              <span class="dock-muted">仅作诊断</span>
             </div>
             <CandidatePanel
               surface="references"
@@ -1692,11 +1705,14 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
       :inert="backgroundInert"
       aria-label="推理任务"
     >
-      <button
+      <motion.button
         v-if="showReasoningTaskChip"
         type="button"
         class="reasoning-task-chip"
         aria-label="展开推理任务"
+        :initial="enterFrom"
+        :animate="enterSettle"
+        :transition="enterEase"
         @click="expandReasoningDock"
       >
         <span class="reasoning-task-chip__icon" aria-hidden="true">
@@ -1711,14 +1727,21 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
           <small>{{ liveStatus.text }}</small>
         </span>
         <span class="live-dot" :class="liveStatus.tone" aria-hidden="true" />
-      </button>
+      </motion.button>
 
-      <section v-show="!showReasoningTaskChip" class="floating-dock reasoning-dock" aria-labelledby="reasoning-dock-title">
+      <motion.section
+        v-show="!showReasoningTaskChip"
+        class="floating-dock reasoning-dock"
+        aria-labelledby="reasoning-dock-title"
+        :initial="enterFrom"
+        :animate="enterSettle"
+        :transition="enterEase"
+      >
         <header class="dock-head reasoning-dock__head">
           <div class="dock-heading">
             <span class="section-kicker">REASONING</span>
-            <h2 id="reasoning-dock-title">{{ guided.active.value ? '引导推演' : '协同推理' }}</h2>
-            <span class="dock-muted">{{ session.messages.value.length }} 条记录</span>
+            <h2 id="reasoning-dock-title">{{ guided.active.value ? '引导定位' : '协同推理' }}</h2>
+            <span class="dock-muted">{{ session.messages.value.length }} 条</span>
           </div>
           <div class="dock-head__actions">
             <div v-if="isMobile" class="sheet-state-switch" role="group" aria-label="任务面板高度">
@@ -1758,16 +1781,32 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
           </div>
         </header>
 
-        <div class="reasoning-live" :class="liveStatus.tone" role="status" aria-live="polite">
+        <motion.div
+          :key="`${liveStatus.tone}:${liveStatus.text}`"
+          class="reasoning-live"
+          :class="liveStatus.tone"
+          role="status"
+          aria-live="polite"
+          :initial="reduceMotion ? false : { opacity: 0.4 }"
+          :animate="{ opacity: 1 }"
+          :transition="{ duration: reduceMotion ? 0 : 0.2 }"
+        >
           <span class="live-dot" aria-hidden="true" />
           <span>{{ liveStatus.text }}</span>
           <span v-if="questionPending" class="chat-alert">待回答</span>
-        </div>
+        </motion.div>
 
         <div class="reasoning-body" :class="{ 'has-legacy-candidates': !guided.active.value }">
-          <div v-if="inferenceNotice" class="inference-notice reasoning-notice" role="status">
+          <motion.div
+            v-if="inferenceNotice"
+            class="inference-notice reasoning-notice"
+            role="status"
+            :initial="enterFrom"
+            :animate="enterSettle"
+            :transition="enterEase"
+          >
             {{ inferenceNotice }}
-          </div>
+          </motion.div>
 
           <div class="reasoning-grid">
             <div class="reasoning-primary">
@@ -1865,12 +1904,26 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
             />
           </div>
         </div>
-      </section>
+      </motion.section>
     </aside>
 
-    <transition name="drawer">
-      <div v-if="historyOpen" class="history-layer">
+    <AnimatePresence>
+      <motion.div
+        v-if="historyOpen"
+        key="history-layer"
+        class="history-layer"
+        :initial="reduceMotion ? false : { opacity: 0 }"
+        :animate="{ opacity: 1 }"
+        :exit="{ opacity: 0 }"
+        :transition="{ duration: reduceMotion ? 0 : 0.18 }"
+      >
         <div class="drawer-backdrop" @click="closeHistory" />
+        <motion.div
+          class="history-drawer-shell"
+          :initial="reduceMotion ? false : { opacity: 0, x: 18 }"
+          :animate="{ opacity: 1, x: 0 }"
+          :transition="{ duration: reduceMotion ? 0 : 0.24, ease: [0.2, 0.7, 0.2, 1] }"
+        >
         <aside
           id="reasoning-history-drawer"
           ref="historyDialogRef"
@@ -1884,7 +1937,7 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
             <div>
               <span class="section-kicker">HISTORY</span>
               <h2 id="history-drawer-title">推理记录</h2>
-              <p>完整对话、回执与待发送反馈</p>
+              <p>对话、回执与待发送反馈</p>
             </div>
             <div class="history-drawer__actions">
               <span>{{ session.messages.value.length }} 条</span>
@@ -1908,15 +1961,26 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
             />
           </div>
         </aside>
-      </div>
-    </transition>
+        </motion.div>
+      </motion.div>
+    </AnimatePresence>
 
-    <transition name="fade">
-      <div v-if="errorMessage" class="error-banner" role="alert" :inert="backgroundInert">
+    <AnimatePresence>
+      <motion.div
+        v-if="errorMessage"
+        key="error-banner"
+        class="error-banner"
+        role="alert"
+        :inert="backgroundInert"
+        :initial="reduceMotion ? false : { opacity: 0, y: 10 }"
+        :animate="{ opacity: 1, y: 0 }"
+        :exit="{ opacity: 0, y: 6 }"
+        :transition="{ duration: reduceMotion ? 0 : 0.2 }"
+      >
         <span>{{ errorMessage }}</span>
         <button type="button" aria-label="关闭错误提示" @click="errorMessage = null">×</button>
-      </div>
-    </transition>
+      </motion.div>
+    </AnimatePresence>
 
     <ConfirmLocationDialog
       v-if="confirmCandidate"

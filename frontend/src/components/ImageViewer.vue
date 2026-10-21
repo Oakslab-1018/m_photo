@@ -480,9 +480,9 @@ onBeforeUnmount(() => {
   position: absolute;
   z-index: 3;
   box-sizing: border-box;
-  border: 3px solid #d97706;
-  background: rgba(245, 158, 11, 0.16);
-  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.9), 0 0 18px rgba(180, 83, 9, 0.55);
+  border: 2px solid var(--amber);
+  background: rgba(232, 163, 61, 0.14);
+  box-shadow: 0 0 0 1px rgba(10, 15, 18, 0.65), 0 0 20px rgba(232, 163, 61, 0.34);
   pointer-events: none;
   animation: clue-source-pulse 1.2s ease-out 1;
 }
@@ -494,14 +494,17 @@ onBeforeUnmount(() => {
   max-width: min(240px, 70vw);
   overflow: hidden;
   padding: 2px 6px;
-  border-radius: 4px;
-  background: #92400e;
-  color: #fff;
-  font-size: 10px;
-  font-weight: 700;
-  line-height: 1.35;
+  border: 1px solid var(--amber-line);
+  border-radius: 3px;
+  background: rgba(10, 15, 18, 0.9);
+  color: var(--amber);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 20px;
   text-overflow: ellipsis;
   white-space: nowrap;
+  backdrop-filter: blur(6px);
 }
 
 .focused-clue-box.label-inside .focused-clue-label {
@@ -516,10 +519,10 @@ onBeforeUnmount(() => {
 
 @keyframes clue-source-pulse {
   0% {
-    box-shadow: 0 0 0 2px #fff, 0 0 0 8px rgba(217, 119, 6, 0.35);
+    box-shadow: 0 0 0 1px rgba(10, 15, 18, 0.65), 0 0 0 7px rgba(232, 163, 61, 0.28);
   }
   100% {
-    box-shadow: 0 0 0 2px #fff, 0 0 18px rgba(180, 83, 9, 0.55);
+    box-shadow: 0 0 0 1px rgba(10, 15, 18, 0.65), 0 0 20px rgba(232, 163, 61, 0.34);
   }
 }
 

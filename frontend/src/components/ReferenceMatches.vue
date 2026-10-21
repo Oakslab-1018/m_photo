@@ -40,7 +40,7 @@ function formatSupport(value: number): string {
     </p>
 
     <p v-if="!scores.length" class="reference-empty">
-      上传图片后，如有参考街景诊断会显示在这里。
+      上传照片后显示街景参考。
     </p>
     <p v-else-if="isEmptyLibrary" class="reference-empty">
       未配置带标签的参考图库，暂无参考街景诊断。
@@ -93,30 +93,54 @@ function formatSupport(value: number): string {
 <style scoped>
 .reference-panel {
   flex-shrink: 0;
-  margin-top: 10px;
-  border-top: 1px solid var(--border);
-  padding-top: 10px;
-  font-size: 12px;
-  color: var(--text);
+  margin-top: 0;
+  padding-top: 0;
+  border-top: 0;
+  color: var(--ink-soft);
+  font-size: 14px;
+  font-weight: 400;
+  line-height: 20px;
 }
-.reference-title { font-size: 13px; font-weight: 700; margin-bottom: 4px; }
-.reference-disclaimer { font-size: 11px; color: var(--warn); margin-bottom: 4px; }
-.reference-empty { font-size: 11px; color: var(--muted); }
-.reference-subtitle { font-size: 11px; font-weight: 700; color: var(--primary); margin: 6px 0 4px; }
-.reference-list { list-style: none; display: flex; flex-direction: column; gap: 4px; }
+.reference-title { margin-bottom: 3px; font-size: 15px;
+  line-height: 22px; font-weight: 600; color: var(--ink); }
+.reference-disclaimer { margin-bottom: 5px; font-size: 13px;
+  font-weight: 400; line-height: 20px; color: var(--faint); }
+.reference-empty { font-size: 13px;
+  font-weight: 400; line-height: 20px; color: var(--muted); }
+.reference-subtitle {
+  margin: 8px 0 4px;
+  color: var(--faint);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 20px;
+  font-weight: 400;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.reference-list { display: flex; flex-direction: column; gap: 8px; list-style: none; }
 .reference-item {
-  background: #f8fafc;
-  border-left: 3px solid var(--primary);
-  border-radius: 4px;
-  padding: 5px 8px;
+  padding: 16px;
+  border-left: 1px solid var(--blue-line);
+  border-radius: 0;
+  background: rgba(255, 255, 255, 0.018);
 }
 .reference-line { display: flex; justify-content: space-between; gap: 8px; }
-.reference-place { font-weight: 600; }
-.reference-cosine { color: var(--muted); font-size: 11px; white-space: nowrap; }
-.reference-meta { color: var(--muted); font-size: 11px; display: flex; flex-wrap: wrap; gap: 4px; }
+.reference-place { font-size: 15px;
+  line-height: 22px; font-weight: 600; color: var(--ink-soft); }
+.reference-cosine { color: var(--faint); font-family: var(--font-mono); font-size: 13px;
+  font-weight: 400;
+  line-height: 20px; white-space: nowrap; }
+.reference-meta { display: flex; flex-wrap: wrap; gap: 3px; color: var(--faint); font-family: var(--font-mono); font-size: 13px;
+  font-weight: 400;
+  line-height: 20px; }
 .reference-id { opacity: 0.7; }
 .reference-regions { display: flex; flex-direction: column; gap: 3px; }
-.reference-region { display: flex; justify-content: space-between; gap: 8px; font-size: 11px; }
-.reference-region-meta { color: var(--muted); text-align: right; }
-.reference-semantics { margin-top: 6px; font-size: 11px; color: var(--muted); }
+.reference-region { display: flex; justify-content: space-between; gap: 8px; font-size: 13px;
+  font-weight: 400;
+  line-height: 20px; }
+.reference-region-meta { color: var(--faint); font-family: var(--font-mono); font-size: 13px;
+  font-weight: 400;
+  line-height: 20px; text-align: right; }
+.reference-semantics { margin-top: 7px; font-size: 13px;
+  font-weight: 400; line-height: 20px; color: var(--faint); }
 </style>

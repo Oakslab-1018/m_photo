@@ -15,5 +15,9 @@ const attribution = computed(() => [...new Set(props.match.sources.map(source =>
 </template>
 
 <style scoped>
-.place-evidence { display: grid; gap: 3px; margin-top: 6px; color: var(--text-secondary, #657080); font-size: 12px; line-height: 1.5; }
+.place-evidence { display: grid; gap: 3px; margin-top: 5px; color: var(--muted); font-size: 13px;
+  font-weight: 400; line-height: 20px; }
+.place-evidence small { color: var(--faint); font-family: var(--font-mono); font-size: 13px;
+  font-weight: 400;
+  line-height: 20px; }
 </style>

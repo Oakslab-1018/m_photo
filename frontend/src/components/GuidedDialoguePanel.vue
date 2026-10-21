@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { AnimatePresence, motion, useReducedMotion } from 'motion-v'
 import PlaceMatchEvidence from '@/components/PlaceMatchEvidence.vue'
 import type {
   ConfidenceRoute,
@@ -121,6 +122,11 @@ const emit = defineEmits<{
 
 const backtrackPrompt = ref<GuidedLocationLevel | null>(null)
 const panelRef = ref<HTMLElement | null>(null)
+const reduceMotion = useReducedMotion()
+/** Initial state shared by dock content entering after a state change. */
+const enterState = computed(() => (reduceMotion.value ? false : { opacity: 0, y: 6 }))
+const enterTarget = { opacity: 1, y: 0 }
+const enterTransition = { duration: 0.22, ease: [0.2, 0.7, 0.2, 1] as const }
 let headerResizeObserver: ResizeObserver | null = null
 
 // Native focus/scrollIntoView must leave controls below the sticky task header.
@@ -188,8 +194,8 @@ const shortcutExplanation = computed(() => {
   const message = safeGuidedText(props.action?.message)
   if (message) return message
   return countryShortcut.value === 'high'
-    ? '模型给出了首选国家，请结合照片确认后再进入下一层级。'
-    : '以下候选较为接近，请结合照片明确选择。'
+    ? '首选国家；请结合照片确认。'
+    : '候选接近；请结合照片选择。'
 })
 const shortcutTitle = computed(() => {
   if (countryShortcut.value === 'high') return '推荐国家 / 地区'
@@ -373,12 +379,15 @@ const latestAssistantMessage = computed(() => {
 })
 const composerHint = computed(() => {
   if (isResolved.value) {
-    return '定位已完成；新线索会交回助手重新核对，不会自动改动已确认结果。'
+    return '新线索会交回助手重新核对，不改动已确认结果。'
   }
   if (!props.candidatesUnlocked) {
-    return '请描述照片中可见的招牌、道路方向、语言或地名；提交不会自动确认地点。'
+    return '补充可见招牌、道路方向或文字；提交不会自动确认地点。'
   }
-  return `可描述照片中可见的线索，也可直接输入${candidateLevelName.value}名称检索目录；提交不会自动确认地点。`
+  if (stage.value === 'country') {
+    return `可直接输入${candidateLevelName.value}名称检索目录；提交后会重新比较国家候选，不会自动确认地点。`
+  }
+  return `可直接输入${candidateLevelName.value}名称检索目录；提交不会自动确认地点。`
 })
 const composerReceiptText = computed(() => safeGuidedReceipt(props.receipt?.summary))
 const receiptStatusText = computed(() => {
@@ -406,7 +415,7 @@ const composerStatusText = computed(() => {
   }
   return composerReceiptText.value
     ? `助手反馈：${composerReceiptText.value}`
-    : '已收到这条线索，定位助手会结合它继续核对。'
+    : '已收到，助手会继续核对。'
 })
 
 /** Scroll only the guided panel; never scroll the document or a candidate card. */
@@ -507,9 +516,17 @@ watch(stage, (nextStage, previousStage) => {
             <span class="guided-kicker">引导定位</span>
             <div class="guided-title-row">
               <h2 id="guided-stage-heading">{{ stageTitle }}</h2>
-              <span class="guided-task-pill" role="status" aria-live="polite">
+              <motion.span
+                :key="currentTaskLabel"
+                class="guided-task-pill"
+                role="status"
+                aria-live="polite"
+                :initial="enterState"
+                :animate="enterTarget"
+                :transition="enterTransition"
+              >
                 {{ currentTaskLabel }}
-              </span>
+              </motion.span>
             </div>
           </div>
           <div class="guided-panel-head-actions">
@@ -563,7 +580,7 @@ watch(stage, (nextStage, previousStage) => {
         </details>
 
         <div v-if="backtrackPrompt" class="guided-backtrack-confirm" role="alert">
-          <span>返回此步会清除它后面已经确认的层级，确定继续？</span>
+          <span>后续已确认层级会被清除，继续？</span>
           <div>
             <button type="button" class="ghost-btn" :disabled="busy" @click="backtrackPrompt = null">
               取消
@@ -588,20 +605,36 @@ watch(stage, (nextStage, previousStage) => {
         </div>
 
         <template v-else-if="dialogue">
-          <div v-if="receipt?.summary || receipt?.status" class="guided-receipt" role="status">
+          <motion.div
+            v-if="receipt?.summary || receipt?.status"
+            class="guided-receipt"
+            role="status"
+            :initial="enterState"
+            :animate="enterTarget"
+            :transition="enterTransition"
+          >
             {{ receiptStatusText }}
-          </div>
+          </motion.div>
 
-          <div v-if="isResolved" class="guided-resolved">
+          <motion.div
+            v-if="isResolved"
+            class="guided-resolved"
+            :initial="enterState"
+            :animate="enterTarget"
+            :transition="enterTransition"
+          >
             <span class="guided-resolved-label">最终结果</span>
             <strong>{{ targetLabel(dialogue.confirmed.city) }}</strong>
             <p>已根据您的确认完成定位；城市坐标仅为代表点，不是照片 GPS。</p>
-          </div>
+          </motion.div>
 
-          <section
+          <motion.section
             v-if="!isResolved && countryShortcut"
             class="guided-confidence-result"
             :class="'is-' + countryShortcut"
+            :initial="enterState"
+            :animate="enterTarget"
+            :transition="enterTransition"
           >
             <div class="guided-confidence-head">
               <div>
@@ -612,11 +645,14 @@ watch(stage, (nextStage, previousStage) => {
             </div>
             <p class="guided-confidence-explanation">{{ shortcutExplanation }}</p>
 
-            <article
+            <motion.article
               v-for="(candidate, index) in shortcutCandidates"
               :key="candidateTargetKey(candidate.target)"
               class="guided-candidate-card guided-confidence-card"
               :class="{ selected: isCandidateSelected(candidate.target) }"
+              :initial="enterState"
+              :animate="enterTarget"
+              :transition="{ duration: 0.2, delay: Math.min(index, 5) * 0.035 }"
             >
               <div class="guided-candidate-summary">
                 <button
@@ -651,7 +687,7 @@ watch(stage, (nextStage, previousStage) => {
                 <div class="guided-candidate-detail-body">
                   <p v-if="candidate.reason" class="guided-candidate-reason">{{ candidate.reason }}</p>
                   <p v-if="!candidatePointLabel(candidate.target)" class="guided-candidate-point-note">
-                    此候选无坐标，地图不放置候选标记；选中时仅聚焦已确认父级范围。
+                    无坐标；选中仅聚焦父级范围。
                   </p>
                   <PlaceMatchEvidence v-if="candidate.place_match" :match="candidate.place_match" />
                 </div>
@@ -675,10 +711,10 @@ watch(stage, (nextStage, previousStage) => {
                   排除{{ locationLevelLabel(candidate.target.level) }}
                 </button>
               </div>
-            </article>
+            </motion.article>
 
             <div v-if="!shortcutCandidates.length" class="guided-empty">
-              服务器候选暂未就绪，请重新加载；页面不会自行拼装地点。
+              候选尚未就绪，请重新加载。
             </div>
             <div class="guided-confidence-actions">
               <button
@@ -692,7 +728,7 @@ watch(stage, (nextStage, previousStage) => {
               </button>
               <span>{{ shortcutFooter }}</span>
             </div>
-          </section>
+          </motion.section>
 
           <section
             v-if="!isResolved && !countryShortcut && phase === 'review'"
@@ -702,7 +738,7 @@ watch(stage, (nextStage, previousStage) => {
             <template v-if="phase === 'review'">
               <div v-if="showLowCluePrompt" class="guided-low-confidence-note">
                 <strong>当前信息不足，先补充可观察线索</strong>
-                <span>请回答下面的问题，或在下方输入文字线索；提交后会重新比较国家候选，不会自动确认地点。</span>
+                <span>回答下方问题，或在下方补充文字线索。</span>
               </div>
               <div v-if="isReviewClueQuestion" class="guided-review-box">
                 <div class="guided-section-head">
@@ -748,7 +784,7 @@ watch(stage, (nextStage, previousStage) => {
                   </button>
                 </template>
                 <div v-else class="guided-question-hint">
-                  当前观察暂时无法显示，请重新加载后再试。
+                  观察暂时无法显示，请重新加载。
                 </div>
               </div>
 
@@ -775,7 +811,7 @@ watch(stage, (nextStage, previousStage) => {
                   </button>
                 </div>
                 <div v-else class="guided-question-hint">
-                  请在下方输入可观察线索；自由文本不会直接推进确认层级。
+                  在下方输入可观察线索。
                 </div>
                 <button
                   type="button"
@@ -788,7 +824,7 @@ watch(stage, (nextStage, previousStage) => {
               </div>
 
               <div v-else-if="pendingClueCount > 0" class="guided-question-hint">
-                还有 {{ pendingClueCount }} 条观察待核对，请重新加载后再试。
+                还有 {{ pendingClueCount }} 条观察待核对。
               </div>
 
               <div v-else class="guided-next-step" role="status">
@@ -847,19 +883,22 @@ watch(stage, (nextStage, previousStage) => {
             </div>
 
             <div v-if="pendingQuestion?.kind === 'confirm_location'" class="guided-question-hint">
-              请在下方候选中明确确认当前层级；不会根据排序第一名自动确认。
+              请明确选择当前层级；不会自动确认第一名。
             </div>
 
             <p class="guided-section-hint">{{ candidateSectionHint }}</p>
             <div v-if="!topCandidates.length" class="guided-empty">
-              当前层级暂无候选。请在下方补充照片中可见的招牌、地名或文字；补充线索不会自动确认地点。
+              当前层级暂无候选；可补充照片中可见的招牌、地名或文字。
             </div>
 
-            <article
+            <motion.article
               v-for="(candidate, index) in topCandidates"
               :key="candidateTargetKey(candidate.target)"
               class="guided-candidate-card"
               :class="{ selected: isCandidateSelected(candidate.target) }"
+              :initial="enterState"
+              :animate="enterTarget"
+              :transition="{ duration: 0.2, delay: Math.min(index, 5) * 0.035 }"
             >
               <div class="guided-candidate-summary">
                 <button
@@ -894,7 +933,7 @@ watch(stage, (nextStage, previousStage) => {
                 <div class="guided-candidate-detail-body">
                   <p v-if="candidate.reason" class="guided-candidate-reason">{{ candidate.reason }}</p>
                   <p v-if="!candidatePointLabel(candidate.target)" class="guided-candidate-point-note">
-                    此候选无坐标，地图不放置候选标记；选中时仅聚焦已确认父级范围。
+                    无坐标；选中仅聚焦父级范围。
                   </p>
                   <PlaceMatchEvidence v-if="candidate.place_match" :match="candidate.place_match" />
                 </div>
@@ -918,7 +957,7 @@ watch(stage, (nextStage, previousStage) => {
                   排除{{ locationLevelLabel(candidate.target.level) }}
                 </button>
               </div>
-            </article>
+            </motion.article>
           </section>
 
           <section v-if="candidatesPhase && dialogue.exclusions.length" class="guided-exclusions">
@@ -926,7 +965,7 @@ watch(stage, (nextStage, previousStage) => {
               <span class="guided-section-title">已排除地点</span>
               <span class="guided-section-note">可撤回</span>
             </div>
-            <p class="guided-section-hint">地点排除只作用于对应目标，不会影响同名地点或其他层级。</p>
+            <p class="guided-section-hint">排除仅作用于该目标。</p>
             <div
               v-for="target in dialogue.exclusions"
               :key="`${target.level}-${target.id}`"
@@ -963,32 +1002,38 @@ watch(stage, (nextStage, previousStage) => {
         补充线索，与定位助手对话
       </label>
 
-      <p
-        v-if="busy || freeTextSubmission"
-        class="guided-composer-status-line guided-composer-submission"
-        :class="freeTextSubmission ? `is-${freeTextSubmission.status}` : 'is-busy'"
-        :role="freeTextSubmission?.status === 'failed' ? 'alert' : 'status'"
-        aria-live="polite"
-      >
-        <span v-if="busy" class="guided-composer-busy">
-          <span class="guided-composer-status-dot" aria-hidden="true" />
-          助手处理中
-        </span>
-        <span
-          v-if="freeTextSubmission"
-          class="guided-composer-submitted-text"
-          :title="freeTextSubmission.text"
+      <AnimatePresence>
+        <motion.p
+          v-if="busy || freeTextSubmission"
+          class="guided-composer-status-line guided-composer-submission"
+          :class="freeTextSubmission ? `is-${freeTextSubmission.status}` : 'is-busy'"
+          :role="freeTextSubmission?.status === 'failed' ? 'alert' : 'status'"
+          aria-live="polite"
+          :initial="reduceMotion ? false : { opacity: 0, y: -3 }"
+          :animate="{ opacity: 1, y: 0 }"
+          :exit="{ opacity: 0, y: -3 }"
+          :transition="{ duration: reduceMotion ? 0 : 0.16 }"
         >
-          你说：“{{ freeTextSubmission.text }}”
-        </span>
-        <span
-          v-if="freeTextSubmission"
-          class="guided-composer-status"
-          :title="composerStatusText"
-        >
-          {{ composerStatusText }}
-        </span>
-      </p>
+          <span v-if="busy" class="guided-composer-busy">
+            <span class="guided-composer-status-dot" aria-hidden="true" />
+            助手处理中
+          </span>
+          <span
+            v-if="freeTextSubmission"
+            class="guided-composer-submitted-text"
+            :title="freeTextSubmission.text"
+          >
+            你说：“{{ freeTextSubmission.text }}”
+          </span>
+          <span
+            v-if="freeTextSubmission"
+            class="guided-composer-status"
+            :title="composerStatusText"
+          >
+            {{ composerStatusText }}
+          </span>
+        </motion.p>
+      </AnimatePresence>
 
       <div class="guided-composer-row">
         <div class="guided-composer-field">
@@ -1005,7 +1050,7 @@ watch(stage, (nextStage, previousStage) => {
             type="text"
             autocomplete="off"
             enterkeyhint="send"
-            placeholder="例如：路牌上是日文，车辆靠左行驶；也可直接输入地名"
+            placeholder="输入照片中的招牌、文字或地名"
             :disabled="busy"
             aria-describedby="guided-composer-hint"
             @compositionstart="composing = true"
@@ -1045,28 +1090,30 @@ watch(stage, (nextStage, previousStage) => {
   </section>
 </template><style scoped>
 .guided-dialogue-shell {
-  --guided-ink: #172522;
-  --guided-muted: #66746f;
-  --guided-line: #dbe7e3;
-  --guided-line-strong: #c5d7d2;
-  --guided-teal: #0f766e;
-  --guided-teal-dark: #0b5b56;
-  --guided-teal-soft: #edf7f4;
-  --guided-warn: #9a5b0b;
-  --guided-danger: #b42318;
+  --guided-ink: var(--ink);
+  --guided-muted: var(--muted);
+  --guided-line: var(--line);
+  --guided-line-strong: var(--line-strong);
+  --guided-teal: var(--amber);
+  --guided-teal-dark: var(--amber-bright);
+  --guided-teal-soft: var(--amber-soft);
+  --guided-warn: #e0b26a;
+  --guided-danger: var(--coral);
+  overflow: hidden;
   display: flex;
   flex: 1 1 auto;
   flex-direction: column;
   gap: 0;
   min-width: 0;
   min-height: 0;
-  overflow: hidden;
-  border: 1px solid var(--guided-line);
-  border-radius: 16px;
+  border: 0;
+  border-radius: 0;
   color: var(--guided-ink);
-  background: #fff;
-  box-shadow: 0 10px 28px rgba(27, 56, 49, 0.06);
+  background: transparent;
+  box-shadow: none;
   font-size: 14px;
+  font-weight: 400;
+  line-height: 20px;
 }
 
 .guided-panel {
@@ -1079,7 +1126,7 @@ watch(stage, (nextStage, previousStage) => {
   scroll-behavior: smooth;
   scroll-padding-top: var(--guided-header-height, 160px);
   padding: 0;
-  background: #fff;
+  background: transparent;
 }
 
 .guided-dock-header {
@@ -1088,12 +1135,12 @@ watch(stage, (nextStage, previousStage) => {
   z-index: 20;
   display: grid;
   gap: 8px;
-  padding: 12px 12px 10px;
+  padding: 12px 16px;
   border-bottom: 1px solid var(--guided-line);
-  border-radius: 15px 15px 0 0;
-  background: rgba(255, 255, 255, 0.98);
-  box-shadow: 0 6px 18px rgba(27, 56, 49, 0.06);
-  backdrop-filter: blur(8px);
+  border-radius: 0;
+  background: rgba(13, 21, 25, 0.985);
+  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.24);
+  backdrop-filter: blur(14px);
 }
 
 .guided-panel-head {
@@ -1111,38 +1158,42 @@ watch(stage, (nextStage, previousStage) => {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 6px 8px;
+  gap: 5px 8px;
   margin-top: 1px;
 }
 
 .guided-kicker {
   display: block;
   color: var(--guided-teal);
-  font-size: 10.5px;
-  font-weight: 800;
-  line-height: 1.2;
-  letter-spacing: 0.11em;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 20px;
+  letter-spacing: 0.08em;
 }
 
 .guided-panel-head h2 {
   margin: 0;
   color: var(--guided-ink);
-  font-size: 17px;
-  line-height: 1.25;
+  font-size: 18px;
+  font-weight: 700;
+  line-height: 28px;
+  letter-spacing: -0.005em;
 }
 
 .guided-task-pill {
   display: inline-flex;
   align-items: center;
-  min-height: 23px;
-  padding: 2px 8px;
-  border: 1px solid #b9dcd5;
-  border-radius: 999px;
-  color: var(--guided-teal-dark);
-  background: var(--guided-teal-soft);
-  font-size: 11.5px;
-  font-weight: 700;
-  line-height: 1.25;
+  min-height: 24px;
+  padding: 3px 8px;
+  border: 1px solid var(--guided-line);
+  border-radius: 3px;
+  color: var(--guided-muted);
+  background: transparent;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 20px;
   white-space: nowrap;
 }
 
@@ -1151,30 +1202,35 @@ watch(stage, (nextStage, previousStage) => {
   flex: 0 0 auto;
   flex-direction: column;
   align-items: flex-end;
-  gap: 5px;
+  gap: 4px;
 }
 
 .guided-progress {
   flex-shrink: 0;
-  padding: 2px 8px;
-  border: 1px solid var(--guided-line);
-  border-radius: 999px;
-  color: var(--guided-muted);
-  background: #f8fbfa;
-  font-size: 11px;
-  line-height: 1.4;
+  color: var(--faint);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 20px;
   white-space: nowrap;
 }
 
 .guided-back-btn {
-  min-height: 27px;
-  padding: 3px 8px;
-  border-color: var(--guided-line-strong);
-  border-radius: 8px;
-  color: var(--guided-teal-dark);
-  font-size: 11px;
-  line-height: 1.3;
+  min-height: 32px;
+  padding: 4px 8px;
+  border-color: var(--guided-line);
+  border-radius: 4px;
+  color: var(--guided-muted);
+  font-size: 14px;
+  font-weight: 400;
+  line-height: 20px;
   white-space: nowrap;
+}
+
+.guided-back-btn:hover:not(:disabled) {
+  border-color: var(--amber-line);
+  color: var(--guided-teal);
+  background: var(--guided-teal-soft);
 }
 
 .guided-path {
@@ -1192,43 +1248,46 @@ watch(stage, (nextStage, previousStage) => {
   display: flex;
   flex: 1 1 0;
   align-items: center;
-  gap: 7px;
+  gap: 8px;
   min-width: 0;
-  min-height: 42px;
+  min-height: 50px;
   margin: 0;
-  padding: 5px 7px;
+  padding: 6px 10px;
   border: 1px solid var(--guided-line);
-  border-radius: 10px;
-  background: #f8fbfa;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.018);
   opacity: 1;
 }
 
 .guided-path li:not(:last-child)::after {
-  content: '→';
+  content: "";
   position: absolute;
-  right: -8px;
+  right: -7px;
+  top: 50%;
   z-index: 1;
-  width: 8px;
-  color: #8ba39d;
-  font-size: 11px;
-  line-height: 1;
-  text-align: center;
-  transform: translateX(50%);
+  width: 7px;
+  height: 1px;
+  background: var(--guided-line-strong);
+  transform: translateY(-50%);
   pointer-events: none;
 }
 
 .guided-path li.is-current {
-  border-color: #8fc6be;
+  border-color: var(--amber-line);
   background: var(--guided-teal-soft);
 }
 
 .guided-path li.is-done {
-  border-color: #c6ded9;
-  background: #f6fbfa;
+  border-color: var(--sage-line);
+  background: var(--sage-soft);
 }
 
 .guided-path li.is-pending {
-  opacity: 0.68;
+  opacity: 1;
+}
+
+.guided-path li.is-pending .guided-step-main strong {
+  color: var(--faint);
 }
 
 .guided-step-index {
@@ -1236,21 +1295,28 @@ watch(stage, (nextStage, previousStage) => {
   flex: 0 0 auto;
   align-items: center;
   justify-content: center;
-  width: 22px;
-  height: 22px;
-  border-radius: 7px;
-  color: #fff;
-  background: #9aa8a4;
-  font-size: 11px;
-  font-weight: 700;
+  width: 26px;
+  height: 26px;
+  border: 1px solid var(--guided-line-strong);
+  border-radius: 3px;
+  color: var(--guided-muted);
+  background: transparent;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 20px;
+  font-weight: 400;
 }
 
 .guided-path li.is-done .guided-step-index {
-  background: var(--guided-teal);
+  border-color: var(--sage-line);
+  color: var(--sage);
+  background: var(--sage-soft);
 }
 
 .guided-path li.is-current .guided-step-index {
-  background: var(--guided-teal-dark);
+  border-color: var(--guided-teal);
+  color: var(--on-amber);
+  background: var(--guided-teal);
 }
 
 .guided-step-main {
@@ -1261,16 +1327,18 @@ watch(stage, (nextStage, previousStage) => {
 }
 
 .guided-step-label {
-  color: var(--guided-muted);
-  font-size: 10px;
-  line-height: 1.25;
+  color: var(--faint);
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 20px;
 }
 
 .guided-step-main strong {
   overflow: hidden;
   color: var(--guided-ink);
-  font-size: 12.5px;
-  line-height: 1.35;
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 22px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -1278,13 +1346,15 @@ watch(stage, (nextStage, previousStage) => {
 .guided-backtrack-btn,
 .guided-link-btn {
   flex: 0 0 auto;
-  min-height: 24px;
-  padding: 2px 3px;
+  min-height: 22px;
+  padding: 1px 2px;
   border: 0;
-  border-radius: 5px;
+  border-radius: 3px;
   color: var(--guided-teal);
   background: transparent;
-  font-size: 10.5px;
+  font-size: 14px;
+  font-weight: 400;
+  line-height: 20px;
   cursor: pointer;
 }
 
@@ -1292,6 +1362,7 @@ watch(stage, (nextStage, previousStage) => {
 .guided-link-btn:hover:not(:disabled) {
   color: var(--guided-teal-dark);
   text-decoration: underline;
+  text-underline-offset: 3px;
 }
 
 .guided-backtrack-btn:disabled,
@@ -1303,9 +1374,11 @@ watch(stage, (nextStage, previousStage) => {
 .guided-task-message {
   overflow: hidden;
   margin: 0;
-  border: 1px solid var(--guided-line);
-  border-radius: 9px;
-  background: #f9fbfb;
+  padding-left: 8px;
+  border: 0;
+  border-left: 2px solid var(--amber-line);
+  border-radius: 0;
+  background: transparent;
 }
 
 .guided-task-message summary {
@@ -1313,11 +1386,12 @@ watch(stage, (nextStage, previousStage) => {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  min-height: 30px;
-  padding: 4px 8px;
+  min-height: 28px;
+  padding: 2px 0;
   color: var(--guided-muted);
-  font-size: 11.5px;
-  line-height: 1.35;
+  font-size: 14px;
+  font-weight: 400;
+  line-height: 20px;
   cursor: pointer;
   list-style: none;
 }
@@ -1328,14 +1402,20 @@ watch(stage, (nextStage, previousStage) => {
 }
 
 .guided-task-message-label {
-  color: var(--guided-teal-dark);
-  font-weight: 700;
+  color: var(--amber);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 20px;
+  font-weight: 400;
+  letter-spacing: 0.04em;
 }
 
 .guided-task-message-toggle {
   flex: 0 0 auto;
-  color: var(--guided-teal);
-  font-size: 10.5px;
+  color: var(--faint);
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 20px;
 }
 
 .guided-task-message[open] .guided-task-message-toggle {
@@ -1344,10 +1424,11 @@ watch(stage, (nextStage, previousStage) => {
 
 .guided-task-message p {
   margin: 0;
-  padding: 0 9px 8px;
+  padding: 0 0 8px;
   color: var(--guided-muted);
-  font-size: 13px;
-  line-height: 1.55;
+  font-size: 14px;
+  font-weight: 400;
+  line-height: 20px;
   overflow-wrap: anywhere;
 }
 
@@ -1356,13 +1437,14 @@ watch(stage, (nextStage, previousStage) => {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  padding: 7px 8px;
-  border: 1px solid #efd6ad;
-  border-radius: 9px;
-  color: var(--guided-warn);
-  background: #fffaf0;
-  font-size: 11.5px;
-  line-height: 1.45;
+  padding: 12px;
+  border: 1px solid var(--coral-line);
+  border-radius: 5px;
+  color: var(--guided-danger);
+  background: var(--coral-soft);
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 20px;
 }
 
 .guided-backtrack-confirm > div {
@@ -1373,15 +1455,17 @@ watch(stage, (nextStage, previousStage) => {
 
 .guided-backtrack-confirm .ghost-btn,
 .guided-backtrack-confirm .mini-btn {
-  min-height: 28px;
-  padding: 3px 7px;
-  font-size: 11px;
+  min-height: 36px;
+  padding: 8px 12px;
+  font-size: 14px;
+  font-weight: 400;
+  line-height: 20px;
 }
 
 .guided-main {
   display: grid;
-  gap: 10px;
-  padding: 10px 12px 14px;
+  gap: 12px;
+  padding: 16px;
 }
 
 .guided-error {
@@ -1389,85 +1473,95 @@ watch(stage, (nextStage, previousStage) => {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  padding: 8px 9px;
-  border: 1px solid #f1c9c6;
-  border-radius: 9px;
-  background: #fff7f6;
+  padding: 12px;
+  border: 1px solid var(--coral-line);
+  border-radius: 5px;
+  background: var(--coral-soft);
 }
 
 .guided-error p {
   color: var(--guided-danger);
-  font-size: 12.5px;
-  line-height: 1.45;
+  font-size: 14px;
+  font-weight: 400;
+  line-height: 20px;
 }
 
 .guided-error .ghost-btn {
-  min-height: 29px;
-  padding: 4px 8px;
-  font-size: 11px;
+  min-height: 36px;
+  padding: 8px 12px;
+  font-size: 14px;
+  font-weight: 400;
+  line-height: 20px;
 }
 
 .guided-loading {
-  padding: 18px 10px;
+  padding: 20px 12px;
   color: var(--guided-muted);
-  font-size: 12.5px;
-  line-height: 1.5;
+  font-size: 14px;
+  font-weight: 400;
+  line-height: 20px;
   text-align: center;
 }
 
 .guided-receipt {
   justify-self: start;
-  padding: 4px 9px;
-  border-radius: 999px;
-  color: var(--guided-teal-dark);
-  background: var(--guided-teal-soft);
-  font-size: 11.5px;
-  line-height: 1.4;
+  padding: 3px 0 3px 8px;
+  border-left: 2px solid var(--amber-line);
+  color: var(--guided-muted);
+  background: transparent;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 20px;
 }
 
 .guided-resolved {
   display: flex;
   flex-direction: column;
-  gap: 3px;
-  padding: 12px;
-  border: 1px solid #a9d2cb;
-  border-radius: 11px;
-  background: linear-gradient(180deg, #f5fbf9, #fff);
+  gap: 6px;
+  padding: 16px;
+  border: 1px solid var(--sage-line);
+  border-radius: 7px;
+  background: var(--sage-soft);
 }
 
 .guided-resolved-label {
-  color: var(--guided-teal);
-  font-size: 10.5px;
-  font-weight: 800;
-  letter-spacing: 0.08em;
+  color: var(--sage);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 20px;
+  font-weight: 400;
+  letter-spacing: 0.1em;
 }
 
 .guided-resolved strong {
   color: var(--guided-ink);
   font-size: 18px;
-  line-height: 1.3;
+  font-weight: 700;
+  line-height: 28px;
+  letter-spacing: -0.01em;
 }
 
 .guided-resolved p {
   color: var(--guided-muted);
-  font-size: 12px;
-  line-height: 1.5;
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 20px;
 }
 
 .guided-confidence-result {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  padding: 10px;
-  border: 1px solid #a9d2cb;
-  border-radius: 11px;
-  background: #fff;
-  box-shadow: 0 0 0 2px rgba(15, 118, 110, 0.05);
+  gap: 10px;
+  padding: 16px;
+  border: 1px solid var(--guided-line);
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.018);
+  box-shadow: none;
 }
 
 .guided-confidence-result.is-candidates {
-  border-color: #e6c997;
-  box-shadow: 0 0 0 2px rgba(154, 91, 11, 0.04);
+  border-color: var(--amber-line);
 }
 
 .guided-confidence-head {
@@ -1480,15 +1574,17 @@ watch(stage, (nextStage, previousStage) => {
 .guided-confidence-head > div {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 1px;
   min-width: 0;
 }
 
 .guided-confidence-kicker {
   color: var(--guided-teal);
-  font-size: 10.5px;
-  font-weight: 800;
-  letter-spacing: 0.07em;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 20px;
+  font-weight: 400;
+  letter-spacing: 0.08em;
 }
 
 .guided-confidence-result.is-candidates .guided-confidence-kicker {
@@ -1498,25 +1594,29 @@ watch(stage, (nextStage, previousStage) => {
 .guided-confidence-head strong {
   color: var(--guided-ink);
   font-size: 15px;
-  line-height: 1.3;
+  font-weight: 600;
+  line-height: 22px;
 }
 
 .guided-confidence-note {
   flex: 0 0 auto;
-  padding: 2px 7px;
+  padding: 1px 5px;
   border: 1px solid var(--guided-line);
-  border-radius: 999px;
-  color: var(--guided-muted);
-  background: #fff;
-  font-size: 10.5px;
-  line-height: 1.4;
+  border-radius: 3px;
+  color: var(--faint);
+  background: transparent;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 20px;
   white-space: nowrap;
 }
 
 .guided-confidence-explanation {
   color: var(--guided-muted);
-  font-size: 12.5px;
-  line-height: 1.55;
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 20px;
 }
 
 .guided-confidence-actions {
@@ -1524,31 +1624,37 @@ watch(stage, (nextStage, previousStage) => {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  padding-top: 7px;
+  padding-top: 12px;
   border-top: 1px dashed var(--guided-line);
 }
 
 .guided-confidence-actions .ghost-btn {
-  min-height: 29px;
-  padding: 4px 8px;
-  font-size: 11px;
+  flex: 0 0 auto;
+  min-height: 36px;
+  padding: 8px 12px;
+  font-size: 14px;
+  font-weight: 400;
+  line-height: 20px;
+  white-space: nowrap;
 }
 
 .guided-confidence-actions span {
-  color: var(--guided-muted);
-  font-size: 11px;
-  line-height: 1.45;
+  color: var(--faint);
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 20px;
 }
 
 .guided-question {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  padding: 12px;
-  border: 1px solid #9dcbc4;
-  border-radius: 12px;
-  background: #fff;
-  box-shadow: 0 0 0 2px rgba(15, 118, 110, 0.045);
+  gap: 10px;
+  padding: 16px;
+  border: 1px solid var(--guided-line);
+  border-left: 2px solid var(--amber);
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.018);
+  box-shadow: none;
 }
 
 .guided-review-box {
@@ -1560,23 +1666,25 @@ watch(stage, (nextStage, previousStage) => {
 .guided-low-confidence-note {
   display: flex;
   flex-direction: column;
-  gap: 3px;
-  padding: 8px 9px;
-  border: 1px solid #eed7b1;
-  border-radius: 9px;
-  background: #fffaf1;
+  gap: 4px;
+  padding: 12px;
+  border: 1px solid var(--amber-line);
+  border-radius: 5px;
+  background: var(--amber-soft);
 }
 
 .guided-low-confidence-note strong {
   color: var(--guided-warn);
-  font-size: 12.5px;
-  line-height: 1.4;
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 20px;
 }
 
 .guided-low-confidence-note span {
-  color: #756650;
-  font-size: 12px;
-  line-height: 1.5;
+  color: var(--guided-muted);
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 20px;
 }
 
 .guided-section-head {
@@ -1588,100 +1696,105 @@ watch(stage, (nextStage, previousStage) => {
 
 .guided-section-title {
   color: var(--guided-ink);
-  font-size: 13px;
-  font-weight: 800;
-  line-height: 1.35;
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 22px;
 }
 
 .guided-one-question,
 .guided-section-note {
-  color: var(--guided-muted);
-  font-size: 11px;
-  line-height: 1.4;
+  color: var(--faint);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 20px;
 }
 
 .guided-review-progress {
   flex-shrink: 0;
-  padding: 2px 7px;
-  border: 1px solid #9dcbc4;
-  border-radius: 999px;
-  color: var(--guided-teal-dark);
-  background: var(--guided-teal-soft);
-  font-size: 10.5px;
-  font-weight: 700;
+  color: var(--guided-teal);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 20px;
+  font-weight: 400;
 }
 
 .guided-question-message {
   color: var(--guided-ink);
   font-size: 14px;
-  font-weight: 650;
-  line-height: 1.55;
+  font-weight: 400;
+  line-height: 20px;
 }
 
 .guided-question-reason,
 .guided-section-hint {
   color: var(--guided-muted);
-  font-size: 12px;
-  line-height: 1.5;
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 20px;
 }
 
 .guided-question-clue {
   display: flex;
   flex-direction: column;
-  gap: 3px;
-  padding: 7px 8px;
+  gap: 4px;
+  padding: 12px;
   border: 1px dashed var(--guided-line-strong);
-  border-radius: 8px;
-  background: #f8fbfa;
+  border-radius: 5px;
+  background: var(--panel-soft);
 }
 
 .guided-question-clue strong {
   color: var(--guided-ink);
-  font-size: 13px;
-  line-height: 1.4;
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 22px;
 }
 
 .guided-question-clue > span,
 .guided-question-hint {
   color: var(--guided-muted);
-  font-size: 12px;
-  line-height: 1.5;
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 20px;
 }
 
 .guided-clue-new {
   justify-self: start;
-  padding: 1px 6px;
-  border-radius: 999px;
-  color: var(--guided-teal-dark) !important;
-  background: var(--guided-teal-soft);
-  font-size: 10.5px !important;
-  font-weight: 700;
+  color: var(--guided-teal) !important;
+  font-family: var(--font-mono);
+  font-size: 13px !important;
+  line-height: 20px;
+  font-weight: 400;
 }
 
 .guided-inline-actions,
 .guided-answer-options {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
+  gap: 5px;
 }
 
 .guided-inline-actions .mini-btn,
 .guided-answer-options .option-chip {
-  min-height: 32px;
-  padding: 5px 10px;
-  font-size: 12px;
+  min-height: 36px;
+  padding: 8px 12px;
+  font-size: 14px;
+  font-weight: 400;
+  line-height: 20px;
 }
 
 .guided-unknown-btn {
   align-self: flex-start;
-  min-height: 31px;
-  padding: 5px 10px;
+  min-height: 36px;
+  padding: 8px 12px;
   border: 1px dashed var(--guided-line-strong);
-  border-radius: 999px;
+  border-radius: 3px;
   color: var(--guided-muted);
-  background: #fff;
-  font-size: 11.5px;
-  line-height: 1.35;
+  background: transparent;
+  font-size: 14px;
+  font-weight: 400;
+  line-height: 20px;
   cursor: pointer;
 }
 
@@ -1702,20 +1815,23 @@ watch(stage, (nextStage, previousStage) => {
 
 .guided-review-nav .ghost-btn,
 .guided-candidates-toolbar .ghost-btn {
-  min-height: 30px;
-  padding: 4px 9px;
-  font-size: 11.5px;
+  min-height: 36px;
+  padding: 8px 12px;
+  font-size: 14px;
+  font-weight: 400;
+  line-height: 20px;
 }
 
 .guided-next-step {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 9px;
-  padding: 10px;
-  border: 1px solid #a9d2cb;
-  border-radius: 10px;
-  background: linear-gradient(180deg, #f3faf8, #fff);
+  gap: 12px;
+  padding: 16px;
+  border: 1px solid var(--sage-line);
+  border-left: 2px solid var(--sage);
+  border-radius: 7px;
+  background: var(--sage-soft);
 }
 
 .guided-next-step > div {
@@ -1726,73 +1842,78 @@ watch(stage, (nextStage, previousStage) => {
 }
 
 .guided-next-step strong {
-  color: var(--guided-teal-dark);
-  font-size: 12.5px;
-  line-height: 1.4;
+  color: var(--sage);
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 22px;
 }
 
 .guided-next-step span {
   color: var(--guided-muted);
-  font-size: 11.5px;
-  line-height: 1.45;
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 20px;
 }
 
 .guided-next-step .primary-btn {
   flex: 0 0 auto;
-  min-height: 33px;
-  padding: 6px 10px;
-  font-size: 11.5px;
+  min-height: 40px;
+  padding: 10px 14px;
+  font-size: 14px;
+  font-weight: 400;
+  line-height: 20px;
 }
 
 .guided-candidates,
 .guided-exclusions {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  padding-top: 10px;
+  gap: 7px;
+  padding-top: 9px;
   border-top: 1px solid var(--guided-line);
 }
 
 .guided-candidates-toolbar {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
+  gap: 5px;
 }
 
 .guided-empty {
-  padding: 10px;
+  padding: 16px;
   border: 1px dashed var(--guided-line-strong);
-  border-radius: 9px;
+  border-radius: 5px;
   color: var(--guided-muted);
-  background: #fbfcfc;
-  font-size: 12px;
-  line-height: 1.5;
+  background: transparent;
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 20px;
 }
 
 .guided-candidate-card {
   display: grid;
   flex: 0 0 auto;
-  gap: 7px;
+  gap: 8px;
   align-items: stretch;
   justify-content: initial;
   min-width: 0;
-  padding: 9px;
+  padding: 16px;
   border: 1px solid var(--guided-line);
-  border-radius: 10px;
-  background: #fff;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.018);
   cursor: default;
-  transition: border-color 0.15s ease, background 0.15s ease, box-shadow 0.15s ease;
+  transition: border-color 0.15s ease, background 0.15s ease;
 }
 
 .guided-candidate-card:hover {
   border-color: var(--guided-line-strong);
-  background: #fff;
+  background: rgba(255, 255, 255, 0.03);
 }
 
 .guided-candidate-card.selected {
-  border-color: #82beb5;
-  background: #f5fbf9;
-  box-shadow: 0 0 0 2px rgba(15, 118, 110, 0.09);
+  border-color: var(--amber-line);
+  background: var(--amber-soft);
+  box-shadow: none;
 }
 
 .guided-candidate-summary {
@@ -1807,9 +1928,9 @@ watch(stage, (nextStage, previousStage) => {
   align-items: flex-start;
   gap: 8px;
   min-width: 0;
-  padding: 2px;
+  padding: 1px;
   border: 0;
-  border-radius: 7px;
+  border-radius: 3px;
   color: inherit;
   background: transparent;
   text-align: left;
@@ -1817,7 +1938,7 @@ watch(stage, (nextStage, previousStage) => {
 }
 
 .guided-candidate-select:hover:not(:disabled) .guided-candidate-main strong {
-  color: var(--guided-teal-dark);
+  color: var(--guided-teal);
 }
 
 .guided-candidate-select:disabled {
@@ -1829,20 +1950,21 @@ watch(stage, (nextStage, previousStage) => {
   flex: 0 0 auto;
   align-items: center;
   justify-content: center;
-  width: 27px;
-  height: 27px;
-  border: 1px solid #b9dcd5;
-  border-radius: 8px;
-  color: var(--guided-teal-dark);
-  background: var(--guided-teal-soft);
-  font-size: 12px;
-  font-weight: 800;
-  line-height: 1;
+  width: 28px;
+  height: 28px;
+  border: 1px solid var(--guided-line-strong);
+  border-radius: 3px;
+  color: var(--guided-muted);
+  background: transparent;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 20px;
 }
 
 .guided-candidate-card.selected .guided-candidate-number {
   border-color: var(--guided-teal);
-  color: #fff;
+  color: var(--on-amber);
   background: var(--guided-teal);
 }
 
@@ -1850,15 +1972,16 @@ watch(stage, (nextStage, previousStage) => {
   display: flex;
   flex: 1 1 auto;
   flex-direction: column;
-  gap: 2px;
+  gap: 1px;
   min-width: 0;
 }
 
 .guided-candidate-main strong {
   overflow: hidden;
   color: var(--guided-ink);
-  font-size: 14px;
-  line-height: 1.35;
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 22px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -1866,15 +1989,16 @@ watch(stage, (nextStage, previousStage) => {
 .guided-candidate-name-meta {
   display: flex;
   flex-wrap: wrap;
-  gap: 2px 8px;
+  gap: 2px 7px;
   min-width: 0;
 }
 
 .guided-candidate-meta,
 .guided-candidate-point {
-  color: var(--guided-muted);
-  font-size: 11px;
-  line-height: 1.4;
+  color: var(--faint);
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 20px;
 }
 
 .guided-candidate-meta {
@@ -1888,39 +2012,51 @@ watch(stage, (nextStage, previousStage) => {
 
 .guided-candidate-point {
   flex: 0 0 auto;
-  color: var(--guided-warn);
+  color: var(--blue);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 20px;
 }
 
 .guided-candidate-point.missing {
-  color: var(--guided-muted);
+  color: var(--faint);
 }
 
 .guided-candidate-detail {
-  margin-left: 35px;
+  margin-left: 36px;
   border-top: 1px dashed var(--guided-line);
 }
 
 .guided-candidate-detail summary {
-  min-height: 27px;
-  padding: 5px 1px 2px;
+  min-height: 32px;
+  padding: 6px 0 2px;
   color: var(--guided-teal);
-  font-size: 11px;
-  line-height: 1.35;
+  font-size: 14px;
+  font-weight: 400;
+  line-height: 20px;
   cursor: pointer;
   list-style: none;
 }
 
+.guided-candidate-detail summary:hover {
+  color: var(--guided-teal-dark);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
 .guided-candidate-detail-body {
   display: grid;
-  gap: 5px;
-  padding: 2px 1px 1px;
+  gap: 4px;
+  padding: 2px 0 1px;
 }
 
 .guided-candidate-reason,
 .guided-candidate-point-note {
   color: var(--guided-muted);
-  font-size: 12px;
-  line-height: 1.5;
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 20px;
   overflow-wrap: anywhere;
 }
 
@@ -1931,8 +2067,9 @@ watch(stage, (nextStage, previousStage) => {
 .guided-candidate-detail :deep(.place-evidence) {
   margin-top: 0;
   color: var(--guided-muted);
-  font-size: 11.5px;
-  line-height: 1.5;
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 20px;
 }
 
 .guided-candidate-actions {
@@ -1940,21 +2077,22 @@ watch(stage, (nextStage, previousStage) => {
   flex-direction: row;
   flex-wrap: wrap;
   justify-content: flex-end;
-  gap: 6px;
-  padding-left: 35px;
+  gap: 8px;
+  padding-left: 36px;
 }
 
 .guided-candidate-actions .mini-btn {
-  min-height: 32px;
-  padding: 5px 10px;
-  border-radius: 8px;
-  font-size: 11.5px;
-  font-weight: 650;
+  min-height: 36px;
+  padding: 8px 12px;
+  border-radius: 5px;
+  font-size: 14px;
+  line-height: 20px;
+  font-weight: 400;
 }
 
 .guided-candidate-actions .mini-btn.confirm {
   border-color: var(--guided-teal);
-  color: #fff;
+  color: var(--on-amber);
   background: var(--guided-teal);
 }
 
@@ -1964,19 +2102,19 @@ watch(stage, (nextStage, previousStage) => {
 }
 
 .guided-candidate-actions .mini-btn.reject {
-  border-color: #eccbc8;
+  border-color: var(--coral-line);
   color: var(--guided-danger);
-  background: #fff;
+  background: transparent;
 }
 
 .guided-candidate-actions .mini-btn.reject:hover:not(:disabled) {
   border-color: var(--guided-danger);
-  color: #fff;
+  color: var(--bg);
   background: var(--guided-danger);
 }
 
 .guided-candidate-actions .mini-btn:disabled {
-  opacity: 0.5;
+  opacity: 0.45;
   cursor: not-allowed;
 }
 
@@ -1985,13 +2123,14 @@ watch(stage, (nextStage, previousStage) => {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  padding: 6px 8px;
-  border: 1px solid #f0d4d2;
-  border-radius: 8px;
+  padding: 8px 12px;
+  border: 1px solid var(--coral-line);
+  border-radius: 4px;
   color: var(--guided-danger);
-  background: #fff9f8;
-  font-size: 12px;
-  line-height: 1.45;
+  background: var(--coral-soft);
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 20px;
 }
 
 .guided-composer {
@@ -1999,45 +2138,47 @@ watch(stage, (nextStage, previousStage) => {
   z-index: 30;
   display: grid;
   flex: 0 0 auto;
-  gap: 7px;
+  gap: 8px;
   min-width: 0;
-  padding: 9px 12px 10px;
+  padding: 12px 16px;
   border-top: 1px solid var(--guided-line);
-  background: #fff;
-  box-shadow: 0 -7px 18px rgba(27, 56, 49, 0.055);
+  background: rgba(13, 21, 25, 0.985);
+  box-shadow: 0 -10px 26px rgba(0, 0, 0, 0.24);
   transition: border-color 0.16s ease;
 }
 
 .guided-composer.is-busy {
-  border-top-color: #b9dcd5;
+  border-top-color: var(--amber-line);
 }
 
 .guided-composer-status-line {
   display: flex;
   flex-wrap: wrap;
   align-items: flex-start;
-  gap: 3px 7px;
+  gap: 2px 6px;
   min-width: 0;
   margin: 0;
-  padding: 5px 7px;
+  padding: 6px 8px;
   border: 1px solid var(--guided-line);
-  border-radius: 8px;
+  border-radius: 4px;
   color: var(--guided-muted);
-  background: #f8fbfa;
-  font-size: 11.5px;
-  line-height: 1.4;
+  background: rgba(255, 255, 255, 0.018);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 20px;
 }
 
 .guided-composer-status-line.is-failed {
-  border-color: #f0cfcc;
+  border-color: var(--coral-line);
   color: var(--guided-danger);
-  background: #fff7f6;
+  background: var(--coral-soft);
 }
 
 .guided-composer-status-line.is-unconfirmed {
-  border-color: #eed7b1;
+  border-color: var(--amber-line);
   color: var(--guided-warn);
-  background: #fffaf1;
+  background: var(--amber-soft);
 }
 
 .guided-composer-busy {
@@ -2045,13 +2186,13 @@ watch(stage, (nextStage, previousStage) => {
   flex: 0 0 auto;
   align-items: center;
   gap: 5px;
-  color: var(--guided-teal-dark);
-  font-weight: 700;
+  color: var(--guided-teal);
+  font-weight: 500;
 }
 
 .guided-composer-status-dot {
-  width: 6px;
-  height: 6px;
+  width: 5px;
+  height: 5px;
   border-radius: 50%;
   background: currentColor;
   animation: guided-composer-pulse 1.1s ease-in-out infinite;
@@ -2061,7 +2202,7 @@ watch(stage, (nextStage, previousStage) => {
   overflow: hidden;
   flex: 0 1 auto;
   max-width: 100%;
-  color: var(--guided-teal-dark);
+  color: var(--ink-soft);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -2075,7 +2216,7 @@ watch(stage, (nextStage, previousStage) => {
 .guided-composer-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
-  gap: 7px;
+  gap: 6px;
   align-items: stretch;
 }
 
@@ -2084,49 +2225,54 @@ watch(stage, (nextStage, previousStage) => {
   display: flex;
   align-items: center;
   min-width: 0;
-  border-radius: 9px;
+  border-radius: 6px;
 }
 
 .guided-composer-field-icon {
   position: absolute;
-  left: 11px;
+  left: 12px;
   z-index: 1;
   display: inline-flex;
-  color: var(--guided-teal);
+  color: var(--faint);
   pointer-events: none;
 }
 
 .guided-composer-row .guided-composer-field input {
   width: 100%;
-  min-height: 41px;
-  padding: 9px 11px 9px 34px;
-  border: 1.5px solid var(--guided-line-strong);
-  border-radius: 9px;
+  min-height: 42px;
+  padding: 10px 12px 10px 34px;
+  border: 1px solid var(--guided-line-strong);
+  border-radius: 6px;
   color: var(--guided-ink);
-  background: #fff;
+  background: rgba(255, 255, 255, 0.028);
   font-size: 14px;
-  line-height: 1.4;
+  font-weight: 400;
+  line-height: 20px;
   outline: none;
   transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
 
 .guided-composer-row .guided-composer-field input::placeholder {
-  color: #929e9a;
+  color: var(--faint);
 }
 
 .guided-composer-field:focus-within {
-  outline: 2px solid var(--guided-teal);
-  outline-offset: 1px;
-  box-shadow: 0 0 0 3px rgba(15, 118, 110, 0.1);
+  outline: none;
+  box-shadow: 0 0 0 1px var(--amber-line);
+  border-radius: 6px;
 }
 
 .guided-composer-row .guided-composer-field input:focus {
-  border-color: var(--guided-teal);
+  border-color: var(--amber);
+}
+
+.guided-composer-row .guided-composer-field input:focus-visible {
+  outline: none;
 }
 
 .guided-composer-row .guided-composer-field input:disabled {
   color: var(--guided-muted);
-  background: #f3f6f5;
+  background: rgba(255, 255, 255, 0.014);
   cursor: not-allowed;
 }
 
@@ -2134,33 +2280,37 @@ watch(stage, (nextStage, previousStage) => {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 6px;
-  min-height: 41px;
-  padding: 0 13px;
-  border-radius: 9px;
-  color: #fff;
-  background: var(--guided-teal);
-  box-shadow: 0 4px 10px rgba(15, 118, 110, 0.16);
-  font-size: 12.5px;
-  font-weight: 700;
+  gap: 5px;
+  min-height: 42px;
+  padding: 0 14px;
+  border: 1px solid var(--amber);
+  border-radius: 6px;
+  color: var(--on-amber);
+  background: var(--amber);
+  box-shadow: none;
+  font-size: 14px;
+  line-height: 20px;
+  font-weight: 400;
   white-space: nowrap;
 }
 
 .guided-composer-row .guided-composer-submit:hover:not(:disabled) {
-  background: var(--guided-teal-dark);
+  border-color: var(--amber-bright);
+  background: var(--amber-bright);
 }
 
 .guided-composer-row .guided-composer-submit:disabled {
-  color: #fff;
-  background: #aebbb7;
+  border-color: var(--guided-line);
+  color: var(--faint);
+  background: rgba(255, 255, 255, 0.03);
   box-shadow: none;
 }
 
 .guided-composer-spinner {
-  width: 13px;
-  height: 13px;
-  border: 2px solid rgba(255, 255, 255, 0.45);
-  border-top-color: #fff;
+  width: 12px;
+  height: 12px;
+  border: 1.5px solid rgba(23, 16, 6, 0.3);
+  border-top-color: var(--on-amber);
   border-radius: 50%;
   animation: guided-composer-spin 0.75s linear infinite;
 }
@@ -2178,9 +2328,10 @@ watch(stage, (nextStage, previousStage) => {
   overflow: hidden;
   flex: 1 1 auto;
   min-width: 0;
-  color: var(--guided-muted);
-  font-size: 11px;
-  line-height: 1.4;
+  color: var(--faint);
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 20px;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
   line-clamp: 2;
@@ -2188,25 +2339,27 @@ watch(stage, (nextStage, previousStage) => {
 
 .guided-composer-enter-hint {
   flex: 0 0 auto;
-  color: var(--guided-muted);
-  font-size: 10px;
-  line-height: 1.6;
+  color: var(--faint);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 20px;
   white-space: nowrap;
 }
 
 .guided-composer-enter-hint kbd {
-  padding: 1px 5px;
+  padding: 1px 4px;
   border: 1px solid var(--guided-line-strong);
   border-bottom-width: 2px;
-  border-radius: 5px;
+  border-radius: 3px;
   color: var(--guided-muted);
-  background: #fff;
+  background: rgba(255, 255, 255, 0.03);
   font: inherit;
 }
 
 .guided-dialogue-shell button:focus-visible,
 .guided-dialogue-shell summary:focus-visible {
-  outline: 2px solid var(--guided-teal);
+  outline: 1.5px solid var(--guided-teal);
   outline-offset: 2px;
 }
 
@@ -2225,12 +2378,12 @@ watch(stage, (nextStage, previousStage) => {
 @keyframes guided-composer-pulse {
   0%,
   100% {
-    opacity: 0.45;
+    opacity: 0.4;
     transform: scale(0.9);
   }
   50% {
     opacity: 1;
-    transform: scale(1.12);
+    transform: scale(1.1);
   }
 }
 
@@ -2242,13 +2395,13 @@ watch(stage, (nextStage, previousStage) => {
 
 @media (max-width: 480px) {
   .guided-dialogue-shell {
-    border-radius: 13px;
+    border-radius: 0;
   }
 
   .guided-dock-header {
-    gap: 7px;
-    padding: 10px 10px 9px;
-    border-radius: 12px 12px 0 0;
+    gap: 6px;
+    padding: 8px 10px;
+    border-radius: 0;
   }
 
   .guided-panel-head {
@@ -2256,7 +2409,7 @@ watch(stage, (nextStage, previousStage) => {
   }
 
   .guided-progress {
-    padding-inline: 6px;
+    padding-inline: 0;
   }
 
   .guided-back-btn {
@@ -2266,26 +2419,27 @@ watch(stage, (nextStage, previousStage) => {
   }
 
   .guided-path {
-    gap: 6px;
+    gap: 5px;
   }
 
   .guided-path li {
-    gap: 6px;
-    padding: 5px;
+    gap: 5px;
+    padding: 4px;
   }
 
   .guided-path li:not(:last-child)::after {
-    right: -6px;
+    right: -5px;
+    width: 5px;
   }
 
   .guided-main {
-    gap: 9px;
-    padding: 9px 10px 12px;
+    gap: 8px;
+    padding: 8px 10px 12px;
   }
 
   .guided-question,
   .guided-confidence-result {
-    padding: 10px;
+    padding: 9px;
   }
 
   .guided-next-step {
@@ -2312,7 +2466,7 @@ watch(stage, (nextStage, previousStage) => {
   }
 
   .guided-composer {
-    padding: 8px 10px 9px;
+    padding: 7px 10px 8px;
   }
 
   .guided-composer-enter-hint {

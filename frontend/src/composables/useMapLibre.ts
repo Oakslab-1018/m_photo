@@ -12,6 +12,7 @@ export interface MapLike {
   fitBounds(bounds: [[number, number], [number, number]], options?: Record<string, unknown>): unknown
   easeTo(options: Record<string, unknown>): unknown
   setPadding(padding: ViewportInsets): unknown
+  setStyle(style: string, options?: { diff?: boolean }): unknown
   remove(): void
 }
 
@@ -76,6 +77,13 @@ export interface ViewportInsets {
   left: number
 }
 
+export interface MapLifecycleFailure {
+  /** Source failures are recoverable once that exact source proves a tile loaded. */
+  kind: 'source' | 'style'
+  error: unknown
+  sourceId?: string
+}
+
 export interface MapLifecycleOptions {
   container: HTMLElement
   styleUrl: string
@@ -83,7 +91,9 @@ export interface MapLifecycleOptions {
   /** Initial overlay safe area. Can be updated without changing the camera. */
   viewportInsets?: ViewportInsets
   onLoad?: () => void
-  onError?: (error: unknown) => void
+  onError?: (failure: MapLifecycleFailure) => void
+  /** Called only after every recorded failure has independent recovery evidence. */
+  onRecover?: () => void
 }
 
 export interface MapLifecycle {
@@ -94,6 +104,8 @@ export interface MapLifecycle {
   setViewportInsets(insets: ViewportInsets): void
   getViewportInsets(): ViewportInsets
   markers(): readonly MarkerLike[]
+  /** Reload the same style while retaining camera, padding, and marker instances. */
+  retryStyle(): boolean
   dispose(): void
 }
 
@@ -141,12 +153,63 @@ export function createMapLifecycle(
     trackResize: true,
   })
   map.addControl(new NavigationCtor({ visualizePitch: true }), 'top-right')
-  map.on('error', (event) => options.onError?.(event))
-  map.on('load', () => options.onLoad?.())
 
   let active: MarkerLike[] = []
   let disposed = false
   let viewportInsets = normalizeViewportInsets(options.viewportInsets)
+  const failedSources = new Set<string>()
+  let styleFailed = false
+  let failureVisible = false
+
+  function reportFailure(failure: MapLifecycleFailure): void {
+    failureVisible = true
+    options.onError?.(failure)
+  }
+
+  function recoverIfHealthy(): void {
+    if (!failureVisible || styleFailed || failedSources.size) return
+    failureVisible = false
+    options.onRecover?.()
+  }
+
+  map.on('error', (rawEvent) => {
+    if (disposed) return
+    const event = rawEvent as { error?: unknown; sourceId?: unknown } | null
+    const sourceId = typeof event?.sourceId === 'string' && event.sourceId ? event.sourceId : null
+    const error = event?.error ?? rawEvent
+    if (sourceId) {
+      failedSources.add(sourceId)
+      reportFailure({ kind: 'source', sourceId, error })
+      return
+    }
+    styleFailed = true
+    reportFailure({ kind: 'style', error })
+  })
+
+  // A loaded tile is the only recovery proof. MapLibre also emits load/idle after
+  // sources with failed tiles settle, and metadata/other-source events do not
+  // prove that the failed source is usable again.
+  map.on('sourcedata', (rawEvent) => {
+    if (disposed) return
+    const event = rawEvent as { sourceId?: unknown; tile?: { state?: unknown } | null } | null
+    const sourceId = typeof event?.sourceId === 'string' ? event.sourceId : null
+    if (!sourceId || event?.tile?.state !== 'loaded') return
+    if (!failedSources.delete(sourceId)) return
+    recoverIfHealthy()
+  })
+
+  // A style failure is independent of source-tile recovery. A later successful
+  // style load (for example after retryStyle) is its recovery evidence.
+  map.on('style.load', () => {
+    if (disposed || !styleFailed) return
+    styleFailed = false
+    recoverIfHealthy()
+  })
+
+  map.on('load', () => {
+    if (disposed) return
+    options.onLoad?.()
+  })
 
   // MapLibre's edge insets shift the vanishing point without changing the
   // geographic camera center. Keeping this as the map's persistent padding lets
@@ -211,6 +274,12 @@ export function createMapLifecycle(
     map.setPadding({ ...viewportInsets })
   }
 
+  function retryStyle(): boolean {
+    if (disposed) return false
+    map.setStyle(options.styleUrl, { diff: false })
+    return true
+  }
+
   return {
     map,
     renderMarkers,
@@ -219,6 +288,7 @@ export function createMapLifecycle(
     setViewportInsets,
     getViewportInsets: () => ({ ...viewportInsets }),
     markers: () => active,
+    retryStyle,
     dispose(): void {
       if (disposed) return
       disposed = true

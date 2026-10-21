@@ -58,7 +58,7 @@ onMounted(scrollToBottom)
 <template>
   <div ref="logRef" class="chat-log" aria-live="polite">
     <div class="msg ai">
-      <div class="bubble">你好！请上传一张街景或风景图，我会提取线索并与你一起推理拍摄地。</div>
+      <div class="bubble">上传街景或风景图，开始提取线索。</div>
     </div>
     <template v-for="(message, index) in messages" :key="message.id ?? index">
       <div class="msg" :class="message.role">

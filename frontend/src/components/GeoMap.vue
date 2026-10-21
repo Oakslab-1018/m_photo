@@ -85,6 +85,18 @@ const mapError = ref<string | null>(null)
 let lifecycle: MapLifecycle | null = null
 let singleClickTimer: ReturnType<typeof setTimeout> | null = null
 
+function retryBasemap(): void {
+  try {
+    if (!lifecycle?.retryStyle()) {
+      mapError.value = '底图尚未就绪，暂时无法重试'
+      return
+    }
+  } catch (error) {
+    mapError.value = '底图样式重试失败，请稍后重试'
+    console.warn('MapLibre retry failed', error)
+  }
+}
+
 function cancelPendingMarkerClick(): void {
   if (singleClickTimer === null) return
   clearTimeout(singleClickTimer)
@@ -498,13 +510,15 @@ onMounted(() => {
       styleUrl: styleConfig.styleUrl,
       createMarkerElement: markerElement,
       viewportInsets: normalizedViewportInsets.value,
-      onLoad: () => {
-        mapError.value = null
+      onError: (failure) => {
+        mapError.value = failure.kind === 'source'
+          ? '底图瓦片加载失败，请检查网络后重试'
+          : '底图样式加载失败，请检查网络或地图样式配置'
+        const error = failure.error as { message?: string } | undefined
+        console.warn('MapLibre ' + failure.kind + ' error', error?.message ?? error)
       },
-      onError: (event) => {
-        mapError.value = '底图加载失败，请检查网络或地图样式配置'
-        const error = (event as { error?: { message?: string } })?.error
-        console.warn('MapLibre error', error?.message ?? error)
+      onRecover: () => {
+        mapError.value = null
       },
     })
     renderMarkers()
@@ -613,9 +627,18 @@ onBeforeUnmount(() => {
       </div>
       <div class="geo-map__safe-center">
         <div v-if="!displayPoints.length" class="map-empty-overlay">
-          {{ guidedMode ? '当前阶段暂无可显示的有效坐标候选' : '上传图片后，候选国家与城市代表点会显示在这里' }}
+          {{ guidedMode ? '当前阶段暂无坐标候选' : '上传照片后显示候选代表点' }}
         </div>
-        <div v-if="mapError" class="map-error-overlay" role="status">{{ mapError }}</div>
+        <div v-if="mapError" class="map-error-overlay" role="status">
+          <span>{{ mapError }}</span>
+          <button
+            type="button"
+            class="ghost-btn map-error-overlay__retry"
+            @click.stop="retryBasemap"
+          >
+            重试底图
+          </button>
+        </div>
       </div>
     </div>
 
@@ -637,9 +660,9 @@ onBeforeUnmount(() => {
       <span class="map-hint">
         {{ guidedMode
           ? (guidedConfirmationReady
-            ? '单击选中候选 · 双击确认当前层级 · 所有坐标非照片 GPS'
-            : '单击选中候选 · 新增观察待核对，暂不能确认地点 · 所有坐标非照片 GPS')
-          : '单击选中国家 · 双击确认国家 · 标记均为代表点，不是照片 GPS' }}
+            ? '单击选中 · 双击确认 · 坐标为代表点，非照片 GPS'
+            : '待核对，暂不能确认 · 坐标为代表点，非照片 GPS')
+          : '单击选中 · 双击确认 · 代表点非照片 GPS' }}
       </span>
       <div class="focus-group">
         <template v-if="guidedMode">
@@ -693,20 +716,31 @@ onBeforeUnmount(() => {
   box-sizing: border-box;
   max-height: calc(100% - var(--geo-map-inset-top) - var(--geo-map-inset-bottom) - 52px);
   /* Leave the compact attribution control its own unobstructed bottom row. */
-  margin: 0 calc(var(--geo-map-inset-right) + 10px) calc(var(--geo-map-inset-bottom) + 42px) calc(var(--geo-map-inset-left) + 10px);
-  padding: 8px 10px;
+  margin: 0 calc(var(--geo-map-inset-right) + 10px) calc(var(--geo-map-inset-bottom) + 40px) calc(var(--geo-map-inset-left) + 10px);
+  padding: 6px 10px;
   overflow: auto;
   overscroll-behavior: contain;
-  border: 1px solid rgba(148, 163, 184, 0.42);
-  border-radius: 12px;
-  background: rgba(255, 255, 255, 0.92);
-  box-shadow: 0 8px 28px rgba(15, 23, 42, 0.18);
-  backdrop-filter: blur(10px);
+  border: 1px solid var(--shell-line-strong);
+  border-radius: 6px;
+  background: rgba(9, 15, 18, 0.87);
+  box-shadow: var(--shell-shadow-soft);
+  backdrop-filter: blur(14px);
 }
 
 .geo-map--immersive > .geo-map-footer .ghost-btn {
-  min-height: 34px;
-  background: rgba(255, 255, 255, 0.94);
+  min-height: 27px;
+  padding: 3px 8px;
+  border-color: var(--shell-line-strong);
+  background: transparent;
+  font-size: 14px;
+  font-weight: 400;
+  line-height: 20px;
+}
+
+.geo-map--immersive > .geo-map-footer .ghost-btn:hover:not(:disabled) {
+  border-color: var(--amber-line);
+  color: var(--amber);
+  background: var(--amber-soft);
 }
 
 .geo-map-coordinate-note {
@@ -738,6 +772,24 @@ onBeforeUnmount(() => {
   inset: auto;
   transform: none;
   max-width: min(86%, 520px);
+}
+
+/* The safe-center layer is click-through, but the error action must stay usable. */
+.geo-map__safe-center .map-error-overlay {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  pointer-events: auto;
+  text-align: center;
+}
+
+.geo-map__safe-center .map-error-overlay__retry {
+  flex: 0 0 auto;
+  min-height: 26px;
+  padding: 2px 9px;
+  pointer-events: auto;
 }
 
 .geo-map__badge {
@@ -797,24 +849,25 @@ onBeforeUnmount(() => {
 }
 
 .geo-map :deep(.maplibre-marker:focus-visible) {
-  outline: 3px solid #0f766e;
-  outline-offset: 2px;
+  outline: 1.5px solid var(--amber);
+  outline-offset: 3px;
+  border-radius: 50%;
 }
 
 .geo-map :deep(.geo-map-marker-visual) {
   display: grid;
   place-items: center;
-  width: 24px;
-  height: 24px;
+  width: 22px;
+  height: 22px;
   box-sizing: border-box;
-  border: 2px solid #fff;
+  border: 1.5px solid var(--amber);
   border-radius: 50%;
-  background: var(--primary);
-  color: #fff;
-  box-shadow: 0 1px 4px rgba(30, 41, 59, 0.38);
-  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
-  font-size: 11px;
-  font-weight: 800;
+  background: #0a1114;
+  color: var(--amber);
+  box-shadow: 0 0 0 3px rgba(8, 13, 16, 0.55);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 500;
   font-variant-numeric: tabular-nums;
   line-height: 1;
   -webkit-font-smoothing: antialiased;
@@ -822,41 +875,62 @@ onBeforeUnmount(() => {
 }
 
 .geo-map :deep(.maplibre-marker-city .geo-map-marker-visual) {
-  border: 3px solid var(--city);
-  border-radius: 5px;
-  background: #fff;
-  color: var(--city);
+  width: 15px;
+  height: 15px;
+  border: 1.5px solid var(--blue);
+  border-radius: 2px;
+  background: #0a1114;
+  color: var(--blue);
+  font-size: 8px;
 }
 
 .geo-map :deep(.maplibre-marker.confirmed .geo-map-marker-visual) {
-  border-color: #fff;
-  background: var(--danger);
-  color: #fff;
+  border-color: var(--sage);
+  background: var(--sage);
+  color: #08120c;
 }
 
 .geo-map :deep(.maplibre-marker.resolved .geo-map-marker-visual) {
-  box-shadow: 0 0 0 5px rgba(220, 38, 38, 0.24), 0 1px 5px rgba(30, 41, 59, 0.4);
+  border-color: var(--sage);
+  background: var(--sage);
+  color: #08120c;
+  box-shadow:
+    0 0 0 4px var(--sage-soft),
+    0 0 0 3px rgba(8, 13, 16, 0.6);
 }
 
 .geo-map :deep(.maplibre-marker.passive-parent .geo-map-marker-visual) {
-  box-shadow: 0 0 0 3px rgba(100, 116, 139, 0.35), 0 1px 4px rgba(30, 41, 59, 0.32);
+  border-style: dashed;
+  border-color: var(--line-strong);
+  color: var(--muted);
+  box-shadow: 0 0 0 3px rgba(8, 13, 16, 0.5);
 }
 
 .geo-map :deep(.maplibre-marker.selected .geo-map-marker-visual) {
-  box-shadow: 0 0 0 4px rgba(15, 118, 110, 0.35), 0 1px 4px rgba(30, 41, 59, 0.38);
+  border-color: var(--amber-bright);
+  box-shadow:
+    0 0 0 4px var(--amber-soft),
+    0 0 0 3px rgba(8, 13, 16, 0.6);
+}
+
+.geo-map :deep(.maplibre-marker.selected .geo-map-marker-city .geo-map-marker-visual),
+.geo-map :deep(.maplibre-marker-city.selected .geo-map-marker-visual) {
+  border-color: var(--blue);
+  background: var(--blue);
+  color: #08120c;
 }
 
 .geo-map :deep(.geo-map-marker-visual.confirmed-check) {
-  font-size: 14px;
-  font-weight: 900;
+  font-size: 12px;
+  font-weight: 500;
 }
 
 @media (max-width: 760px) {
   .geo-map--immersive > .geo-map-footer {
     /* Attribution can wrap to two lines on a narrow screen. */
-    margin-bottom: calc(var(--geo-map-inset-bottom) + 62px);
-    gap: 8px;
-    padding: 7px 9px;
+    margin-bottom: calc(var(--geo-map-inset-bottom) + 58px);
+    gap: 7px;
+    padding: 6px 8px;
     overflow-x: hidden;
   }
 
@@ -887,9 +961,11 @@ onBeforeUnmount(() => {
   .geo-map--immersive > .geo-map-footer .ghost-btn {
     width: 100%;
     min-width: 0;
-    min-height: 36px;
+    min-height: 32px;
     padding-inline: 8px;
-    font-size: 11px;
+    font-size: 14px;
+  font-weight: 400;
+  line-height: 20px;
     white-space: normal;
   }
 }

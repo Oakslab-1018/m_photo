@@ -4,7 +4,7 @@
     :class="{ dragover }"
     role="button"
     tabindex="0"
-    aria-label="选择或拖拽图片"
+    aria-label="选择或拖拽照片"
     @click="pick"
     @keydown.enter="pick"
     @keydown.space.prevent="pick"
@@ -21,7 +21,7 @@
       @change="onChange"
     >
     <template v-if="previewUrl">
-      <img :src="previewUrl" alt="待上传图片预览" class="preview-img">
+      <img :src="previewUrl" alt="待上传照片预览" class="preview-img">
       <div v-if="clickPoints.length" class="preview-markers">
         <span
           v-for="(point, index) in clickPoints"
@@ -34,7 +34,7 @@
       </div>
     </template>
     <div v-else class="upload-hint">
-      点击或拖拽图片到此处
+      点击或拖拽照片到此处
       <span>支持 jpg / png / webp</span>
     </div>
   </div>

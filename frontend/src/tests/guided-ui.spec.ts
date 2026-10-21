@@ -570,7 +570,7 @@ describe('GuidedDialoguePanel utilities', () => {
     const html = await render(dialogue({ stage: 'city' }))
 
     expect(html).toContain('补充线索，与定位助手对话')
-    expect(html).toContain('例如：路牌上是日文，车辆靠左行驶；也可直接输入地名')
+    expect(html).toContain('输入照片中的招牌、文字或地名')
     expect(html).toContain('发送线索')
     expect(html).toContain('可直接输入城市名称检索目录')
     expect(html).toContain('提交不会自动确认地点')

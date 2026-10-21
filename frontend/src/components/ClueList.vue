@@ -149,9 +149,9 @@ function locateClue(clue: Clue): void {
 
 <template>
   <div ref="listRef" class="clue-list" aria-live="polite">
-    <div v-if="loading" class="empty-hint">正在提取多维度线索…</div>
+    <div v-if="loading" class="empty-hint">正在提取线索…</div>
     <div v-else-if="!groups.length" class="empty-hint">
-      上传图片后，AI 将自动提取多维度线索，也可在对话中手动补充。
+      上传照片后自动提取线索，也可在对话中手动补充。
     </div>
     <template v-else>
       <div class="clue-overview">
@@ -265,32 +265,40 @@ function locateClue(clue: Clue): void {
 }
 
 .locate-clue {
-  border: 1px solid var(--primary-soft);
-  border-radius: 999px;
-  background: var(--primary-soft);
-  color: var(--primary-dark);
+  padding: 1px 0;
+  border: 0;
+  border-bottom: 1px dashed var(--amber-line);
+  border-radius: 0;
+  color: var(--amber);
+  background: transparent;
   cursor: pointer;
-  font-size: 10px;
-  line-height: 1.3;
-  padding: 3px 9px;
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 20px;
 }
 
 .locate-clue:hover,
 .locate-clue:focus-visible {
-  border-color: var(--primary);
+  border-bottom-color: var(--amber);
+  color: var(--amber-bright);
   outline: none;
 }
 
 .clue-evidence-details {
-  margin-top: 4px;
+  margin-top: 3px;
 }
 
 .clue-evidence-details summary {
   width: fit-content;
-  color: var(--primary);
+  color: var(--muted);
   cursor: pointer;
-  font-size: 10px;
-  line-height: 1.4;
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 20px;
+}
+
+.clue-evidence-details summary:hover {
+  color: var(--amber);
 }
 
 .clue-evidence-details .ev {

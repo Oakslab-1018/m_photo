@@ -1,7 +1,9 @@
+import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 import {
   createMapLifecycle,
   type MapLibreNamespace,
+  type MapLifecycleFailure,
   type MapLike,
   type MapPoint,
   type MarkerLike,
@@ -22,6 +24,7 @@ interface FakeMap extends MapLike {
   eases: Record<string, unknown>[]
   paddings: ViewportInsets[]
   padding: ViewportInsets
+  styleCalls: Array<{ style: string; options?: { diff?: boolean } }>
   center: [number, number]
   zoom: number
   markers: FakeMarker[]
@@ -38,6 +41,7 @@ function fakeNamespace(): { api: MapLibreNamespace; last: () => FakeMap } {
     eases: Record<string, unknown>[] = []
     paddings: ViewportInsets[] = []
     padding: ViewportInsets = { top: 0, right: 0, bottom: 0, left: 0 }
+    styleCalls: Array<{ style: string; options?: { diff?: boolean } }> = []
     center: [number, number] = [0, 20]
     zoom = 1
     markers: FakeMarker[] = []
@@ -65,6 +69,10 @@ function fakeNamespace(): { api: MapLibreNamespace; last: () => FakeMap } {
       const next = { ...padding }
       this.paddings.push(next)
       this.padding = next
+      return this
+    }
+    setStyle(style: string, options?: { diff?: boolean }): this {
+      this.styleCalls.push({ style, options })
       return this
     }
     remove(): void {
@@ -130,22 +138,178 @@ describe('createMapLifecycle', () => {
   it('configures demo style, navigation control, and load/error handlers', () => {
     const { api, last } = fakeNamespace()
     let loaded = 0
-    let errored = false
+    let failure: MapLifecycleFailure | undefined
     const lifecycle = createMapLifecycle(api, {
       container: stubContainer(),
       styleUrl: 'https://demotiles.maplibre.org/style.json',
       createMarkerElement: elementFor,
       onLoad: () => (loaded += 1),
-      onError: () => (errored = true),
+      onError: (next) => (failure = next),
     })
     const map = last()
     expect(map.options.style).toBe('https://demotiles.maplibre.org/style.json')
     expect(map.options.trackResize).toBe(true)
     expect(map.controls).toHaveLength(1)
     map.fire('load')
-    map.fire('error', { error: new Error('tile blocked') })
+    map.fire('error', { error: new Error('style blocked') })
     expect(loaded).toBe(1)
-    expect(errored).toBe(true)
+    expect(failure?.kind).toBe('style')
+    expect(failure?.error).toBeInstanceOf(Error)
+    lifecycle.dispose()
+  })
+
+  it('clears a source warning only after that exact source proves a tile loaded', () => {
+    const { api, last } = fakeNamespace()
+    const failures: MapLifecycleFailure[] = []
+    let recovered = 0
+    const lifecycle = createMapLifecycle(api, {
+      container: stubContainer(),
+      styleUrl: 'demo',
+      createMarkerElement: elementFor,
+      onError: (failure) => failures.push(failure),
+      onRecover: () => (recovered += 1),
+    })
+    const map = last()
+
+    map.fire('error', {
+      error: new Error('tile blocked'),
+      sourceId: 'esri-world-imagery',
+      tile: { state: 'errored' },
+    })
+    expect(failures).toHaveLength(1)
+    expect(failures[0]).toMatchObject({
+      kind: 'source',
+      sourceId: 'esri-world-imagery',
+    })
+
+    // load, idle, metadata, and unrelated-source success are not recovery proof.
+    map.fire('load')
+    map.fire('idle')
+    map.fire('sourcedata', {
+      sourceId: 'esri-world-imagery',
+      sourceDataType: 'metadata',
+      isSourceLoaded: true,
+    })
+    map.fire('sourcedata', {
+      sourceId: 'unrelated-source',
+      tile: { state: 'loaded' },
+    })
+    map.fire('sourcedata', {
+      sourceId: 'esri-world-imagery',
+      sourceDataType: 'idle',
+      isSourceLoaded: true,
+    })
+    expect(recovered).toBe(0)
+
+    map.fire('sourcedata', {
+      sourceId: 'esri-world-imagery',
+      sourceDataType: 'content',
+      tile: { state: 'loaded' },
+    })
+    expect(recovered).toBe(1)
+
+    map.fire('sourcedata', {
+      sourceId: 'esri-world-imagery',
+      tile: { state: 'loaded' },
+    })
+    expect(recovered).toBe(1)
+    lifecycle.dispose()
+  })
+
+  it('keeps an all-tile outage visible until every failed source has a loaded tile', () => {
+    const { api, last } = fakeNamespace()
+    let recovered = 0
+    const lifecycle = createMapLifecycle(api, {
+      container: stubContainer(),
+      styleUrl: 'demo',
+      createMarkerElement: elementFor,
+      onRecover: () => (recovered += 1),
+    })
+    const map = last()
+
+    map.fire('error', { sourceId: 'source-a', tile: { state: 'errored' } })
+    map.fire('error', { sourceId: 'source-b', tile: { state: 'errored' } })
+    map.fire('load')
+    map.fire('idle')
+    map.fire('style.load')
+    map.fire('sourcedata', { sourceId: 'source-a', sourceDataType: 'metadata' })
+    map.fire('sourcedata', { sourceId: 'unrelated', tile: { state: 'loaded' } })
+    expect(recovered).toBe(0)
+
+    map.fire('sourcedata', { sourceId: 'source-a', tile: { state: 'loaded' } })
+    expect(recovered).toBe(0)
+    map.fire('sourcedata', { sourceId: 'source-b', tile: { state: 'loaded' } })
+    expect(recovered).toBe(1)
+    lifecycle.dispose()
+  })
+
+  it('does not let source-tile recovery clear a style failure', () => {
+    const { api, last } = fakeNamespace()
+    let recovered = 0
+    const lifecycle = createMapLifecycle(api, {
+      container: stubContainer(),
+      styleUrl: 'demo',
+      createMarkerElement: elementFor,
+      onRecover: () => (recovered += 1),
+    })
+    const map = last()
+
+    map.fire('error', { sourceId: 'source-a', tile: { state: 'errored' } })
+    map.fire('error', { error: new Error('style failed') })
+    map.fire('sourcedata', { sourceId: 'source-a', tile: { state: 'loaded' } })
+    map.fire('load')
+    map.fire('idle')
+    expect(recovered).toBe(0)
+
+    map.fire('style.load')
+    expect(recovered).toBe(1)
+    lifecycle.dispose()
+  })
+
+  it('retries the same style with diff disabled while preserving viewport state and markers', () => {
+    const { api, last } = fakeNamespace()
+    const failures: MapLifecycleFailure[] = []
+    let recovered = 0
+    const lifecycle = createMapLifecycle(api, {
+      container: stubContainer(),
+      styleUrl: 'demo-style-url',
+      createMarkerElement: elementFor,
+      onError: (failure) => failures.push(failure),
+      onRecover: () => (recovered += 1),
+    })
+    const map = last()
+
+    lifecycle.renderMarkers([point()])
+    map.center = [121.5, 31.2]
+    map.zoom = 6
+    const padding = { top: 12, right: 24, bottom: 36, left: 48 }
+    map.setPadding(padding)
+    const marker = map.markers[0]
+    const fitCount = map.fits.length
+    const easeCount = map.eases.length
+    const paddingCount = map.paddings.length
+
+    map.fire('error', { sourceId: 'source-a', tile: { state: 'errored' } })
+    expect(failures).toHaveLength(1)
+    expect(lifecycle.retryStyle()).toBe(true)
+
+    expect(map.styleCalls).toEqual([{ style: 'demo-style-url', options: { diff: false } }])
+    expect(map.fits).toHaveLength(fitCount)
+    expect(map.eases).toHaveLength(easeCount)
+    expect(map.paddings).toHaveLength(paddingCount)
+    expect(map.center).toEqual([121.5, 31.2])
+    expect(map.zoom).toBe(6)
+    expect(map.padding).toEqual(padding)
+    expect(map.markers).toHaveLength(1)
+    expect(map.markers[0]).toBe(marker)
+    expect(marker.removed).toBe(false)
+
+    // Failures from the retried attempt remain visible until their own proof.
+    expect(recovered).toBe(0)
+    map.fire('error', { sourceId: 'source-a', tile: { state: 'errored' } })
+    expect(failures).toHaveLength(2)
+    map.fire('sourcedata', { sourceId: 'source-a', tile: { state: 'loaded' } })
+    expect(recovered).toBe(1)
     lifecycle.dispose()
   })
 
@@ -277,6 +441,38 @@ describe('createMapLifecycle', () => {
     lifecycle.dispose()
   })
 
+  it('suppresses callbacks and retries after dispose', () => {
+    const { api, last } = fakeNamespace()
+    const failures: MapLifecycleFailure[] = []
+    let recovered = 0
+    let loaded = 0
+    const lifecycle = createMapLifecycle(api, {
+      container: stubContainer(),
+      styleUrl: 'demo',
+      createMarkerElement: elementFor,
+      onError: (failure) => failures.push(failure),
+      onRecover: () => (recovered += 1),
+      onLoad: () => (loaded += 1),
+    })
+    const map = last()
+
+    map.fire('error', { sourceId: 'source-a', tile: { state: 'errored' } })
+    expect(failures).toHaveLength(1)
+    lifecycle.dispose()
+
+    map.fire('sourcedata', { sourceId: 'source-a', tile: { state: 'loaded' } })
+    map.fire('style.load')
+    map.fire('error', { error: new Error('late style error') })
+    map.fire('load')
+    expect(failures).toHaveLength(1)
+    expect(recovered).toBe(0)
+    expect(loaded).toBe(0)
+    expect(lifecycle.retryStyle()).toBe(false)
+    expect(map.styleCalls).toHaveLength(0)
+    expect(map.removed).toBe(true)
+    lifecycle.dispose()
+  })
+
   it('ignores renders after dispose and is idempotent', () => {
     const { api, last } = fakeNamespace()
     const lifecycle = createMapLifecycle(api, {
@@ -293,5 +489,17 @@ describe('createMapLifecycle', () => {
     expect(map.markers).toHaveLength(0)
     expect(map.fits).toHaveLength(0)
     expect(map.removed).toBe(true)
+  })
+})
+
+describe('GeoMap basemap retry UI', () => {
+  it('keeps an accessible retry button interactive over the click-through safe area', () => {
+    const source = readFileSync(new URL('../components/GeoMap.vue', import.meta.url), 'utf8')
+
+    expect(source).toContain('重试底图')
+    expect(source).toMatch(/<button[\s\S]*?type="button"[\s\S]*?重试底图/)
+    expect(source).toContain('lifecycle?.retryStyle()')
+    expect(source).toContain('底图样式重试失败，请稍后重试')
+    expect(source).toMatch(/\.geo-map__safe-center \.map-error-overlay \{[\s\S]*?pointer-events:\s*auto;/)
   })
 })

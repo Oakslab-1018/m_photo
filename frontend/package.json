@@ -12,7 +12,10 @@
     "test:watch": "vitest"
   },
   "dependencies": {
+    "@fontsource/ibm-plex-mono": "^5.2.6",
+    "@fontsource/ibm-plex-sans": "^5.2.6",
     "maplibre-gl": "^6.13.0",
+    "motion-v": "^2.8.0",
     "vue": "^3.5.43"
   },
   "devDependencies": {
