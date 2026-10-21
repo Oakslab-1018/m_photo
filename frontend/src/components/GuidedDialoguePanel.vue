@@ -841,14 +841,31 @@ watch(stage, (nextStage, previousStage) => {
     <form
       v-if="dialogue"
       class="guided-composer"
+      :class="{ 'is-busy': busy }"
       aria-labelledby="guided-composer-label"
+      :aria-busy="busy ? 'true' : 'false'"
       @submit.prevent="submitComposer"
     >
       <div class="guided-composer-head">
-        <label id="guided-composer-label" for="guided-conversation-input">
-          补充线索，与定位助手对话
-        </label>
-        <span>对话输入 · 也支持地名检索</span>
+        <div class="guided-composer-heading">
+          <span class="guided-composer-icon" aria-hidden="true">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M20 15a3 3 0 0 1-3 3H8l-4 3V6a3 3 0 0 1 3-3h10a3 3 0 0 1 3 3z" />
+              <path d="M8 9h8M8 13h5" />
+            </svg>
+          </span>
+          <span class="guided-composer-title">
+            <span class="guided-composer-kicker">看到新线索？随时补充</span>
+            <label id="guided-composer-label" for="guided-conversation-input">
+              补充线索，与定位助手对话
+            </label>
+          </span>
+        </div>
+        <span v-if="busy" class="guided-composer-mode is-busy">
+          <span class="guided-composer-status-dot" aria-hidden="true" />
+          助手处理中
+        </span>
+        <span v-else class="guided-composer-mode">文字线索 · 地名检索</span>
       </div>
 
       <p
@@ -877,25 +894,422 @@ watch(stage, (nextStage, previousStage) => {
       </p>
 
       <div class="guided-composer-row">
-        <input
-          id="guided-conversation-input"
-          ref="searchInputRef"
-          v-model="composerText"
-          type="text"
-          autocomplete="off"
-          placeholder="例如：路牌上是日文，车辆靠左行驶；也可直接输入地名"
-          :disabled="busy"
-          aria-describedby="guided-composer-hint"
-          @compositionstart="composing = true"
-          @compositionend="composing = false"
-          @keydown.enter="onComposerEnter"
-        />
-        <button type="submit" class="primary-btn" :disabled="!canSendComposer">
-          {{ applying ? '发送中…' : busy ? '处理中…' : '发送线索' }}
+        <div class="guided-composer-field">
+          <span class="guided-composer-field-icon" aria-hidden="true">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="11" cy="11" r="7" />
+              <path d="m20 20-4-4" />
+            </svg>
+          </span>
+          <input
+            id="guided-conversation-input"
+            ref="searchInputRef"
+            v-model="composerText"
+            type="text"
+            autocomplete="off"
+            enterkeyhint="send"
+            placeholder="例如：路牌上是日文，车辆靠左行驶；也可直接输入地名"
+            :disabled="busy"
+            aria-describedby="guided-composer-hint"
+            @compositionstart="composing = true"
+            @compositionend="composing = false"
+            @keydown.enter="onComposerEnter"
+          />
+        </div>
+        <button
+          type="submit"
+          class="primary-btn guided-composer-submit"
+          :disabled="!canSendComposer"
+          :title="busy ? '当前操作完成后可继续发送' : '发送当前线索（Enter）'"
+        >
+          <span v-if="busy" class="guided-composer-spinner" aria-hidden="true" />
+          <span>{{ applying ? '发送中…' : busy ? '处理中…' : '发送线索' }}</span>
+          <svg v-if="!busy" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+            <path d="m5 12 14-7-4 14-3-6z" />
+            <path d="m12 13 7-8" />
+          </svg>
         </button>
       </div>
 
-      <p id="guided-composer-hint" class="guided-composer-hint">{{ composerHint }}</p>
+      <div class="guided-composer-foot">
+        <p id="guided-composer-hint" class="guided-composer-hint">{{ composerHint }}</p>
+        <span class="guided-composer-enter-hint" aria-hidden="true"><kbd>Enter</kbd> 发送</span>
+      </div>
     </form>
   </section>
 </template>
+<style scoped>
+.guided-composer {
+  position: relative;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid rgba(15, 118, 110, 0.28);
+  border-radius: 14px;
+  background:
+    radial-gradient(circle at 96% 0%, rgba(15, 118, 110, 0.12), transparent 34%),
+    linear-gradient(135deg, rgba(230, 242, 240, 0.92), rgba(255, 255, 255, 0.98) 48%);
+  box-shadow:
+    0 0 0 1px rgba(255, 255, 255, 0.72) inset,
+    0 9px 24px rgba(15, 118, 110, 0.1),
+    0 2px 5px rgba(30, 41, 59, 0.04);
+  transition: border-color 0.16s ease, box-shadow 0.16s ease;
+}
+
+.guided-composer::before {
+  content: '';
+  position: absolute;
+  top: 12px;
+  bottom: 12px;
+  left: 0;
+  width: 3px;
+  border-radius: 0 999px 999px 0;
+  background: linear-gradient(180deg, #2aa198, var(--primary));
+  pointer-events: none;
+}
+
+.guided-composer.is-busy {
+  border-color: rgba(15, 118, 110, 0.4);
+  box-shadow:
+    0 0 0 1px rgba(255, 255, 255, 0.72) inset,
+    0 8px 22px rgba(15, 118, 110, 0.14);
+}
+
+.guided-composer-head {
+  align-items: center;
+  gap: 7px 12px;
+  flex-wrap: wrap;
+}
+
+.guided-composer-heading {
+  display: flex;
+  flex: 1 1 280px;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+}
+
+.guided-composer-icon {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 10px;
+  color: #fff;
+  background: linear-gradient(145deg, var(--primary), var(--primary-dark));
+  box-shadow: 0 4px 10px rgba(15, 118, 110, 0.22);
+}
+
+.guided-composer-title {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 1px;
+}
+
+.guided-composer-kicker {
+  color: var(--primary-dark);
+  font-size: 9px;
+  font-weight: 800;
+  line-height: 1.2;
+  letter-spacing: 0.12em;
+}
+
+.guided-composer-head label {
+  color: var(--ink);
+  font-size: 14px;
+  font-weight: 800;
+  line-height: 1.3;
+  cursor: pointer;
+}
+
+.guided-composer-mode {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 5px;
+  min-height: 22px;
+  padding: 2px 8px;
+  border: 1px solid rgba(15, 118, 110, 0.16);
+  border-radius: 999px;
+  color: var(--primary-dark);
+  background: rgba(255, 255, 255, 0.72);
+  font-size: 9.5px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.guided-composer-mode.is-busy {
+  border-color: rgba(217, 119, 6, 0.26);
+  color: var(--warn);
+  background: rgba(253, 243, 227, 0.82);
+}
+
+.guided-composer-status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: guided-composer-pulse 1.1s ease-in-out infinite;
+}
+
+.guided-composer-assistant,
+.guided-composer-submission {
+  align-items: flex-start;
+  gap: 7px;
+  padding: 5px 7px;
+  border: 1px solid rgba(15, 118, 110, 0.1);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.68);
+}
+
+.guided-composer-assistant strong,
+.guided-composer-submission strong {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 18px;
+  padding: 0 7px;
+  border-radius: 999px;
+  color: #fff;
+  background: var(--primary);
+  font-size: 9px;
+  line-height: 1;
+}
+
+.guided-composer-assistant span {
+  display: -webkit-box;
+  overflow: hidden;
+  white-space: normal;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 1;
+  line-clamp: 1;
+}
+
+.guided-composer-submitted-text {
+  color: var(--primary-dark);
+}
+
+.guided-composer-status {
+  display: -webkit-box;
+  overflow: hidden;
+  white-space: normal;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 1;
+  line-clamp: 1;
+}
+
+.guided-composer-submission.is-pending,
+.guided-composer-submission.is-unconfirmed {
+  border-color: rgba(217, 119, 6, 0.2);
+  background: rgba(253, 243, 227, 0.7);
+}
+
+.guided-composer-submission.is-pending strong,
+.guided-composer-submission.is-unconfirmed strong {
+  background: var(--city);
+}
+
+.guided-composer-submission.is-failed {
+  border-color: rgba(185, 28, 28, 0.2);
+  background: rgba(253, 234, 234, 0.72);
+}
+
+.guided-composer-submission.is-failed strong {
+  background: var(--danger);
+}
+
+.guided-composer-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: stretch;
+}
+
+.guided-composer-field {
+  position: relative;
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  border-radius: 10px;
+}
+
+.guided-composer-field-icon {
+  position: absolute;
+  left: 12px;
+  z-index: 1;
+  display: inline-flex;
+  color: var(--primary);
+  pointer-events: none;
+}
+
+.guided-composer-row .guided-composer-field input {
+  width: 100%;
+  min-height: 42px;
+  padding: 10px 12px 10px 38px;
+  border: 1.5px solid var(--border-strong);
+  border-radius: 10px;
+  color: var(--ink);
+  background: rgba(255, 255, 255, 0.96);
+  font-size: 13px;
+  line-height: 1.4;
+  box-shadow: 0 1px 2px rgba(30, 41, 59, 0.03) inset;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, background 0.15s ease;
+}
+
+.guided-composer-row .guided-composer-field input::placeholder {
+  color: #989286;
+}
+
+.guided-composer-field:focus-within {
+  outline: 2px solid var(--primary);
+  outline-offset: 1px;
+  box-shadow: 0 0 0 4px rgba(15, 118, 110, 0.12);
+}
+
+.guided-composer-row .guided-composer-field input:focus {
+  border-color: var(--primary);
+  outline: none;
+}
+
+.guided-composer-row .guided-composer-field input:disabled {
+  color: var(--ink-soft);
+  background: #f3f3ef;
+  cursor: not-allowed;
+}
+
+.guided-composer-row .guided-composer-submit {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 42px;
+  padding: 0 15px;
+  border-radius: 10px;
+  background: linear-gradient(135deg, var(--primary), var(--primary-dark));
+  box-shadow: 0 5px 12px rgba(15, 118, 110, 0.2);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.guided-composer-row .guided-composer-submit:hover:not(:disabled) {
+  background: linear-gradient(135deg, var(--primary-dark), #0d4f4b);
+}
+
+.guided-composer-row .guided-composer-submit:disabled {
+  background: #cfd6d4;
+  box-shadow: none;
+}
+
+.guided-composer-spinner {
+  width: 13px;
+  height: 13px;
+  border: 2px solid rgba(255, 255, 255, 0.45);
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation: guided-composer-spin 0.75s linear infinite;
+}
+
+.guided-composer-foot {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+  padding: 0 1px;
+}
+
+.guided-composer-hint {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--ink-soft);
+  font-size: 10.5px;
+  line-height: 1.45;
+}
+
+.guided-composer-enter-hint {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 9.5px;
+  line-height: 1.6;
+  white-space: nowrap;
+}
+
+.guided-composer-enter-hint kbd {
+  padding: 1px 5px;
+  border: 1px solid var(--border-strong);
+  border-bottom-width: 2px;
+  border-radius: 5px;
+  color: var(--ink-soft);
+  background: #fff;
+  font: inherit;
+}
+
+@keyframes guided-composer-pulse {
+  0%,
+  100% {
+    opacity: 0.45;
+    transform: scale(0.9);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.12);
+  }
+}
+
+@keyframes guided-composer-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (max-width: 620px) {
+  .guided-composer {
+    gap: 7px;
+    padding: 10px 10px 10px 11px;
+    border-radius: 12px;
+  }
+
+  .guided-composer-heading {
+    flex-basis: 100%;
+  }
+
+  .guided-composer-mode:not(.is-busy) {
+    display: none;
+  }
+
+  .guided-composer-assistant span {
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+  }
+}
+
+@media (max-width: 380px) {
+  .guided-composer-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .guided-composer-row .guided-composer-submit {
+    width: 100%;
+  }
+}
+
+@media (hover: none), (pointer: coarse) {
+  .guided-composer-enter-hint {
+    display: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .guided-composer,
+  .guided-composer-row .guided-composer-field input {
+    transition: none;
+  }
+
+  .guided-composer-status-dot,
+  .guided-composer-spinner {
+    animation: none;
+  }
+}
+</style>

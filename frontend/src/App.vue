@@ -1207,14 +1207,22 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
               @feedback="onFeedback"
             />
             <details v-else-if="guidedCandidateSurfaceVisible" class="guided-history">
-              <summary>查看推理记录（{{ session.messages.value.length }} 条）</summary>
-              <ChatLog
-                :messages="session.messages.value"
-                :pending="pendingMessages"
-                :loading="pointBusy || feedbackBusy"
-                @retry="retryPending"
-                @dismiss="dismissPending"
-              />
+              <summary>
+                <span>查看推理记录（{{ session.messages.value.length }} 条）</span>
+                <span class="guided-history-hint">展开后可滚动查看完整记录</span>
+              </summary>
+              <div class="guided-history-content">
+                <ChatLog
+                  :messages="session.messages.value"
+                  :pending="pendingMessages"
+                  :loading="pointBusy || feedbackBusy"
+                  tabindex="0"
+                  role="region"
+                  aria-label="完整推理记录，可滚动查看"
+                  @retry="retryPending"
+                  @dismiss="dismissPending"
+                />
+              </div>
             </details>
             <div v-else class="guided-history-locked">
               完成观察核对并点击“下一步”后显示推理记录与地点候选，避免提前展示可能包含地点名的内容。

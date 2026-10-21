@@ -407,7 +407,10 @@ textarea.chat-input { resize: none; max-height: 96px; overflow-y: auto; line-hei
 }
 
 /* ---------- guided dialogue: primary interaction ---------- */
-.chat-body.guided-chat-body { gap: 10px; }
+.chat-body.guided-chat-body {
+  gap: 10px; overflow-y: auto; scrollbar-gutter: stable;
+}
+.guided-chat-body > .guided-dialogue-shell { min-height: min(300px, 48vh); }
 .guided-dialogue-shell {
   flex: 1 1 auto; min-height: 0; min-width: 0; overflow: hidden;
   display: flex; flex-direction: column; gap: 8px;
@@ -706,9 +709,30 @@ textarea.chat-input { resize: none; max-height: 96px; overflow-y: auto; line-hei
 .guided-composer-row .primary-btn { padding: 8px 11px; font-size: 12px; }
 .guided-composer-hint { color: var(--muted); font-size: 10px; line-height: 1.4; }
 .guided-history { flex: 0 0 auto; border-top: 1px solid var(--border); padding-top: 6px; }
-.guided-history > summary { cursor: pointer; color: var(--muted); font-size: 11px; min-height: 28px; }
-.guided-history[open] { flex: 0 1 210px; min-height: 120px; display: flex; flex-direction: column; }
-.guided-history .chat-log { margin-top: 6px; }
+.guided-history > summary {
+  cursor: pointer; color: var(--ink-soft); font-size: 12px; min-height: 30px; padding: 4px 0;
+}
+.guided-history-hint {
+  display: inline-block; margin-left: 8px; color: var(--muted); font-size: 10px;
+}
+/* Native details content is not a reliable flex sizing context. Give the log its own viewport. */
+.guided-history-content {
+  height: clamp(140px, 26vh, 260px); min-height: 0; margin-top: 6px;
+  border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 8px;
+  background: var(--panel);
+}
+.guided-history-content > .chat-log {
+  height: 100%; min-height: 0; overflow-y: scroll; overscroll-behavior: contain;
+  scrollbar-gutter: stable; scrollbar-width: auto;
+  scrollbar-color: var(--border-strong) var(--panel-soft); padding-right: 8px;
+}
+.guided-history-content > .chat-log::-webkit-scrollbar { width: 10px; }
+.guided-history-content > .chat-log::-webkit-scrollbar-track { background: var(--panel-soft); }
+.guided-history-content > .chat-log::-webkit-scrollbar-thumb {
+  background: var(--border-strong); border: 2px solid var(--panel-soft); border-radius: 999px;
+}
+.guided-history-content > .chat-log::-webkit-scrollbar-thumb:hover { background: var(--muted); }
+.guided-history-content > .chat-log > * { flex-shrink: 0; }
 .guided-history-locked {
   flex: 0 0 auto;
   border-top: 1px solid var(--border);
