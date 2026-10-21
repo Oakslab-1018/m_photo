@@ -353,7 +353,6 @@ class RegionAnalysisService:
             )
             applied = bool(clues or ranking_applied)
             summary = _summary(
-                plan=plan,
                 quality=detail_quality,
                 ocr_status=ocr_status,
                 model_status=model_status,
@@ -978,9 +977,20 @@ def _question_suggestions(
     return questions[:4]
 
 
+# 语言线索 → 直接地理含义（给用户看的分析依据，不做复杂解释）
+_LANGUAGE_GEO_HINT: dict[str, str] = {
+    "ko": "出现韩文，重点考虑韩国",
+    "ja": "出现日文假名，重点考虑日本",
+    "latin": "出现拉丁字母文字（如英语），考虑美国、欧洲等使用拉丁字母的国家和地区",
+    "cyrillic": "出现西里尔字母，考虑俄罗斯及东欧地区",
+    "thai": "出现泰文，重点考虑泰国",
+    "arabic": "出现阿拉伯文，考虑中东及北非地区",
+    "devanagari": "出现天城文，考虑印度等南亚地区",
+}
+
+
 def _summary(
     *,
-    plan: RegionPlan,
     quality: dict[str, Any],
     ocr_status: dict[str, Any],
     model_status: dict[str, Any],
@@ -989,39 +999,46 @@ def _summary(
     applied: bool,
 ) -> str:
     parts: list[str] = []
+    ocr_texts = [
+        str(item.get("text") or "").strip()
+        for item in observations
+        if item.get("kind") == "ocr_text" and str(item.get("text") or "").strip()
+    ]
     if ocr_status["enabled"] and ocr_status["available"]:
-        count = sum(1 for item in observations if item.get("kind") == "ocr_text")
-        if count:
-            parts.append(f"真实 OCR 识别到 {count} 行文字")
+        if ocr_texts:
+            samples = "、".join(f"「{text[:20]}」" for text in ocr_texts[:3])
+            parts.append(f"识别到 {len(ocr_texts)} 行文字：{samples}")
         else:
-            parts.append("真实 OCR 已运行，但未识别到达到阈值的文字")
+            parts.append("OCR 已运行，但该区域没有识别到可用文字")
     elif ocr_status["enabled"]:
         parts.append(f"OCR 当前不可用（{ocr_status['state']}），未产生文字识别结果")
     else:
-        parts.append("OCR 未启用，未产生真实文字识别结果")
-    if clues:
-        parts.append(f"本次新增 {len(clues)} 条文字派生线索，仅用于候选排序")
-    if plan.purpose in {"auto", "scene"}:
-        scene_count = sum(1 for item in observations if item.get("kind") == "scene_hypothesis")
-        if scene_count:
-            parts.append(f"场景模型给出 {scene_count} 个低可信参考假设，不参与国家排序")
-        elif not model_status.get("enabled"):
-            parts.append("场景与国家模型未启用，未生成场景假设")
-        elif model_status.get("scene_state") == "disabled":
-            parts.append("场景模型未启用，未生成场景假设")
-        elif model_status.get("scene_state") in {"unavailable", "failed"}:
-            parts.append("场景模型端点暂不可用，未生成场景假设")
+        parts.append("OCR 未启用，未产生文字识别结果")
+
+    # 语言 → 直接地理含义，例如“出现韩文，重点考虑韩国”
+    language_hints: list[str] = []
+    for clue in clues:
+        if clue.get("dimension") != "language":
+            continue
+        hint = _LANGUAGE_GEO_HINT.get(str(clue.get("value") or ""))
+        if hint and hint not in language_hints:
+            language_hints.append(hint)
+    parts.extend(language_hints)
+
+    scene_labels = [
+        str(item.get("text") or item.get("value") or "").strip()
+        for item in observations
+        if item.get("kind") == "scene_hypothesis"
+    ]
+    if scene_labels:
+        parts.append("场景模型提示可能是：" + "、".join(f"「{label}」" for label in scene_labels[:3]) + "（仅供人工复核）")
+
     if model_status.get("ranking_applied"):
-        parts.append("已把质量合格的上下文裁剪作为弱国家排序证据，全图原始余弦保持不变")
-    elif model_status.get("enabled") and model_status.get("uncertain") is True:
-        parts.append("局部国家排序存在不确定性，因此未应用裁剪排序")
+        parts.append("该区域上下文已作为弱证据参与候选国家排序")
     if quality["issues"]:
-        parts.append("图像质量提示：" + "、".join(quality["issues"]))
-    parts.append("像素统计不能单独判断建筑风格、植被类型、气候或具体地点")
-    if applied:
-        parts.append("这些证据不会自动确认拍摄地")
-    else:
-        parts.append("本轮未新增可用于排序的证据，仅记录区域质量与模型可用性")
+        parts.append("区域质量提示：" + "、".join(quality["issues"]) + "，建议调整选区后重新分析")
+    if not applied and not language_hints and not ocr_texts:
+        parts.append("本轮没有识别到可用于判断地点的直接依据，可换一块包含招牌、路牌或地标的区域再试")
     return "；".join(parts) + "。"
 
 
