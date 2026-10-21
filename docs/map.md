@@ -10,17 +10,22 @@
 | `VITE_MAP_STYLE_URL` | 完整 MapLibre style JSON URL，优先级最高 |
 | `VITE_MAPTILER_API_KEY` | MapTiler public key；自动解析为 `https://api.maptiler.com/maps/streets-v4/style.json?key=…` |
 
-- 本地：复制 `frontend/.env.example` 为 `frontend/.env.local` 后填写。
+- 本地如需覆盖默认底图：复制 `frontend/.env.example` 为 `frontend/.env.local` 后填写。
 - 容器：`Dockerfile.frontend` 已声明同名 build ARG/ENV，Compose build args 由集成阶段接线。
-- 两者都为空时回落到官方 demo tiles
-  （`https://demotiles.maplibre.org/style.json`）：**仅开发预览、无生产 SLA**，
-  页面左上角会显示 “Demo 底图” 标记；生产构建必须配置上面的变量之一。
+- 两项都为空时，默认加载随前端构建发布的 Esri World Imagery raster style
+  （`frontend/public/esri-world-imagery-style.json`），无需 API key。该样式固定使用
+  `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}`、
+  256px 瓦片和 0–23 级缩放，并在 MapLibre attribution control 中显示
+  “Source: Esri, Vantor, Earthstar Geographics, and the GIS User Community”。
+- `VITE_MAP_STYLE_URL` 优先于 `VITE_MAPTILER_API_KEY`；MapTiler 仅在显式提供 key
+  时启用。
 - MapTiler key 是公开的客户端 key，必须在 MapTiler 控制台配置允许的来源
   （origins/referrers）限制；不要在 `VITE_*` 中放任何服务端密钥。
 
 ## 网络与隐私
 
-- 地图瓦片/样式由第三方底图服务（MapTiler 或 MapLibre demo）通过浏览器直接请求。
+- 默认地图瓦片由 Esri World Imagery 通过浏览器直接请求；显式覆盖时则由所选
+  MapLibre 样式提供方或 MapTiler 直接提供瓦片。
 - 应用**不会**把上传图片或用户照片发送给底图服务；请求只包含瓦片 URL、样式
   与常规浏览器信息。
 - 若瓦片网络被拦截或样式加载失败，地图区域显示 “底图加载失败” 提示，国家/城市

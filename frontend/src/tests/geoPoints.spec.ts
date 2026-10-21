@@ -1,6 +1,7 @@
+import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 import {
-  MAPLIBRE_DEMO_STYLE_URL,
+  ESRI_WORLD_IMAGERY_STYLE_URL,
   resolveMapStyle,
 } from '@/utils/mapConfig'
 import {
@@ -60,13 +61,32 @@ describe('resolveMapStyle', () => {
     )
   })
 
-  it('falls back to demo tiles and flags them as demo-only', () => {
+  it('defaults to bundled Esri World Imagery without marking it demo-only', () => {
     for (const env of [{}, { VITE_MAP_STYLE_URL: '   ' }, { VITE_MAPTILER_API_KEY: '' }]) {
       const config = resolveMapStyle(env)
-      expect(config.styleUrl).toBe(MAPLIBRE_DEMO_STYLE_URL)
-      expect(config.source).toBe('demo')
-      expect(config.demoOnly).toBe(true)
+      expect(config.styleUrl).toBe(`${import.meta.env.BASE_URL}esri-world-imagery-style.json`)
+      expect(config.styleUrl).toBe(ESRI_WORLD_IMAGERY_STYLE_URL)
+      expect(config.source).toBe('default')
+      expect(config.demoOnly).toBe(false)
     }
+  })
+
+  it('bundles the exact Esri World Imagery raster contract', () => {
+    const style = JSON.parse(
+      readFileSync(new URL('../../public/esri-world-imagery-style.json', import.meta.url), 'utf8'),
+    )
+    expect(style.sources['esri-world-imagery']).toMatchObject({
+      type: 'raster',
+      tiles: [
+        'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+      ],
+      tileSize: 256,
+      maxzoom: 23,
+      attribution: 'Source: Esri, Vantor, Earthstar Geographics, and the GIS User Community',
+    })
+    expect(style.layers).toContainEqual(
+      expect.objectContaining({ type: 'raster', source: 'esri-world-imagery' }),
+    )
   })
 })
 

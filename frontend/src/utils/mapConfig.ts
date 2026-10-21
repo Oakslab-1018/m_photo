@@ -2,17 +2,17 @@
  * Map style resolution. No secrets are embedded: VITE_* values are public by
  * definition (Vite inlines them into the deployed bundle), and the MapTiler key
  * is a public client-side key that must be URL-restricted in the MapTiler
- * console. A missing key falls back to the official MapLibre demo tiles, which
- * are demo-only and not for production traffic.
+ * console. Explicit configuration overrides the bundled Esri World Imagery
+ * raster style used by default.
  */
-export const MAPLIBRE_DEMO_STYLE_URL = 'https://demotiles.maplibre.org/style.json'
+export const ESRI_WORLD_IMAGERY_STYLE_URL = `${import.meta.env.BASE_URL}esri-world-imagery-style.json`
 
-export type MapStyleSource = 'configured' | 'demo'
+export type MapStyleSource = 'configured' | 'default'
 
 export interface MapStyleConfig {
   styleUrl: string
   source: MapStyleSource
-  /** True when the demo style is used: demo-only, no production SLA. */
+  /** Retained for map UI compatibility; the current default is not demo-only. */
   demoOnly: boolean
 }
 
@@ -40,5 +40,9 @@ export function resolveMapStyle(env: MapStyleEnv): MapStyleConfig {
       demoOnly: false,
     }
   }
-  return { styleUrl: MAPLIBRE_DEMO_STYLE_URL, source: 'demo', demoOnly: true }
+  return {
+    styleUrl: ESRI_WORLD_IMAGERY_STYLE_URL,
+    source: 'default',
+    demoOnly: false,
+  }
 }
