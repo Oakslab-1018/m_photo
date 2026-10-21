@@ -116,6 +116,8 @@ _NEGATIVE_REPLIES = {
 }
 
 _ASCII_RE = re.compile(r"[A-Za-z]")
+_COORDINATE_LIKE_RE = re.compile(r"[-+]?\d{1,3}(?:\.\d+)?\s*[,; ]\s*[-+]?\d{1,3}(?:\.\d+)?\s*$")
+_URL_LIKE_RE = re.compile(r"(?:https?://|www\.)", re.IGNORECASE)
 _CLAUSE_BOUNDARY = re.compile(r"[。！!？?；;，,\n\r、]+")
 
 # 中文国家别名（共享目录之外的常见称谓；ISO 始终来自目录校验）
@@ -124,59 +126,26 @@ _EXTRA_PLACE_ALIASES = {
     "美利坚": "US", "英格兰": "GB", "苏格兰": "GB", "威尔士": "GB", "大不列颠": "GB",
 }
 
-# 常见城市/地区 -> 国家 ISO（仅用于把用户写出的地名落到目录内国家）
-_CITY_ALIASES = {
-    "东京": "JP", "大阪": "JP", "京都": "JP", "北海道": "JP", "冲绳": "JP",
-    "首尔": "KR", "釜山": "KR", "济州": "KR",
-    "北京": "CN", "上海": "CN", "广州": "CN", "深圳": "CN", "杭州": "CN",
-    "西安": "CN", "成都": "CN", "香港": "HK", "澳门": "MO", "台北": "TW",
-    "曼谷": "TH", "清迈": "TH", "普吉": "TH",
-    "巴黎": "FR", "马赛": "FR", "尼斯": "FR",
-    "伦敦": "GB", "曼彻斯特": "GB", "爱丁堡": "GB",
-    "柏林": "DE", "慕尼黑": "DE", "法兰克福": "DE",
-    "罗马": "IT", "米兰": "IT", "威尼斯": "IT", "佛罗伦萨": "IT",
-    "马德里": "ES", "巴塞罗那": "ES", "雅典": "GR",
-    "莫斯科": "RU", "圣彼得堡": "RU",
-    "纽约": "US", "洛杉矶": "US", "旧金山": "US", "华盛顿": "US", "芝加哥": "US",
-    "波士顿": "US", "西雅图": "US",
-    "多伦多": "CA", "温哥华": "CA", "蒙特利尔": "CA",
-    "悉尼": "AU", "墨尔本": "AU", "布里斯班": "AU", "珀斯": "AU",
-    "圣保罗": "BR", "里约热内卢": "BR", "开罗": "EG", "孟买": "IN", "新德里": "IN",
-    "墨西哥城": "MX", "阿姆斯特丹": "NL", "鹿特丹": "NL", "斯德哥尔摩": "SE",
-}
-
-# 常见城市/地区英文写法（仍限定在目录内国家，仅作为字面地名线索）
-_CITY_ALIASES_EN = {
-    "tokyo": "JP", "osaka": "JP", "kyoto": "JP", "sapporo": "JP",
-    "seoul": "KR", "busan": "KR", "bangkok": "TH", "chiang mai": "TH",
-    "beijing": "CN", "shanghai": "CN", "guangzhou": "CN", "shenzhen": "CN",
-    "hong kong": "HK", "macau": "MO", "taipei": "TW",
-    "paris": "FR", "london": "GB", "edinburgh": "GB",
-    "berlin": "DE", "munich": "DE", "frankfurt": "DE",
-    "rome": "IT", "milan": "IT", "venice": "IT",
-    "madrid": "ES", "barcelona": "ES", "athens": "GR",
-    "moscow": "RU", "st petersburg": "RU",
-    "new york": "US", "los angeles": "US", "san francisco": "US", "chicago": "US",
-    "toronto": "CA", "vancouver": "CA", "sydney": "AU", "melbourne": "AU",
-    "sao paulo": "BR", "rio de janeiro": "BR", "cairo": "EG", "mumbai": "IN",
-    "new delhi": "IN", "mexico city": "MX", "amsterdam": "NL", "stockholm": "SE",
-}
-
-# 城市名后紧跟这些字时更像街名，而不是城市证据（"北京路"）。
-_CITY_SUFFIX_GUARDS = ("路", "道", "巷")
-
 # 用户明确描述招牌/路牌文字，或单独给出地点名时，才抽取字面 signage 线索。
 _SIGNAGE_MARKERS = ("写着", "写的是", "招牌", "路牌", "标牌", "门牌", "告示", "指示牌")
 _QUOTE_PATTERN = re.compile(r"[“\"'「『](?P<text>[^”\"'」』]{2,40})[”\"'」』]")
 _INLINE_SIGNAGE_RE = re.compile(
     r"(?:上?写着|写的是)[:：]?(?P<text>[A-Za-z0-9\u4e00-\u9fff][A-Za-z0-9\u4e00-\u9fff .,·'\-]{1,30})"
 )
+_MARKER_TEXT_RE = re.compile(
+    r"(?:路牌|门牌|指示牌|标牌|招牌)[:：]?(?P<text>[A-Za-z0-9一-鿿][A-Za-z0-9一-鿿 .,·'\-]{1,30})"
+)
+_NEARBY_MARKERS = ("旁边", "附近", "对面", "隔壁", "周围")
+_NEARBY_TERM_RE = re.compile(
+    r"(?P<term>[A-Za-z0-9\u3400-\u9fff·'\- ]{2,40}?)(?:旁边|附近|对面|隔壁|周围)"
+)
+
 # 单独输入的街/POI 名称是用户提供的字面观察，不是城市或国家证据。
 # 这里是通用词形约束，不包含任何具体城市/道路白名单。
 _LOCATION_LABEL_SUFFIXES = (
     "大道", "大街", "路", "街", "巷子", "巷", "弄", "胡同", "广场", "公园",
     "景区", "车站", "站", "机场", "码头", "寺", "祠", "桥", "里", "片区",
-    "社区", "村", "镇", "乡",
+    "社区", "村", "镇", "乡", "市", "区", "县", "馆", "店", "塔", "大厦",
 )
 _LOCATION_LABEL_SUFFIXES_EN = (
     "road", "street", "avenue", "lane", "square", "park", "station", "bridge",
@@ -197,7 +166,7 @@ _LABEL_WRAPPERS = (
 )
 _MERGED_CLUE_EXTRA_KEYS = frozenset({
     "literal_kind", "origin_source", "display_only", "affects_ranking",
-    "reliable", "validated",
+    "reliable", "validated", "place_terms", "place_quote",
 })
 
 
@@ -257,6 +226,23 @@ def _standalone_label_candidate(text: str) -> Optional[str]:
     if not (has_cjk_suffix or has_ascii_suffix):
         return None
     return literal
+
+
+def _looks_like_place_term(text: object) -> bool:
+    """Generic locative shape check; no city or street allow-list."""
+
+    literal = _strip_label_wrappers(str(text or "")).strip().rstrip(_LABEL_TRAILING_PUNCT)
+    if not (2 <= len(literal) <= 40):
+        return False
+    if _has_any(literal, _QUESTION_TOKENS) or _has_any(literal, _INSTRUCTION_TOKENS):
+        return False
+    lowered = literal.casefold()
+    if any(lowered.endswith(suffix) for suffix in _LOCATION_LABEL_SUFFIXES):
+        return True
+    return any(
+        re.search(rf"(?<![a-z]){re.escape(suffix)}$", lowered)
+        for suffix in _LOCATION_LABEL_SUFFIXES_EN
+    )
 
 
 def _has_any(text: str, tokens: Sequence[str]) -> bool:
@@ -572,7 +558,7 @@ def _find_anchor(text: str, candidates: Sequence[Any]) -> Optional[Tuple[int, st
 
 @lru_cache(maxsize=1)
 def _place_alias_matcher() -> Tuple[re.Pattern, Dict[str, Tuple[str, str]]]:
-    """Bounded alias table from the country catalog plus curated city names.
+    """Bounded alias table from the country catalog.
 
     Each alias maps to ``(kind, hint)``: country names/aliases carry a
     catalog-validated ISO code; city names stay literal text (a later,
@@ -600,12 +586,6 @@ def _place_alias_matcher() -> Tuple[re.Pattern, Dict[str, Tuple[str, str]]]:
     for alias, iso in _EXTRA_PLACE_ALIASES.items():
         if _alias_supported(iso):
             table.setdefault(alias, ("country", iso))
-    for alias, iso in _CITY_ALIASES.items():
-        if _alias_supported(iso):
-            table.setdefault(alias, ("city", iso))
-    for alias, iso in _CITY_ALIASES_EN.items():
-        if _alias_supported(iso):
-            table.setdefault(alias, ("city", iso))
     entries: List[str] = []
     for alias in sorted(table, key=len, reverse=True):
         escaped = re.escape(alias)
@@ -618,6 +598,15 @@ def _place_alias_matcher() -> Tuple[re.Pattern, Dict[str, Tuple[str, str]]]:
     pattern = re.compile("|".join(entries), re.IGNORECASE)
     lookup = {alias.lower(): table[alias] for alias in table}
     return pattern, lookup
+
+
+@dataclass(frozen=True)
+class PlaceMention:
+    """Literal user place text that may be resolved later."""
+
+    quote: str
+    search_terms: Tuple[str, ...]
+    parser: str = "rules"
 
 
 @dataclass
@@ -673,6 +662,7 @@ class ParsedFeedback:
     remove_clue_values: List[Tuple[str, str]] = field(default_factory=list)
     confirm_iso: Optional[str] = None
     question: bool = False
+    place_mentions: List[PlaceMention] = field(default_factory=list)
 
     def add_clue(self, dimension: str, value: str, confidence: float, evidence: str = "",
                  literal: str = "", parser: str = "rules",
@@ -715,6 +705,42 @@ class ParsedFeedback:
             "extra": entry_extra,
         })
 
+    def add_place_mention(self, quote: str, terms: Sequence[str], parser: str = "rules") -> None:
+        quote_text = _truncate(str(quote or "").strip(), 200)
+        unique: List[str] = []
+        seen: Set[str] = set()
+        for term in terms or ():
+            text = _truncate(str(term or "").strip(), 60)
+            key = _normalize(text)
+            if not text or not key or key in seen:
+                continue
+            seen.add(key)
+            unique.append(text)
+            if len(unique) >= 4:
+                break
+        if not quote_text or not unique:
+            return
+        for index, existing in enumerate(self.place_mentions):
+            if _normalize(existing.quote) != _normalize(quote_text):
+                continue
+            merged = list(existing.search_terms)
+            merged_keys = {_normalize(item) for item in merged}
+            for term in unique:
+                if _normalize(term) not in merged_keys:
+                    merged.append(term)
+                    merged_keys.add(_normalize(term))
+            self.place_mentions[index] = PlaceMention(
+                quote=existing.quote,
+                search_terms=tuple(merged[:4]),
+                parser=existing.parser,
+            )
+            return
+        self.place_mentions.append(PlaceMention(
+            quote=quote_text,
+            search_terms=tuple(unique),
+            parser=str(parser or "rules"),
+        ))
+
     def add_reject(self, iso: str) -> None:
         iso = str(iso or "").strip().upper()
         if len(iso) == 2 and iso not in self.reject_isos:
@@ -750,6 +776,7 @@ class ParsedFeedback:
             remove_clue_values=list(self.remove_clue_values),
             confirm_iso=self.confirm_iso,
             question=self.question,
+            place_mentions=list(self.place_mentions),
         )
         if not isinstance(other, ParsedFeedback):
             return result
@@ -763,6 +790,8 @@ class ParsedFeedback:
                             clue.get("confidence", 0.0), clue.get("evidence", ""),
                             extra.get("literal", ""), extra.get("parser", "rules"),
                             extra=merged_extra)
+        for mention in other.place_mentions:
+            result.add_place_mention(mention.quote, mention.search_terms, mention.parser)
         for iso in other.reject_isos:
             result.add_reject(iso)
         for iso in other.clear_exclusions:
@@ -955,7 +984,9 @@ class ChineseFreeTextParser:
                 self._parse_place_mentions(clause, evidence, pending, parsed)
                 self._parse_phrase_mentions(clause, evidence, parsed)
                 self._parse_signage_mentions(clause, evidence, parsed)
+                self._parse_nearby_mention(clause, evidence, parsed)
         self._parse_standalone_label(raw, evidence, parsed)
+        self._parse_bare_place_text(raw, parsed)
         if _has_any(raw, _SELF_CORRECTION_TOKENS):
             # "刚才说错了，其实是X"：同批新线索覆盖对应维度的旧用户线索。
             for dimension in {clue["dimension"] for clue in parsed.clues}:
@@ -968,28 +999,25 @@ class ChineseFreeTextParser:
                               pending: Optional[PendingQuestion],
                               parsed: ParsedFeedback) -> None:
         for kind, hint, pos, literal in self._place_matches(clause):
-            guards = _PLACE_SUFFIX_GUARDS if kind == "country" else _CITY_SUFFIX_GUARDS
-            if self._is_location_reject(clause, pos, literal, guards):
-                if kind == "country":
-                    # 只有显式否定国家才是硬排除；否定城市不等于否定国家。
-                    parsed.add_reject(hint)
-                    # 同时清掉此前同国家的用户地名线索（城市字面量不动）。
-                    parsed.add_removal("place_name", hint)
+            if kind != "country":
+                continue
+            if self._is_location_reject(clause, pos, literal, _PLACE_SUFFIX_GUARDS):
+                parsed.add_reject(hint)
+                parsed.add_removal("place_name", hint)
                 continue
             segment = _segment_before(clause, pos)
             if _has_any(segment, _UNCERTAIN_TOKENS) or _is_negated(segment):
                 continue
-            if not self._is_place_evidence(clause, pos, literal, pending, guards):
+            if not self._is_place_evidence(
+                clause, pos, literal, pending, _PLACE_SUFFIX_GUARDS
+            ):
                 continue
-            if kind == "country":
-                value, extra = hint, {"place_kind": "country"}
-            else:
-                # 城市/地名保留用户字面写法，交给带目录校验的 city resolver。
-                value, extra = literal, {"place_kind": "city", "country_hint": hint}
-            if kind == "country" and _has_any(clause, _CORRECTION_TOKENS):
+            if _has_any(clause, _CORRECTION_TOKENS):
                 parsed.add_clear_exclusion(hint)
-            parsed.add_clue("place_name", value, DIMENSION_CONFIDENCE["place_name"],
-                            evidence, literal, parser="rules", extra=extra)
+            parsed.add_clue(
+                "place_name", hint, DIMENSION_CONFIDENCE["place_name"],
+                evidence, literal, parser="rules", extra={"place_kind": "country"},
+            )
 
     def _parse_phrase_mentions(self, clause: str, evidence: str,
                                parsed: ParsedFeedback) -> None:
@@ -1010,9 +1038,9 @@ class ChineseFreeTextParser:
     def _place_matches(self, clause: str) -> List[Tuple[str, str, int, str]]:
         """Return ``(kind, hint, position, literal)`` matches.
 
-        Country matches carry a validated ISO hint; city matches stay literal
-        (keeping a trailing 市/区/县/都) with only a validated country hint in
-        metadata.
+        Country names/aliases carry a validated ISO hint.  City and street
+        text deliberately never enters this matcher; it is stored as a literal
+        PlaceMention and resolved against the city catalog later.
         """
         pattern, lookup = _place_alias_matcher()
         matches: List[Tuple[str, str, int, str]] = []
@@ -1021,11 +1049,9 @@ class ChineseFreeTextParser:
             if not entry:
                 continue
             kind, hint = entry
-            end = match.end()
-            if kind == "city":
-                while end < len(clause) and end - match.end() < 2 and clause[end] in "市区县镇都":
-                    end += 1
-            matches.append((kind, hint, match.start(), clause[match.start():end]))
+            if kind != "country":
+                continue
+            matches.append((kind, hint, match.start(), match.group(0)))
         return matches
 
     def _parse_signage_mentions(self, clause: str, evidence: str,
@@ -1047,6 +1073,9 @@ class ChineseFreeTextParser:
         if not candidates:
             for match in _INLINE_SIGNAGE_RE.finditer(clause):
                 candidates.append((match.start("text"), match.group("text").strip()))
+        if not candidates:
+            for match in _MARKER_TEXT_RE.finditer(clause):
+                candidates.append((match.start("text"), match.group("text").strip()))
         for pos, candidate in candidates:
             literal = _strip_label_wrappers(candidate).strip()
             if not (2 <= len(literal) <= 40):
@@ -1062,10 +1091,15 @@ class ChineseFreeTextParser:
             if any(phrase in literal for phrase, _dim, _value in self._phrase_index):
                 # 该文字本身已经是明确的维度线索（如"靠左行驶"），避免重复。
                 continue
+            extra = _literal_observation_extra("reported_signage")
+            extra["place_terms"] = [literal]
+            extra["place_quote"] = clause.strip()[:200]
             parsed.add_clue(
                 "signage", literal, 0.8, evidence, literal, parser="rules",
-                extra=_literal_observation_extra("reported_signage"),
+                extra=extra,
             )
+            if _looks_like_place_term(literal):
+                parsed.add_place_mention(clause, (literal,), parser="rules")
             existing.add(normalized)
 
     def _parse_standalone_label(self, raw: str, evidence: str,
@@ -1073,7 +1107,7 @@ class ChineseFreeTextParser:
         """Save a whole-message street/POI label as literal user observation.
 
         This path deliberately does not infer a country or city. It only records
-        the user's text; a separate curated, catalog-validated helper may propose
+        the user's text; the generic catalog/place resolver may propose
         a location later.
         """
         literal = _standalone_label_candidate(raw)
@@ -1088,10 +1122,92 @@ class ChineseFreeTextParser:
             return
         if any(phrase in literal for phrase, _dim, _value in self._phrase_index):
             return
+        extra = _literal_observation_extra("standalone_street_label")
+        extra["place_terms"] = [literal]
+        extra["place_quote"] = raw[:200]
         parsed.add_clue(
             "signage", literal, 0.8, evidence, literal, parser="rules",
-            extra=_literal_observation_extra("standalone_street_label"),
+            extra=extra,
         )
+        parsed.add_place_mention(raw, (literal,), parser="rules")
+
+    def _parse_bare_place_text(self, raw: str, parsed: ParsedFeedback) -> None:
+        """Preserve a short bare label for catalog-only exact matching.
+
+        It is not promoted to a clue and does not authorize external search by
+        itself; the resolver may use it only if the authoritative catalog has an
+        exact city/alias match.
+        """
+
+        text = _strip_label_wrappers(raw.strip().rstrip(_LABEL_TRAILING_PUNCT)).strip()
+        if not (2 <= len(text) <= 24):
+            return
+        if not re.fullmatch(r"[A-Za-z0-9㐀-鿿·'\- ]+", text):
+            return
+        if _has_any(text, _QUESTION_TOKENS) or _has_any(text, _UNCERTAIN_TOKENS):
+            return
+        if _has_any(text, _NEGATION_TOKENS) or _has_any(text, _INSTRUCTION_TOKENS):
+            return
+        if _has_any(text, _NON_EVIDENCE_TOKENS) or _has_any(text, _LABEL_PROSE_TOKENS):
+            return
+        if any(phrase in text for phrase, _dim, _value in self._phrase_index):
+            return
+        if self._resolve_iso(text):
+            return
+        if any(
+            _normalize(text) == _normalize(term)
+            for mention in parsed.place_mentions
+            for term in mention.search_terms
+        ):
+            return
+        parsed.add_place_mention(raw, (text,), parser="rules")
+
+    def _parse_nearby_mention(
+        self,
+        clause: str,
+        evidence: str,
+        parsed: ParsedFeedback,
+    ) -> None:
+        """Capture context such as "某店旁边" without inventing an identity."""
+
+        if not _has_any(clause, _NEARBY_MARKERS):
+            return
+        if _has_any(clause, _QUESTION_TOKENS) or _has_any(clause, _UNCERTAIN_TOKENS):
+            return
+        if _has_any(clause, _INSTRUCTION_TOKENS) or _has_any(clause, _NON_EVIDENCE_TOKENS):
+            return
+        terms: List[str] = []
+        for match in _NEARBY_TERM_RE.finditer(clause):
+            term = _strip_label_wrappers(match.group("term")).strip()
+            if not (2 <= len(term) <= 40):
+                continue
+            if _has_any(term, _LABEL_PROSE_TOKENS) or _has_any(term, _INSTRUCTION_TOKENS):
+                continue
+            if _normalize(term) in {_normalize(item) for item in terms}:
+                continue
+            terms.append(term)
+            if len(terms) >= 2:
+                break
+        if not terms:
+            return
+        for term in terms:
+            normalized = _normalize(term)
+            existing = {
+                _normalize((clue.get("extra") or {}).get("literal"))
+                for clue in parsed.clues
+                if isinstance(clue.get("extra"), dict)
+            }
+            if normalized in {_normalize(clue.get("value")) for clue in parsed.clues}:
+                continue
+            if normalized in existing:
+                continue
+            extra = _literal_observation_extra("nearby_place")
+            extra["place_terms"] = [term]
+            extra["place_quote"] = clause.strip()[:200]
+            parsed.add_clue(
+                "signage", term, 0.75, evidence, term, parser="rules", extra=extra,
+            )
+        parsed.add_place_mention(clause, tuple(terms), parser="rules")
 
     def _phrase_matches(self, clause: str) -> List[Tuple[int, str, str, str]]:
         raw_matches: List[Tuple[int, str, str, str]] = []
@@ -1240,6 +1356,14 @@ class ChineseFreeTextParser:
                     result.add_clue(clue["dimension"], clue["value"], self.REMOTE_CONFIDENCE,
                                     _truncate(text, 200), clue["literal"], parser="deepseek",
                                     extra=extra)
+        mentions = payload.get("place_mentions")
+        if isinstance(mentions, list):
+            for entry in mentions[:2]:
+                mention = self._validate_remote_place_mention(entry, text)
+                if mention is not None:
+                    result.add_place_mention(
+                        mention.quote, mention.search_terms, parser="deepseek"
+                    )
         rejects = payload.get("reject")
         if isinstance(rejects, list):
             for entry in rejects[:4]:
@@ -1247,6 +1371,58 @@ class ChineseFreeTextParser:
                 if iso:
                     result.add_reject(iso)
         return result
+
+    def _validate_remote_place_mention(self, entry: Any, text: str) -> Optional[PlaceMention]:
+        """Accept only literal, quote-anchored search terms from the LLM."""
+
+        if not isinstance(entry, dict):
+            return None
+        quote = entry.get("quote")
+        raw_terms = entry.get("search_terms")
+        if not isinstance(quote, str) or not isinstance(raw_terms, list):
+            return None
+        quote = quote.strip()
+        if not quote or len(quote) > 60 or text.find(quote) < 0:
+            return None
+        if _has_any(quote, _QUESTION_TOKENS):
+            return None
+        pos = text.find(quote)
+        if _has_any(_clause_containing(text, pos), _QUESTION_TOKENS):
+            return None
+        segment = _segment_before(text, pos)
+        if _has_any(segment, _UNCERTAIN_TOKENS) or _is_negated(segment):
+            return None
+        if _has_any(segment, _INSTRUCTION_TOKENS):
+            return None
+        terms: List[str] = []
+        seen: Set[str] = set()
+        normalized_quote = _normalize(quote)
+        for raw in raw_terms[:4]:
+            if not isinstance(raw, str):
+                continue
+            term = _strip_label_wrappers(raw).strip()
+            normalized = _normalize(term)
+            if not (2 <= len(term) <= 40) or not normalized or normalized in seen:
+                continue
+            if normalized not in normalized_quote:
+                continue
+            term_pos = text.find(term, pos, pos + len(quote))
+            if term_pos < 0:
+                continue
+            term_context = _segment_before(text, term_pos)
+            if (_has_any(term_context, _UNCERTAIN_TOKENS)
+                    or _is_negated(term_context)
+                    or _has_any(term_context, _INSTRUCTION_TOKENS)):
+                continue
+            if _has_any(term, _QUESTION_TOKENS) or _has_any(term, _INSTRUCTION_TOKENS):
+                continue
+            if _COORDINATE_LIKE_RE.search(term) or _URL_LIKE_RE.search(term):
+                continue
+            seen.add(normalized)
+            terms.append(term)
+        if not terms:
+            return None
+        return PlaceMention(quote=quote, search_terms=tuple(terms), parser="deepseek")
 
     def _validate_remote_clue(self, entry: Any, text: str) -> Optional[Dict[str, str]]:
         if not isinstance(entry, dict):
@@ -1282,12 +1458,11 @@ class ChineseFreeTextParser:
                 return None
             return {"dimension": dimension, "value": literal, "literal": quote}
         if dimension == "place_name":
+            # The LLM may only name an explicit country/region. City and street
+            # text belongs in  and is resolved by catalog search.
             iso = self._resolve_iso(raw_value)
             if iso and self._anchor_supported(dimension, iso, quote):
                 return {"dimension": dimension, "value": iso, "literal": quote}
-            literal = raw_value.strip()
-            if self._literal_place_supported(literal, quote, text):
-                return {"dimension": dimension, "value": literal, "literal": quote}
             return None
         value = self._resolve_value(dimension, raw_value)
         if value and self._anchor_supported(dimension, value, quote):
@@ -1359,25 +1534,10 @@ class ChineseFreeTextParser:
             for key in (country.get("name_zh"), country.get("name")):
                 if isinstance(key, str) and key.lower() == lowered:
                     return country["iso"]
-        alias = _EXTRA_PLACE_ALIASES.get(token) or _CITY_ALIASES.get(token)
+        alias = _EXTRA_PLACE_ALIASES.get(token)
         if alias and kg.get_by_iso(alias):
             return alias
         return None
-
-    def _literal_place_supported(self, literal: str, quote: str, text: str) -> bool:
-        """Literal (city/signage) place text must itself be user-grounded."""
-        if not (2 <= len(literal) <= 40):
-            return False
-        normalized = _normalize(literal)
-        if not normalized or normalized not in _normalize(quote):
-            return False
-        aliases = set(_CITY_ALIASES) | set(_CITY_ALIASES_EN)
-        if literal in aliases or literal.lower() in aliases:
-            return True
-        if any(alias in literal for alias in aliases):
-            return True
-        clause = _clause_containing(text, max(0, text.find(quote)))
-        return _has_any(clause, _SIGNAGE_MARKERS)
 
     def _anchors(self, dimension: str, value: str) -> Set[str]:
         anchors = {str(value).lower(), str(value).replace("_", " ").lower()}
@@ -1395,9 +1555,6 @@ class ChineseFreeTextParser:
                 for key in (country.get("name_zh"), country.get("name")):
                     if isinstance(key, str) and key:
                         anchors.add(key.lower())
-            for alias, alias_iso in _CITY_ALIASES.items():
-                if alias_iso == value.upper():
-                    anchors.add(alias.lower())
         return {anchor for anchor in anchors if anchor}
 
     def _anchor_supported(self, dimension: str, value: str, quote: str) -> bool:

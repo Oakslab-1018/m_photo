@@ -45,6 +45,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from catalog_db import default_catalog_path
 
@@ -54,6 +55,12 @@ DEFAULT_AI_MODE = "mock"
 DEFAULT_OCR_PROVIDER = "mock"
 DEFAULT_OCR_MODEL_TYPE = "server"
 VALID_OCR_MODEL_TYPES = ("server", "mobile")
+DEFAULT_OCR_DEVICE = "cpu"
+VALID_OCR_DEVICES = ("cpu", "cuda")
+DEFAULT_OCR_GPU_URL = "http://127.0.0.1:8003"
+DEFAULT_OCR_GPU_TIMEOUT_SECONDS = 60.0
+DEFAULT_OCR_CPU_INTRA_OP_THREADS = 8
+DEFAULT_OCR_CPU_INTER_OP_THREADS = 1
 DEFAULT_OCR_MIN_TEXT_SCORE = 0.5
 DEFAULT_OCR_LANGUAGE_MIN_CONFIDENCE = 0.7
 DEFAULT_GEO_CATALOG_MODE = "db"
@@ -77,6 +84,41 @@ def normalize_ocr_model_type(value: str | None) -> str:
             f"OCR_MODEL_TYPE must be one of {VALID_OCR_MODEL_TYPES!r}; got {candidate!r}"
         )
     return candidate
+
+
+def normalize_ocr_device(value: str | None) -> str:
+    """Return the explicit OCR execution device (cpu or cuda)."""
+    candidate = str(value or DEFAULT_OCR_DEVICE).strip().lower()
+    if candidate not in VALID_OCR_DEVICES:
+        raise ValueError(
+            f"OCR_DEVICE must be one of {VALID_OCR_DEVICES!r}; got {candidate!r}"
+        )
+    return candidate
+
+
+def normalize_ocr_gpu_url(value: str | None) -> str:
+    """Validate the local GPU OCR HTTP endpoint without accepting credentials."""
+    raw = str(value or DEFAULT_OCR_GPU_URL).strip() or DEFAULT_OCR_GPU_URL
+    parsed = urlsplit(raw)
+    if parsed.scheme.lower() != "http":
+        raise ValueError("OCR_GPU_URL must use http")
+    if parsed.username or parsed.password:
+        raise ValueError("OCR_GPU_URL must not contain credentials")
+    if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+        raise ValueError("OCR_GPU_URL must be a root HTTP endpoint")
+    hostname = (parsed.hostname or "").strip().lower()
+    allowed_hosts = {"127.0.0.1", "localhost", "::1", "host.docker.internal"}
+    if hostname not in allowed_hosts:
+        raise ValueError(
+            "OCR_GPU_URL must use a loopback host or host.docker.internal"
+        )
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("OCR_GPU_URL has an invalid port") from exc
+    host = f"[{hostname}]" if ":" in hostname else hostname
+    netloc = f"{host}:{port}" if port is not None else host
+    return f"http://{netloc}"
 
 
 def normalize_geo_catalog_mode(value: str | None) -> str:
@@ -161,6 +203,12 @@ class Settings:
     ocr_cls_model_path: Path | None = None
     ocr_min_text_score: float = DEFAULT_OCR_MIN_TEXT_SCORE
     ocr_language_min_confidence: float = DEFAULT_OCR_LANGUAGE_MIN_CONFIDENCE
+    ocr_device: str = DEFAULT_OCR_DEVICE
+    ocr_gpu_url: str = DEFAULT_OCR_GPU_URL
+    ocr_gpu_api_key: str = field(default="", repr=False)
+    ocr_gpu_timeout_seconds: float = DEFAULT_OCR_GPU_TIMEOUT_SECONDS
+    ocr_cpu_intra_op_threads: int = DEFAULT_OCR_CPU_INTRA_OP_THREADS
+    ocr_cpu_inter_op_threads: int = DEFAULT_OCR_CPU_INTER_OP_THREADS
     streetclip_enabled: bool = False
     streetclip_url: str = "http://127.0.0.1:8001"
     streetclip_api_key: str = field(default="", repr=False)
@@ -319,6 +367,32 @@ class Settings:
         ocr_language_min_confidence = bounded_float(
             "OCR_LANGUAGE_MIN_CONFIDENCE", DEFAULT_OCR_LANGUAGE_MIN_CONFIDENCE
         )
+        ocr_device = normalize_ocr_device(get("OCR_DEVICE"))
+        ocr_gpu_url = normalize_ocr_gpu_url(get("OCR_GPU_URL"))
+
+        def positive_int(name: str, default: int, maximum: int = 64) -> int:
+            raw = get(name)
+            if not raw:
+                return default
+            try:
+                value = int(raw)
+            except ValueError as exc:
+                raise ValueError(f"{name} must be an integer") from exc
+            if value < 1 or value > maximum:
+                raise ValueError(f"{name} must be between 1 and {maximum}")
+            return value
+
+        def positive_float(name: str, default: float, maximum: float = 300.0) -> float:
+            raw = get(name)
+            if not raw:
+                return default
+            try:
+                value = float(raw)
+            except ValueError as exc:
+                raise ValueError(f"{name} must be a number") from exc
+            if value <= 0.0 or value > maximum:
+                raise ValueError(f"{name} must be > 0 and <= {maximum}")
+            return value
 
         return cls(
             data_dir=data_dir,
@@ -338,6 +412,18 @@ class Settings:
             ocr_cls_model_path=optional_model_path("OCR_CLS_MODEL_PATH"),
             ocr_min_text_score=ocr_min_text_score,
             ocr_language_min_confidence=ocr_language_min_confidence,
+            ocr_device=ocr_device,
+            ocr_gpu_url=ocr_gpu_url,
+            ocr_gpu_api_key=(get("GPUOCR_API_KEY", "STREETCLIP_API_KEY") or "").strip(),
+            ocr_gpu_timeout_seconds=positive_float(
+                "OCR_GPU_TIMEOUT_SECONDS", DEFAULT_OCR_GPU_TIMEOUT_SECONDS
+            ),
+            ocr_cpu_intra_op_threads=positive_int(
+                "OCR_CPU_INTRA_OP_THREADS", DEFAULT_OCR_CPU_INTRA_OP_THREADS
+            ),
+            ocr_cpu_inter_op_threads=positive_int(
+                "OCR_CPU_INTER_OP_THREADS", DEFAULT_OCR_CPU_INTER_OP_THREADS
+            ),
             streetclip_enabled=(get("STREETCLIP_ENABLED") or "false").lower() in {"1", "true", "yes", "on"},
             streetclip_url=(get("STREETCLIP_URL") or "http://127.0.0.1:8001").rstrip("/"),
             streetclip_api_key=(get("STREETCLIP_API_KEY") or "").strip(),
@@ -363,9 +449,17 @@ __all__ = [
     "DEFAULT_OCR_MIN_TEXT_SCORE",
     "DEFAULT_OCR_MODEL_TYPE",
     "DEFAULT_OCR_PROVIDER",
+    "DEFAULT_OCR_DEVICE",
+    "DEFAULT_OCR_GPU_TIMEOUT_SECONDS",
+    "DEFAULT_OCR_GPU_URL",
+    "DEFAULT_OCR_CPU_INTER_OP_THREADS",
+    "DEFAULT_OCR_CPU_INTRA_OP_THREADS",
     "VALID_GEO_CATALOG_MODES",
+    "VALID_OCR_DEVICES",
     "VALID_OCR_MODEL_TYPES",
     "normalize_geo_catalog_mode",
+    "normalize_ocr_device",
+    "normalize_ocr_gpu_url",
     "normalize_ocr_model_type",
     "DEFAULT_DATA_DIRNAME",
     "MAX_UPLOAD_BYTES",

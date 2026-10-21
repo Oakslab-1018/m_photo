@@ -442,6 +442,8 @@ function mergeGuidedCandidate(
       ? { selection_basis: basis.candidate.selection_basis }
       : {}),
   }
+  const placeMatch = basis.candidate.place_match ?? left.candidate.place_match ?? right.candidate.place_match
+  if (placeMatch) merged.place_match = placeMatch
   if (scored.score !== null) {
     merged.score = scored.score
     merged.score_type = scored.candidate.score_type ?? null

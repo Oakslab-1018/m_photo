@@ -32,6 +32,7 @@ from ..domain.geolocation.engine import (
     normalize_place_text,
 )
 from ..domain.geolocation.country_policy import canonical_country_iso, normalize_iso
+from .place_resolution import CityEvidence
 
 
 CITY_CLUE_BOOST_SCALE = 0.12
@@ -59,6 +60,8 @@ class _Evidence:
     confidence: float
     evidence: str
     catalog_iso: Optional[str] = None
+    city_id: Optional[int] = None
+    source_iso: Optional[str] = None
 
 
 class CityClueReasoner:
@@ -70,7 +73,8 @@ class CityClueReasoner:
         self._catalog = catalog
 
     def rerank(self, city_scores: Sequence[Dict[str, Any]],
-               clues: Sequence[Clue], *, iso: str) -> CityRerankResult:
+               clues: Sequence[Clue], *, iso: str,
+               city_evidence: Sequence[CityEvidence] = ()) -> CityRerankResult:
         rows = list(city_scores or [])
         iso_key = str(iso or "").strip().upper()
         if not rows or self._catalog is None:
@@ -79,6 +83,7 @@ class CityClueReasoner:
         if not scope:
             return CityRerankResult(rows)
         evidence = self._extract_evidence(clues, iso_key)
+        evidence.extend(self._extract_city_evidence(city_evidence, iso_key, scope))
         if not evidence:
             return CityRerankResult(rows)
 
@@ -88,13 +93,21 @@ class CityClueReasoner:
         notes: List[str] = []
 
         for item in evidence:
-            norm = normalize_place_text(item.text)
-            if not norm:
-                continue
-            hit = self._match_name(norm, buckets)
-            if hit is None:
-                continue
-            ids = buckets[hit]
+            if item.city_id is not None:
+                # The resolver already mapped the literal street/POI to this
+                # catalog city. The street itself need not contain its name.
+                ids = [item.city_id]
+                hit = normalize_place_text(self._row_name(scope.get(item.city_id)))
+                if not hit:
+                    continue
+            else:
+                norm = normalize_place_text(item.text)
+                if not norm:
+                    continue
+                hit = self._match_name(norm, buckets)
+                if hit is None:
+                    continue
+                ids = buckets[hit]
             if len(ids) > 1:
                 notes.append(f"线索中的「{hit}」在该国目录中不唯一，未参与重排")
                 continue
@@ -211,6 +224,41 @@ class CityClueReasoner:
                 ))
         return evidence
 
+    def _extract_city_evidence(
+        self,
+        city_evidence: Sequence[CityEvidence],
+        iso: str,
+        scope: Mapping[Any, Any],
+    ) -> List[_Evidence]:
+        """Accept only resolver-validated, unique city evidence in this scope."""
+
+        best: Dict[int, _Evidence] = {}
+        for item in city_evidence or ():
+            if not isinstance(item, CityEvidence):
+                continue
+            if str(item.source_iso or "").strip().upper() != iso:
+                continue
+            try:
+                city_id = int(item.city_id)
+            except (TypeError, ValueError):
+                continue
+            if city_id not in scope:
+                continue
+            confidence = min(1.0, max(0.0, float(item.confidence)))
+            if confidence < MIN_EVIDENCE_CONFIDENCE:
+                continue
+            current = best.get(city_id)
+            if current is None or confidence > current.confidence:
+                best[city_id] = _Evidence(
+                    dimension="place_name",
+                    text=item.text,
+                    confidence=confidence,
+                    evidence=item.text,
+                    catalog_iso=iso,
+                    city_id=city_id,
+                    source_iso=iso,
+                )
+        return list(best.values())
     # ---- name matching ------------------------------------------------------
     @staticmethod
     def _row_name(row: Any) -> str:

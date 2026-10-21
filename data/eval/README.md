@@ -36,7 +36,7 @@
 - revised vs legacy：top1 `3 corrected / 3 harmed`；top3 `1 corrected / 2 harmed`。不宣称准确率提升。
 - HIGH `>= 0.02`（revised）：134 eligible，24 wrong，17.9% false-high；只是描述性诊断，阈值 provisional 且未校准。
 
-报告：[full-paired-recovered557-replay/report.md](../../reports/ocr-evidence-ablation-20261020T205803/full-paired-recovered557-replay/report.md)。full 2997 续跑已获授权，剩余 2440 条实现待启动；当前仍未完成，本文不提供恢复/续跑命令。
+报告：[full-paired-recovered557-replay/report.md](../../reports/ocr-evidence-ablation-20261020T205803/full-paired-recovered557-replay/report.md)。全量 2997 张现已完成，2737 张有国家标签、0 arm failures。Top-1：纯模型 53.67%、旧 OCR 52.83%、新 OCR 53.45%；[全量报告](../../reports/eval-acceleration-20261021/run-20261021T121100/replay-retry-1/report.md)。
 
 ## 复现
 
@@ -112,7 +112,7 @@ JSON Lines，每行一张图；示例见 [`manifest.example.jsonl`](manifest.exa
 
 ## 当前限制
 
-- legacy baseline 只有 1764 条前缀；full paired 的 557 条 recovered prefix 已有离线报告，但 full 2997 正在后台续跑（复用 598 条，计划补采 2399 条后自动回放）。两者都不能替代完整 benchmark。
+- legacy baseline 只有 1764 条前缀。全量国家三臂已完成 2997 张：复用 1355 条，新采 1642 条平均 0.8618 秒/张；不含城市、用户对话或参考检索，不能据此推断它们的准确率与交互收益。
 - 没有真实 reference corpus/index；StreetCLIP 国家排序不是已完成的独立参考检索。国家消融也不含 reference arm。
 - LLM 仅做经校验的文字线索抽取与解释，不决定国家/坐标；所有结果仍由同一确定性 scorer 产生，provider 失败回退本地模板。
 - 国家消融说明见 [country-ablation.md](../../docs/country-ablation.md)，产品与对话契约见 [guided-dialogue.md](../../docs/guided-dialogue.md)。

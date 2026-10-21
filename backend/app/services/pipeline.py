@@ -43,6 +43,11 @@ class PipelineService:
         value = getattr(self._settings, "ocr_model_type", "server")
         return value if isinstance(value, str) and value.strip() else "server"
 
+    @property
+    def ocr_device(self) -> str:
+        value = getattr(self._settings, "ocr_device", "cpu")
+        return value if isinstance(value, str) and value.strip() else "cpu"
+
     def _get_pipeline(self):
         if self._pipeline is None:
             with self._lock:
@@ -63,6 +68,18 @@ class PipelineService:
                         ocr_language_min_confidence=self._float(
                             "ocr_language_min_confidence", 0.7
                         ),
+                        ocr_device=self.ocr_device,
+                        ocr_gpu_url=self._text("ocr_gpu_url"),
+                        ocr_gpu_api_key=self._text("ocr_gpu_api_key"),
+                        ocr_gpu_timeout_seconds=self._float(
+                            "ocr_gpu_timeout_seconds", 60.0
+                        ),
+                        ocr_cpu_intra_op_threads=self._int(
+                            "ocr_cpu_intra_op_threads", 8
+                        ),
+                        ocr_cpu_inter_op_threads=self._int(
+                            "ocr_cpu_inter_op_threads", 1
+                        ),
                     )
         return self._pipeline
 
@@ -82,6 +99,23 @@ class PipelineService:
             except ValueError:
                 return default
         return default
+
+    def _int(self, attr: str, default: int) -> int:
+        value = getattr(self._settings, attr, None)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            try:
+                return int(value)
+            except ValueError:
+                return default
+        return default
+
+    def _text(self, attr: str) -> str | None:
+        value = getattr(self._settings, attr, None)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        return None
 
     def analyze(self, image_path: str) -> list[dict[str, Any]]:
         """Run all analyzers and return plain clue dictionaries."""
@@ -125,6 +159,8 @@ class PipelineService:
                     "available": False,
                     "line_count": 0,
                     "detail": type(exc).__name__,
+                    "requested_device": self.ocr_device,
+                    "effective_device": None,
                 },
             }
 
@@ -143,6 +179,8 @@ class PipelineService:
                 "provider": self.ocr_provider,
                 "state": "unavailable",
                 "detail": type(exc).__name__,
+                "requested_device": self.ocr_device,
+                "effective_device": None,
             }
 
 

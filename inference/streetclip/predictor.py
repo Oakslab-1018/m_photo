@@ -31,7 +31,9 @@ from .catalog import Country, compute_catalog_revision, render_prompts
 from .cities import City, city_prompt_count, render_city_prompts
 from .config import (
     CITY_TEXT_FEATURE_CACHE_COUNTRIES,
+    DEFAULT_BATCH_PROCESSOR_CHUNK,
     DEFAULT_CITY_PROMPT_CHUNK,
+    MAX_BATCH_PROCESSOR_CHUNK,
     MODEL_ID,
     MODEL_REVISION,
     PROMPT_TEMPLATE_VERSION,
@@ -223,35 +225,156 @@ class StreetClipPredictor:
     def encode_image(self, image: Any) -> np.ndarray:
         """Thread-safe shared encoder: PIL image -> CPU normalized float32 vector.
 
-        This is the exact hook used by the country ranking, the city ranking and
-        the offline reference index builder. It performs one model forward pass
-        per image under the single inference lock and always detaches to a
-        contiguous CPU array before returning.
+        Single-image callers use the same bounded batch path with a one-image
+        list, so their exact embedding computation and OOM fallback remain
+        consistent with ``encode_images``.
         """
-        if not self._ready or self._model is None:
-            raise PredictorUnavailableError("model is not loaded")
-        torch = self._torch_module()
+        return self.encode_images([image])[0]
+
+    @staticmethod
+    def _is_out_of_memory(exc: BaseException, torch: Any) -> bool:
+        oom_type = getattr(torch, "OutOfMemoryError", None)
+        if isinstance(oom_type, type) and isinstance(exc, oom_type):
+            return True
+        message = str(exc).lower()
+        return "out of memory" in message or "not enough memory" in message
+
+    @staticmethod
+    def _release_inference_memory(torch: Any) -> None:
+        """Best-effort cleanup before retrying a smaller image microbatch."""
+        import gc  # noqa: PLC0415 - only needed on the exceptional path
+
+        gc.collect()
         try:
-            with self._inference_lock, torch.inference_mode():
-                inputs = self._processor(images=image, return_tensors="pt")
-                inputs = {key: value.to(self._device) for key, value in inputs.items()}
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:  # pragma: no cover - defensive cleanup only
+            return
+
+    def _encode_image_batch_once(self, images: list[Any], torch: Any) -> np.ndarray:
+        """Run one processor batch and exactly one image-feature model call."""
+        inputs: dict[str, Any] | None = None
+        output: Any = None
+        normalized: Any = None
+        values: Any = None
+        try:
+            inputs = self._processor(images=images, return_tensors="pt")
+            inputs = {key: value.to(self._device) for key, value in inputs.items()}
+            with torch.inference_mode():
                 output = self._model.get_image_features(**inputs)
                 normalized = torch.nn.functional.normalize(output, p=2, dim=-1)
-                vector = (
-                    normalized.squeeze(0)
-                    .detach()
-                    .to("cpu")
-                    .to(torch.float32)
-                    .numpy()
+                values = normalized.detach().to("cpu").to(torch.float32).numpy()
+            array = np.ascontiguousarray(values, dtype=np.float32)
+            if (
+                array.ndim != 2
+                or array.shape[0] != len(images)
+                or array.shape[1] == 0
+            ):
+                raise PredictorUnavailableError(
+                    "StreetCLIP returned an invalid image embedding batch"
                 )
+            return array
+        finally:
+            # Do not let a failed OOM attempt retain tensors through its
+            # traceback while the caller retries a smaller microbatch.
+            inputs = None
+            output = None
+            normalized = None
+            values = None
+
+    def _encode_image_batch_with_oom_fallback(
+        self,
+        images: list[Any],
+        torch: Any,
+    ) -> np.ndarray:
+        """Encode one microbatch, recursively halving it only on OOM."""
+        try:
+            return self._encode_image_batch_once(images, torch)
         except PredictorUnavailableError:
             raise
         except Exception as exc:  # pragma: no cover - requires real weights
-            raise PredictorUnavailableError(f"StreetCLIP image encoding failed: {exc}") from exc
-        array = np.ascontiguousarray(vector, dtype=np.float32)
-        if array.ndim != 1 or array.size == 0:
-            raise PredictorUnavailableError("StreetCLIP returned an invalid image embedding")
-        return array
+            if not self._is_out_of_memory(exc, torch):
+                raise
+            self._release_inference_memory(torch)
+            if len(images) <= 1:
+                raise PredictorUnavailableError(
+                    "StreetCLIP image encoding ran out of memory for one image"
+                ) from exc
+            split_at = len(images) // 2
+            logger.warning(
+                "StreetCLIP image batch OOM size=%d; retrying as %d+%d",
+                len(images),
+                split_at,
+                len(images) - split_at,
+            )
+            first = self._encode_image_batch_with_oom_fallback(
+                images[:split_at], torch
+            )
+            second = self._encode_image_batch_with_oom_fallback(
+                images[split_at:], torch
+            )
+            return np.ascontiguousarray(
+                np.concatenate((first, second), axis=0), dtype=np.float32
+            )
+
+    def encode_images(self, images: list[Any]) -> np.ndarray:
+        """PIL images -> contiguous CPU L2-normalized float32 embedding rows.
+
+        The processor receives real image batches and each bounded microbatch
+        invokes ``get_image_features`` once. The configured processor chunk
+        bounds peak tensor size; only an actual OOM retries a split microbatch,
+        recursively down to one image. A one-image OOM is reported as an
+        unavailable predictor instead of being hidden or returning a fake row.
+        """
+        if not self._ready or self._model is None:
+            raise PredictorUnavailableError("model is not loaded")
+        if not isinstance(images, list) or not images:
+            raise ValueError("images must be a non-empty list")
+        torch = self._torch_module()
+        try:
+            configured_chunk = int(
+                getattr(
+                    self.settings,
+                    "batch_processor_chunk",
+                    DEFAULT_BATCH_PROCESSOR_CHUNK,
+                )
+            )
+        except (TypeError, ValueError):
+            configured_chunk = DEFAULT_BATCH_PROCESSOR_CHUNK
+        chunk_size = min(
+            MAX_BATCH_PROCESSOR_CHUNK,
+            max(1, configured_chunk),
+        )
+
+        try:
+            blocks: list[np.ndarray] = []
+            with self._inference_lock:
+                for start in range(0, len(images), chunk_size):
+                    chunk = images[start : start + chunk_size]
+                    block = self._encode_image_batch_with_oom_fallback(chunk, torch)
+                    if block.shape[0] != len(chunk):
+                        raise PredictorUnavailableError(
+                            "StreetCLIP image batch row count mismatch"
+                        )
+                    blocks.append(block)
+            combined = np.ascontiguousarray(
+                np.concatenate(blocks, axis=0), dtype=np.float32
+            )
+        except PredictorUnavailableError:
+            raise
+        except Exception as exc:  # pragma: no cover - requires real weights
+            raise PredictorUnavailableError(
+                f"StreetCLIP image batch encoding failed: {exc}"
+            ) from exc
+        if (
+            combined.ndim != 2
+            or combined.shape[0] != len(images)
+            or combined.shape[1] == 0
+        ):
+            raise PredictorUnavailableError(
+                "StreetCLIP returned an invalid image embedding batch"
+            )
+        return combined
 
     def _encode_text_prompts(self, prompts: list[str]) -> np.ndarray:
         """Encode text prompts in bounded chunks; CPU normalized float32 rows."""

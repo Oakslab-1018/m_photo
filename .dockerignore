@@ -109,3 +109,7 @@ nul
 
 # Downloaded metadata caches are local build inputs, not source.
 /.cache/
+
+# Evaluation inputs and run snapshots are host-only, never app assets.
+/data/eval/
+/reports/

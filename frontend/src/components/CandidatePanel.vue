@@ -26,6 +26,7 @@ import {
   regionScopeLabel,
 } from '@/utils/geo'
 import ReferenceMatches from '@/components/ReferenceMatches.vue'
+import PlaceMatchEvidence from '@/components/PlaceMatchEvidence.vue'
 
 const props = defineProps<{
   scores: CountryScore[]
@@ -311,6 +312,7 @@ function isForeignCitySelection(): boolean {
                     {{ targetLabel(candidate.target) }}
                   </div>
                   <div class="candidate-score">{{ candidateScoreLabel(candidate) }}</div>
+                  <PlaceMatchEvidence v-if="candidate.place_match" :match="candidate.place_match" />
                 </div>
               </div>
               <div class="candidate-actions">

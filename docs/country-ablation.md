@@ -1,6 +1,6 @@
 # 国家消融：semantic 守卫与 capture/replay
 
-状态：国家消融工具与已保存结果的文档可复核；关联的 confidence/guided backend/frontend 仍在实现，测试待 primary 接受。本文不作对话准确率、coverage 或问题数收益声明。
+状态：国家三臂 capture/replay 与置信路由已接入；全量三臂已完成，状态见 ACTIVE_RUN。本轮交互变更由用户手测，不宣称对话准确率、coverage 或问题数收益。
 
 ## 口径
 
@@ -12,6 +12,18 @@
 - 参考索引代码/sidecar 契约存在，但当前没有真实 reference corpus/index；StreetCLIP 国家排序不是已完成的独立参考索引检索。
 
 ## 结果
+
+### 全量 2997 张（2026-10-21）
+
+2737 条有效国家标签、260 条 unknown 排除、0 arm failures。复用 1355 条证据，新增 1642 条 GPU 采集平均 0.8618 秒/张；总样本中 1283 条 CPU、1714 条 GPU，三臂使用完全相同的缓存。
+
+| arm | top1 | top3 | top5 |
+| --- | ---: | ---: | ---: |
+| model_only | 53.67% | 70.77% | 77.20% |
+| legacy_ocr | 52.83% | 70.59% | 77.13% |
+| revised_ocr | 53.45% | 70.55% | 77.02% |
+
+revised 的 top1 较 legacy 增加约 0.62 个百分点，较 model_only 低约 0.22 个百分点；未证明 OCR 融合提高纯模型准确率。本次不含用户对话或参考检索，不能推断其收益。完整结果：[report.md](../reports/eval-acceleration-20261021/run-20261021T121100/replay-retry-1/report.md)。以下前缀结果仅保留历史记录。
 
 ### Legacy baseline（partial）
 
@@ -43,7 +55,7 @@ revised vs legacy：top1 `3 corrected / 3 harmed`，top3 `1 corrected / 2 harmed
 
 HIGH `>= 0.02` 的描述性诊断（revised）：134 eligible、24 wrong、17.9% false-high。阈值来自 provisional policy，未在此子集调参，也未经完整 benchmark 校准。报告：[full-paired-recovered557-replay/report.md](../reports/ocr-evidence-ablation-20261020T205803/full-paired-recovered557-replay/report.md)。
 
-full 2997 已恢复后台采集，复用 598 条记录、补采 2399 条后自动回放；状态见根目录 reports/ocr-evidence-ablation-20261020T205803/ACTIVE_RUN.json，目前没有完整 benchmark 结论。30 图还与 prospective 1233 holdout 重叠 10 张，因此该 holdout 并非完全 blind。
+这些前缀结果现已由全量结果补充。缓存逐条记录 CPU/GPU 运行来源，混合设备段不用于证明两设备逐位一致。30 图与历史 prospective 1233 holdout 重叠 10 张，因此该 holdout 并非完全 blind。
 
 ## Semantic 守卫
 
@@ -68,3 +80,9 @@ capture 需要冻结的旧代码 worktree、原 root 的 env-file、manifest、i
 ```
 
 capture 完成前可留下 `cache.jsonl.partial`；只有最终 `meta.json` 才表示正常完成。replay 会拒绝 model/prompt/catalog/manifest/image 不兼容、cache 校验失败，以及 scorer/engine 字节 hash 不一致的 cache；本轮只允许 semantic 变化。输出目录必须新建且与 cache 分离。本文不提供续跑/恢复命令；完整 2997 的状态以 primary 后续报告为准。
+
+## 加速采集
+
+`eval_accelerated_capture.py` 以持久 CPU 工作进程准备图像与派生线索，通过独立服务执行 GPU OCR，模型端每批处理 4 张。单一写入端按 manifest 顺序落盘，批次 fsync；进程退出保留完整前缀。`run_accelerated_eval.py` 冻结旧、新 OCR 语义源码与输入，监管 capture/replay，并更新 ACTIVE_RUN。
+
+国家采集不含城市阶段，不能直接与旧端到端约 4 秒/张比较。首次 CUDA 初始化单列；稳定吞吐使用新增样本数与实际运行时间计算。三臂共享同一份证据缓存，缓存不传入 ground truth；GPU 设备与运行库版本保存在每条记录中。

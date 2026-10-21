@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, ref, watch } from 'vue'
+import PlaceMatchEvidence from '@/components/PlaceMatchEvidence.vue'
 import type {
   ConfidenceRoute,
   GuidedDialogue,
@@ -571,6 +572,7 @@ watch(stage, (nextStage, previousStage) => {
               {{ candidatePointLabel(candidate.target) }}
             </span>
             <p v-if="candidate.reason" class="guided-candidate-reason">{{ candidate.reason }}</p>
+            <PlaceMatchEvidence v-if="candidate.place_match" :match="candidate.place_match" />
           </div>
           <div class="guided-candidate-actions">
             <button
@@ -792,6 +794,7 @@ watch(stage, (nextStage, previousStage) => {
               此候选无坐标，地图不放置候选标记；选中时仅聚焦已确认父级范围
             </span>
             <p v-if="candidate.reason" class="guided-candidate-reason">{{ candidate.reason }}</p>
+            <PlaceMatchEvidence v-if="candidate.place_match" :match="candidate.place_match" />
           </div>
           <div class="guided-candidate-actions">
             <button

@@ -18,14 +18,14 @@ import logging
 import re
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, List, Mapping, Sequence
 
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 
-from services.chat import ChineseFreeTextParser, PendingQuestion
+from services.chat import ChineseFreeTextParser, PendingQuestion, PlaceMention
 
 from ..config import Settings
 from ..database import GeoSession, GuidedDialogue, GuidedEvent
@@ -38,7 +38,7 @@ from ..domain.geolocation.country_policy import (
     normalize_iso,
     source_region_iso,
 )
-from ..domain.geolocation.engine import find_exact_phrase, normalize_place_text
+from ..domain.geolocation.engine import normalize_place_text
 from ..domain.geolocation.model_ranking import ModelAwareEngine, ModelAwareHypotheses
 from ..schemas import (
     ActionModel,
@@ -62,6 +62,8 @@ from .city_catalog import CityRow
 from .city_reasoning import CityClueReasoner
 from .deepseek import DeepSeekClient, narration_matches_action
 from .geo_session import GeoSessionService
+from .geocoding import GeocodingConfig, get_shared_geocoder
+from .place_resolution import CityEvidence, PlaceResolutionBatch, PlaceResolutionService
 from .model_gateway import StreetClipGateway, build_inference_notice
 
 logger = logging.getLogger(__name__)
@@ -105,15 +107,6 @@ def _looks_like_street_text(value: object) -> bool:
     return bool(text) and any(suffix in text for suffix in _STREET_SUFFIXES)
 
 
-# Explicit, catalog-validated Chinese aliases for guided city proposals. The
-# legacy parser's alias map is country-level and intentionally not reused as a
-# location confirmation source. These IDs are checked against the read-only
-# SQLite city catalog and still require an explicit confirm_location event.
-_GUIDED_CITY_ALIAS_IDS = {
-    "杭州": "1808926",
-}
-
-
 class GuidedNotFound(RuntimeError):
     """会话/引导状态不存在（HTTP 404）。"""
 
@@ -144,6 +137,7 @@ def _empty_state() -> dict[str, Any]:
         "asked_clue_questions": [],
         "confidence_confirm_isos": [],
         "proposals": [],
+        "place_resolutions": [],
         "proposal_meta": {},
         "conflict": None,
         "pending_correction": None,
@@ -163,24 +157,49 @@ def _normalise_state(value: object) -> dict[str, Any]:
             result["confirmed"][level] = dict(target) if isinstance(target, Mapping) else None
     for key in (
         "exclusions", "clues", "asked_question_ids", "asked_clue_questions",
-        "confidence_confirm_isos", "proposals",
+        "confidence_confirm_isos", "proposals", "place_resolutions",
     ):
         raw = value.get(key)
         if isinstance(raw, list):
             result[key] = [dict(item) if isinstance(item, Mapping) else item for item in raw]
+    # Legacy alias-derived metadata must never recreate a mapping.  New
+    # resolution metadata always carries resolution_ids; stale curated entries
+    # are dropped rather than converted into hidden static knowledge.
+    for record in result.get("clues") or []:
+        if not isinstance(record, dict):
+            continue
+        extra = record.get("_extra")
+        if isinstance(extra, dict):
+            extra.pop("place_alias", None)
+            record["_extra"] = extra
     proposal_meta = value.get("proposal_meta")
     if isinstance(proposal_meta, Mapping):
         result["proposal_meta"] = {
             str(key): dict(item)
             for key, item in proposal_meta.items()
             if isinstance(item, Mapping)
+            and (
+                item.get("resolution_ids")
+                or not str(key).startswith("city:")
+            )
         }
+    valid_meta_keys = set(result["proposal_meta"])
+    result["proposals"] = [
+        item for item in result.get("proposals") or []
+        if not isinstance(item, Mapping)
+        or item.get("level") != "city"
+        or _target_state_key(item) in valid_meta_keys
+    ]
     question = value.get("pending_question")
     result["pending_question"] = dict(question) if isinstance(question, Mapping) else None
     conflict = value.get("conflict")
     result["conflict"] = dict(conflict) if isinstance(conflict, Mapping) else None
     correction = value.get("pending_correction")
     result["pending_correction"] = dict(correction) if isinstance(correction, Mapping) else None
+    if isinstance(result.get("place_resolutions"), list):
+        result["place_resolutions"] = [
+            item for item in result["place_resolutions"] if isinstance(item, Mapping)
+        ][-20:]
     result["session_evidence_fingerprint"] = str(value.get("session_evidence_fingerprint") or "")
     result["last_text"] = str(value.get("last_text") or "")
     return result
@@ -244,6 +263,8 @@ def _reviewed_record(raw: Mapping[str, Any], occurrence: int = 0) -> dict[str, A
     evidence = str(raw.get("evidence") or raw.get("description") or "").strip()
     confidence = _clamp_confidence(raw.get("confidence"))
     extra = raw.get("extra") if isinstance(raw.get("extra"), Mapping) else {}
+    extra = dict(extra)
+    extra.pop("place_alias", None)
     return {
         "id": _clue_id(raw, occurrence),
         "dimension": dimension,
@@ -329,6 +350,13 @@ def _review_question(record: Mapping[str, Any]) -> dict[str, Any]:
 
 
 @dataclass
+class _FreeTextPreflight:
+    parsed: Any
+    resolution: PlaceResolutionBatch | None = None
+    notice: str | None = None
+
+
+@dataclass
 class _Prepared:
     state: dict[str, Any]
     stage: str
@@ -350,6 +378,12 @@ class GuidedDialogueService:
         self.parser = ChineseFreeTextParser()
         self.gateway = StreetClipGateway(settings)
         self.provider = DeepSeekClient(settings)
+        self.geocoding_config = GeocodingConfig.from_env()
+        self.place_resolver = PlaceResolutionService(
+            geocoder=get_shared_geocoder(self.geocoding_config),
+            cache_ttl_seconds=self.geocoding_config.cache_ttl_seconds,
+            negative_cache_ttl_seconds=self.geocoding_config.negative_cache_ttl_seconds,
+        )
         self._store_instance: Any | None = None
         self._country_records_cache: list[dict[str, Any]] | None = None
 
@@ -416,14 +450,15 @@ class GuidedDialogueService:
                 response = self._response(session_id, prepared, revision=row.revision, receipt=None)
                 self._strict_response(response)
                 return response
-            new_revision = row.revision + 1
+            base_revision = int(row.revision)
+            new_revision = base_revision + 1
             try:
                 with self.geo.transaction():
                     result = self.geo.session.execute(
                         update(GuidedDialogue)
                         .where(
                             GuidedDialogue.session_id == session_id,
-                            GuidedDialogue.revision == row.revision,
+                            GuidedDialogue.revision == base_revision,
                         )
                         .values(
                             revision=new_revision,
@@ -454,14 +489,19 @@ class GuidedDialogueService:
         if existing is not None:
             return self._replay_existing(session_id, event, existing)
 
-        if int(event.expected_revision) != int(row.revision):
+        base_revision = int(row.revision)
+        if int(event.expected_revision) != base_revision:
             raise GuidedConflict("对话版本已过期，请重新加载后再试")
 
         state = _normalise_state(row.state)
         state, evidence_changed = self._reconcile_session_evidence(state, session)
         if evidence_changed:
             raise GuidedConflict("底层证据已更新，请重新加载对话后再试")
-        outcome = self._apply_event(state, session, event)
+        preflight = (
+            self._preflight_free_text(state, session, event)
+            if event.type == "free_text" else None
+        )
+        outcome = self._apply_event(state, session, event, preflight=preflight)
         query = None
         prepared = self._prepare(
             outcome["state"],
@@ -493,6 +533,7 @@ class GuidedDialogueService:
             "clue_id": event.clue_id,
             "level": event.level,
             "proposals": prepared.state.get("proposals") or [],
+            "place_resolutions": prepared.state.get("place_resolutions") or [],
         }
         if event.type == "free_text" and event.text:
             user_content = event.text.strip()
@@ -500,7 +541,7 @@ class GuidedDialogueService:
             user_content = f"回答：{event.value.strip()}"
         else:
             user_content = outcome["summary"]
-        new_revision = row.revision + (1 if outcome["effective"] else 0)
+        new_revision = base_revision + (1 if outcome["effective"] else 0)
         try:
             with self.geo.transaction():
                 update_values: dict[str, Any] = {"updated_at": datetime.utcnow()}
@@ -518,7 +559,7 @@ class GuidedDialogueService:
                     update(GuidedDialogue)
                     .where(
                         GuidedDialogue.session_id == session_id,
-                        GuidedDialogue.revision == row.revision,
+                        GuidedDialogue.revision == base_revision,
                     )
                     .values(**update_values)
                 )
@@ -585,6 +626,136 @@ class GuidedDialogueService:
             if existing is None:
                 raise
             return self._replay_existing(session_id, event, existing)
+
+    # ------------------------------------------------------ external preflight
+    def _preflight_free_text(
+        self,
+        state: dict[str, Any],
+        session: GeoSession,
+        event: GuidedEventRequest,
+    ) -> _FreeTextPreflight:
+        """Parse and resolve user text before the write transaction.
+
+        Provider I/O happens here, never in GET and never while a database
+        transaction is held open.  The resulting state is still only a
+        proposal; a later explicit confirm_location is required.
+        """
+
+        text = (event.text or "").strip()
+        if not text:
+            raise GuidedValidationError("缺少自由文本内容")
+        pending = self._parser_pending(state.get("pending_question"))
+        parsed = self.parser.parse(text, pending=pending)
+        session_id = int(session.id)
+        history = self.geo.list_messages(session_id)
+        catalog = self.parser.remote_catalog()
+        if (self.settings.deepseek_api_key or "").strip():
+            # Snapshot bounded context first, then end the read transaction
+            # before any external extraction request.
+            self.geo.rollback()
+            try:
+                raw_plan = self.provider.extract({
+                    "text": text,
+                    "history": history,
+                    "pending": pending.to_dict() if pending is not None else None,
+                    "catalog": catalog,
+                })
+                remote_plan = self.parser.validate_remote(raw_plan, text, pending)
+                if remote_plan.clues or remote_plan.reject_isos or remote_plan.place_mentions:
+                    parsed = parsed.merged(remote_plan)
+            except Exception as exc:
+                logger.warning(
+                    "Guided DeepSeek extraction unavailable; using rules (%s)",
+                    type(exc).__name__,
+                )
+
+        mentions = list(parsed.place_mentions)
+        if not mentions:
+            return _FreeTextPreflight(parsed=parsed)
+        if self._mentions_need_context(mentions):
+            mentions.extend(self._prior_unresolved_mentions(state))
+        confirmed = state.get("confirmed") or {}
+        country = confirmed.get("country") if isinstance(confirmed, Mapping) else None
+        country_iso = normalize_iso(country.get("id")) if isinstance(country, Mapping) else ""
+        scopes = self._country_source_scopes(state)
+        try:
+            resolution = self.place_resolver.resolve(
+                self._store(),
+                mentions,
+                country_iso=country_iso or None,
+                source_isos=scopes,
+                between_local_and_network=self.geo.rollback,
+            )
+        except Exception as exc:
+            logger.warning("Place resolution unavailable (%s)", type(exc).__name__)
+            return _FreeTextPreflight(
+                parsed=parsed,
+                notice="地名检索暂时不可用；文字线索已保留，请补充城市、区名或附近地标。",
+            )
+        return _FreeTextPreflight(
+            parsed=parsed,
+            resolution=resolution,
+            notice=resolution.notice,
+        )
+
+    @staticmethod
+    def _mentions_need_context(mentions: Sequence[PlaceMention]) -> bool:
+        markers = ("路牌", "门牌", "招牌", "标牌", "指示牌", "旁边", "附近", "对面", "隔壁", "周围")
+        suffixes = ("大道", "大街", "路", "街", "巷", "弄", "胡同", "广场", "公园", "站", "桥")
+        for mention in mentions:
+            quote = str(getattr(mention, "quote", "") or "")
+            if any(marker in quote for marker in markers):
+                return True
+            for term in getattr(mention, "search_terms", ()) or ():
+                if any(str(term).endswith(suffix) for suffix in suffixes):
+                    return True
+        return False
+
+    def _prior_unresolved_mentions(self, state: Mapping[str, Any]) -> list[PlaceMention]:
+        """Combine only recent unresolved user terms, never all catalog text."""
+
+        active_ids = self._active_guided_clue_ids(state)
+        result: list[PlaceMention] = []
+        seen_terms: set[str] = set()
+        for entry in reversed(list(state.get("place_resolutions") or [])[-4:]):
+            if not isinstance(entry, Mapping):
+                continue
+            if self._resolution_expired(entry):
+                continue
+            if str(entry.get("status") or "") not in {"unresolved", "ambiguous", "unavailable"}:
+                continue
+            clue_ids = {str(item) for item in entry.get("clue_ids") or [] if str(item)}
+            if clue_ids and not clue_ids.issubset(active_ids):
+                continue
+            terms = tuple(str(item) for item in entry.get("query_terms") or [] if str(item))
+            if not terms:
+                continue
+            fresh = tuple(
+                term for term in terms
+                if normalize_place_text(term) not in seen_terms
+            )
+            if not fresh:
+                continue
+            seen_terms.update(normalize_place_text(term) for term in fresh)
+            result.append(PlaceMention(
+                quote=str(entry.get("quote") or " ".join(fresh))[:200],
+                search_terms=fresh[:2],
+                parser="state",
+            ))
+            if len(result) >= 1:
+                break
+        return result
+
+    @staticmethod
+    def _active_guided_clue_ids(state: Mapping[str, Any]) -> set[str]:
+        return {
+            str(record.get("id"))
+            for record in state.get("clues") or []
+            if isinstance(record, Mapping)
+            and record.get("id")
+            and str(record.get("_origin") or "") == "guided_user"
+            and str(record.get("status") or "pending") in {"pending", "confirmed"}
+        }
 
     # ----------------------------------------------------------- persistence
     def _event_by_id(self, session_id: int, event_id: str) -> GuidedEvent | None:
@@ -1057,7 +1228,7 @@ class GuidedDialogueService:
     @staticmethod
     def _candidate(target: Mapping[str, Any], **kwargs: Any) -> dict[str, Any]:
         result = {"target": dict(target)}
-        for key in ("score", "score_type", "reason", "selection_basis"):
+        for key in ("score", "score_type", "reason", "selection_basis", "place_match"):
             value = kwargs.get(key)
             if value is not None:
                 result[key] = value
@@ -1273,12 +1444,17 @@ class GuidedDialogueService:
                 if isinstance(row, Mapping)
             ]
             scoped_rows = self._city_rows_for_source(source_iso)
-            if scoped_rows and clues and rows:
+            scoped_evidence = [
+                item for item in self._place_city_evidence(state)
+                if item.source_iso == source_iso
+            ]
+            if scoped_rows and (clues or scoped_evidence) and rows:
                 try:
                     reranked = CityClueReasoner({source_iso: scoped_rows}).rerank(
                         rows,
                         clues,
                         iso=source_iso,
+                        city_evidence=scoped_evidence,
                     )
                     if reranked is not None:
                         rows = list(reranked.city_scores)
@@ -1340,7 +1516,7 @@ class GuidedDialogueService:
             if existing is None:
                 candidates[key] = self._candidate(target, **kwargs)
                 return
-            for field in ("score", "score_type", "reason", "selection_basis"):
+            for field in ("score", "score_type", "reason", "selection_basis", "place_match"):
                 value = kwargs.get(field)
                 if value is not None and existing.get(field) is None:
                     existing[field] = value
@@ -1357,6 +1533,7 @@ class GuidedDialogueService:
                 self._city_target(row, label=str(raw.get("label") or row.name)),
                 reason=self._proposal_reason(state, row),
                 selection_basis="user_text",
+                place_match=self._place_match_from_meta(state, row),
             )
 
         if query_key:
@@ -1398,12 +1575,24 @@ class GuidedDialogueService:
                 score = -float(item.get("score"))
             except (TypeError, ValueError):
                 score = 1.0
+            meta = (state.get("proposal_meta") or {}).get(
+                f"city:{target.get('id')}"
+            )
+            ambiguous = bool(
+                isinstance(meta, Mapping) and meta.get("ambiguous")
+            )
+            if ambiguous:
+                score = 1.0
             try:
                 row = rows[int(str(target.get("id") or ""))]
-                population = -row.population
+                population = 0 if ambiguous else -row.population
             except (KeyError, TypeError, ValueError):
                 population = 0
-            return (basis_rank, exact, score, population, str(target.get("id") or ""))
+            label_order = label_key if ambiguous else ""
+            return (
+                basis_rank, exact, score, 0 if ambiguous else 1,
+                label_order, population, str(target.get("id") or ""),
+            )
 
         ordered = sorted(candidates.values(), key=sort_key)
         return ordered[:CITY_CANDIDATE_LIMIT]
@@ -1813,11 +2002,15 @@ class GuidedDialogueService:
             allow_catalog_fallback=bool(scores) or inference_notice is None,
         )
         if stage == "country":
-            proposed_countries = [
-                self._candidate(target, reason="自由文本提议")
-                for target in proposals
+            country_targets = [
+                target for target in proposals
                 if target.get("level") == "country"
                 and self._excluded_by_state(state, target) is None
+            ]
+            country_targets.extend(self._resolved_country_targets(state))
+            proposed_countries = [
+                self._candidate(target, reason="自由文本或地名检索提议", selection_basis="user_text")
+                for target in country_targets
             ]
             country_candidates = self._merge_candidates(proposed_countries, country_candidates)
         city_candidates = (
@@ -2045,6 +2238,39 @@ class GuidedDialogueService:
             ],
         }
 
+    def _place_clarification_question(
+        self,
+        state: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        entries = self._active_resolution_entries(state)
+        if not entries:
+            return None
+        latest = entries[-1]
+        status = str(latest.get("status") or "")
+        if status not in {"ambiguous", "unresolved", "unavailable", "foreign_conflict"}:
+            return None
+        question_id = f"place-clarify:{latest.get('id')}"
+        asked = {str(item) for item in state.get("asked_question_ids") or []}
+        if question_id in asked:
+            return None
+        message = str(latest.get("notice") or "").strip()
+        if not message:
+            if status == "foreign_conflict":
+                message = "检索结果与当前国家不一致；请补充正确国家或回退后重新选择。"
+            elif status == "unavailable":
+                message = "地名检索暂不可用；请补充城市、区名或附近地标。"
+            elif status == "ambiguous":
+                message = "这个地点可能对应多个城市；请补充城市、区名或附近地标。"
+            else:
+                message = "暂未找到可核验城市；请补充城市、区名或附近地标。"
+        return {
+            "id": question_id,
+            "kind": "request_clue",
+            "message": message,
+            "dimension": "place_name",
+            "options": None,
+        }
+
     def _ensure_question(
         self,
         state: dict[str, Any],
@@ -2098,6 +2324,11 @@ class GuidedDialogueService:
             question = _review_question(record)
             state["pending_question"] = question
             return question
+
+        place_question = self._place_clarification_question(state)
+        if place_question is not None:
+            state["pending_question"] = place_question
+            return place_question
 
         candidate_sets = {
             "country": list(country_candidates),
@@ -2212,6 +2443,8 @@ class GuidedDialogueService:
         state: dict[str, Any],
         session: GeoSession,
         event: GuidedEventRequest,
+        *,
+        preflight: _FreeTextPreflight | None = None,
     ) -> dict[str, Any]:
         event_type = str(event.type)
         if event_type == "confirm_clue":
@@ -2243,7 +2476,7 @@ class GuidedDialogueService:
         if event_type == "backtrack":
             return self._apply_backtrack(state, event)
         if event_type == "free_text":
-            return self._apply_free_text(state, session, event)
+            return self._apply_free_text(state, session, event, preflight=preflight)
         if event_type == "answer":
             return self._apply_answer(state, event)
         if event_type == "unknown":
@@ -2384,6 +2617,7 @@ class GuidedDialogueService:
         state["pending_question"] = None
         state["pending_correction"] = None
         self._clear_path_invalidated_by_exclusion(state, target)
+        self._refresh_derived_proposals(state)
         self._refresh_conflict(state)
         return self._outcome(state, True, "applied", f"已排除「{target.get('label')}」。")
 
@@ -2433,6 +2667,7 @@ class GuidedDialogueService:
         if len(state["exclusions"]) == before:
             return self._outcome(state, False, "unchanged", "该地点此前未被排除。")
         state["pending_question"] = None
+        self._refresh_derived_proposals(state)
         self._refresh_conflict(state)
         return self._outcome(state, True, "applied", f"已恢复「{target.get('label')}」的候选资格。")
 
@@ -2466,6 +2701,7 @@ class GuidedDialogueService:
         state["pending_correction"] = None
         state["proposals"] = []
         state["proposal_meta"] = {}
+        self._refresh_derived_proposals(state)
         self._refresh_conflict(state)
         return self._outcome(state, True, "applied", f"已回退到{_LEVEL_LABELS[level]}阶段。")
 
@@ -2474,6 +2710,8 @@ class GuidedDialogueService:
         state: dict[str, Any],
         session: GeoSession,
         event: GuidedEventRequest,
+        *,
+        preflight: _FreeTextPreflight | None = None,
     ) -> dict[str, Any]:
         text = (event.text or "").strip()
         if not text:
@@ -2483,7 +2721,7 @@ class GuidedDialogueService:
             self._record_clue_question(state, pending_state)
             state["pending_question"] = None
             state["conflict"] = None
-            state["proposals"] = []
+            self._refresh_derived_proposals(state)
             return self._outcome(
                 state,
                 True,
@@ -2491,20 +2729,9 @@ class GuidedDialogueService:
                 "已记录为无法判断并计入本轮问题；不会自动推进地点。",
             )
         pending = self._parser_pending(state.get("pending_question"))
-        parsed = self.parser.parse(text, pending=pending)
-        if self.provider is not None:
-            try:
-                raw_plan = self.provider.extract({
-                    "text": text,
-                    "history": self.geo.list_messages(session.id),
-                    "pending": pending.to_dict() if pending is not None else None,
-                    "catalog": self.parser.remote_catalog(),
-                })
-                remote_plan = self.parser.validate_remote(raw_plan, text, pending)
-                if remote_plan.clues or remote_plan.reject_isos:
-                    parsed = parsed.merged(remote_plan)
-            except Exception as exc:
-                logger.warning("Guided DeepSeek extraction unavailable; using rules (%s)", type(exc).__name__)
+        parsed = preflight.parsed if preflight is not None else self.parser.parse(
+            text, pending=pending
+        )
         added: list[str] = []
         parsed_answer = bool(
             pending_state is not None
@@ -2531,6 +2758,59 @@ class GuidedDialogueService:
         }
         duplicate_evidence = False
         previous_text = str(state.get("last_text") or "")
+
+        # Persist every literal search term as a display-only clue even when the
+        # LLM supplied the mention without a separate signage clue.
+        for mention in parsed.place_mentions:
+            for term in mention.search_terms:
+                normalized = normalize_place_text(term)
+                if not normalized:
+                    continue
+                covered = any(
+                    isinstance(record, Mapping)
+                    and (
+                        normalize_place_text(record.get("value")) == normalized
+                        or normalized in {
+                            normalize_place_text(item)
+                            for item in (record.get("_extra") or {}).get("place_terms", [])
+                            if isinstance(item, str)
+                        }
+                    )
+                    for record in state.get("clues") or []
+                ) or any(
+                    isinstance(raw, Mapping)
+                    and (
+                        normalize_place_text(raw.get("value")) == normalized
+                        or normalized in {
+                            normalize_place_text(item)
+                            for item in (raw.get("extra") or {}).get("place_terms", [])
+                            if isinstance(item, str)
+                        }
+                    )
+                    for raw in parsed.clues
+                )
+                if covered:
+                    continue
+                extra = {
+                    "literal_kind": "place_search_term",
+                    "origin_source": "user_text",
+                    "display_only": True,
+                    "affects_ranking": False,
+                    "reliable": False,
+                    "validated": False,
+                    "parser": mention.parser,
+                    "place_terms": [term],
+                    "place_quote": mention.quote,
+                }
+                parsed.clues.append({
+                    "dimension": "signage",
+                    "value": term[:64],
+                    "confidence": 0.75,
+                    "evidence": mention.quote[:200],
+                    "source": "user",
+                    "extra": extra,
+                })
+
         for raw in parsed.clues:
             if not isinstance(raw, Mapping):
                 continue
@@ -2548,11 +2828,6 @@ class GuidedDialogueService:
                 continue
             extra = dict(record.get("_extra") or {})
             extra["parser"] = str(extra.get("parser") or "guided_rules")
-            if str(record.get("dimension") or "") in {"place_name", "signage"}:
-                literal = str(extra.get("literal") or record.get("value") or "")
-                clue_alias = self._validated_curated_alias_entry(literal)
-                if clue_alias is not None:
-                    extra["place_alias"] = self._curated_alias_diagnostic(clue_alias)
             record["_extra"] = extra
             record["_origin"] = "guided_user"
             state.setdefault("clues", []).append(record)
@@ -2560,20 +2835,45 @@ class GuidedDialogueService:
             existing_evidence.add(evidence_key)
             added.append(str(record.get("id")))
 
-        curated_proposals, curated_meta = self._curated_proposals_from_clues(state)
+        old_proposals = [
+            dict(item) for item in state.get("proposals") or [] if isinstance(item, Mapping)
+        ]
         proposed = self._propose_targets(state, text, parsed.clues)
-        merged: dict[str, dict[str, Any]] = {}
-        for target in [*curated_proposals, *proposed]:
-            if isinstance(target, Mapping):
-                merged.setdefault(_target_state_key(target), dict(target))
-        proposals = list(merged.values())
+        country_keys = {
+            _target_state_key(item) for item in old_proposals
+            if isinstance(item, Mapping) and item.get("level") != "city"
+        }
+        retained_country = [
+            dict(item) for item in old_proposals
+            if isinstance(item, Mapping) and item.get("level") != "city"
+        ]
+        for target in proposed:
+            key = _target_state_key(target)
+            if key not in country_keys:
+                retained_country.append(target)
+                country_keys.add(key)
+        state["proposals"] = retained_country
+
+        resolution_added = False
+        if preflight is not None and preflight.resolution is not None:
+            resolution_added = self._record_place_resolution(state, preflight.resolution)
+
+        self._refresh_derived_proposals(state)
+        proposals = [
+            dict(item) for item in state.get("proposals") or [] if isinstance(item, Mapping)
+        ]
         conflict = self._detect_conflict(state, proposals)
         correction = self._correction_plan(text, parsed, added)
-        old_proposals = [dict(item) for item in state.get("proposals") or [] if isinstance(item, Mapping)]
-        old_conflict = dict(state.get("conflict")) if isinstance(state.get("conflict"), Mapping) else None
-        old_correction = dict(state.get("pending_correction")) if isinstance(state.get("pending_correction"), Mapping) else None
+        old_conflict = (
+            dict(state.get("conflict")) if isinstance(state.get("conflict"), Mapping) else None
+        )
+        old_correction = (
+            dict(state.get("pending_correction"))
+            if isinstance(state.get("pending_correction"), Mapping) else None
+        )
         effective = bool(
             added
+            or resolution_added
             or proposals != old_proposals
             or conflict != old_conflict
             or correction is not None
@@ -2603,36 +2903,45 @@ class GuidedDialogueService:
                     "unchanged",
                     "这是询问，未据此新增地点线索。",
                 )
-            return self._outcome(state, False, "unrecognized", "没有识别到新的目录证据、地点提议或修正计划。")
-        state["proposals"] = proposals
-        state["proposal_meta"] = curated_meta
+            return self._outcome(
+                state,
+                False,
+                "unrecognized",
+                "没有识别到新的目录证据、地点检索结果或修正计划。",
+            )
         state["conflict"] = conflict
         state["pending_correction"] = correction
         state["last_text"] = text
         state["pending_question"] = None
+        resolution = preflight.resolution if preflight is not None else None
         if correction is not None:
             summary = "检测到可能的排除或修正，需要你确认是否应用。"
         elif conflict is not None:
             summary = str(conflict.get("message") or "线索与已确认路径冲突，未自动改变路径。")
-        elif proposals:
-            city_labels = [
+        elif resolution is not None and resolution.status == "resolved":
+            labels = [
                 str(item.get("label") or item.get("id") or "")
-                for item in proposals
+                for item in state.get("proposals") or []
                 if isinstance(item, Mapping) and item.get("level") == "city"
             ]
-            if city_labels and _looks_like_street_text(text):
-                summary = (
-                    f"已记录招牌文字{text}，关联到{'、'.join(city_labels)}候选，需确认"
-                )
-            else:
-                summary = "已记录自由文本提议；必须明确确认地点后才会推进。"
+            summary = (
+                f"已记录文字线索，检索到目录城市候选{'、'.join(labels)}，需你确认。"
+                if labels else "已记录文字线索，但候选当前不可见；请补充城市或区名。"
+            )
+        elif resolution is not None and resolution.status == "ambiguous":
+            summary = resolution.notice or "地点不唯一；请补充城市、区名或附近地标。"
+        elif resolution is not None and resolution.status == "foreign_conflict":
+            summary = resolution.notice or "检索结果与当前国家不一致，未自动改变路径。"
+        elif resolution is not None and resolution.status in {"unresolved", "unavailable"}:
+            summary = resolution.notice or "暂未找到可核验城市；请补充城市、区名或附近地标。"
+        elif proposals:
+            summary = "已记录自由文本提议；必须明确确认地点后才会推进。"
         elif added:
-            if _looks_like_street_text(text):
-                summary = "已记录文字线索，暂未匹配城市，可补充附近地名"
-            else:
-                summary = "已记录待复核的自由文本线索；没有确认任何地点。"
+            summary = "已记录文字线索；暂未匹配城市，可补充城市、区名或附近地标。"
         else:
             summary = "没有识别到新的目录证据或地点提议。"
+        if preflight is not None and preflight.notice and resolution is None:
+            summary = f"{preflight.notice} {summary}".strip()
         return self._outcome(state, True, "applied", summary)
 
     def _apply_answer(
@@ -2661,6 +2970,7 @@ class GuidedDialogueService:
             })
             record["_origin"] = "guided_user"
             state.setdefault("clues", []).append(record)
+            self._refresh_derived_proposals(state)
             return self._outcome(state, True, "applied", "已记录澄清；已确认路径保持不变，冲突问题结束。")
         if question.get("kind") == "review_clue":
             token = value.lower()
@@ -2985,192 +3295,315 @@ class GuidedDialogueService:
         text: str,
         parsed_clues: Sequence[Mapping[str, Any]],
     ) -> list[dict[str, Any]]:
+        """Return only explicit country proposals from accepted parsed clues."""
+
         proposals: list[dict[str, Any]] = []
         seen: set[tuple[str, str]] = set()
-
-        def add(target: Mapping[str, Any] | None) -> None:
-            if not isinstance(target, Mapping):
-                return
-            key = _target_key(target)
-            if key in seen:
-                return
-            seen.add(key)
-            proposals.append(dict(target))
-
-        # Proposals come only from accepted parsed evidence. Never reinterpret a
-        # question, instruction, or other raw message text as a place assertion.
         for raw in parsed_clues:
             if not isinstance(raw, Mapping):
                 continue
-            dimension = str(raw.get("dimension") or "")
-            if dimension not in {"place_name", "signage"}:
+            if str(raw.get("dimension") or "") != "place_name":
                 continue
             value = str(raw.get("value") or "").strip()
-            if not value:
-                continue
             extra = raw.get("extra") if isinstance(raw.get("extra"), Mapping) else {}
-            literal = str(extra.get("literal") or raw.get("literal") or "").strip()
-            iso = (
-                normalize_iso(value)
-                if value.isascii() and value.isalpha() and value == value.upper()
-                else ""
-            )
-            if iso and self._country_exists(iso):
-                add(self._country_target(iso))
-            for candidate in dict.fromkeys(
-                item for item in (literal, value) if item and item != iso
-            ):
-                for target in self._match_city_text(state, candidate):
-                    add(target)
+            if extra.get("place_kind") != "country":
+                continue
+            iso = normalize_iso(value)
+            if not iso or not self._country_exists(iso):
+                continue
+            target = self._country_target(iso)
+            key = _target_key(target)
+            if key in seen:
+                continue
+            seen.add(key)
+            proposals.append(target)
         return proposals[:PROPOSAL_LIMIT]
 
-    @staticmethod
-    def _curated_alias_entry(text: str) -> Any | None:
-        try:
-            from ..domain.geolocation.place_aliases import match_curated_place_alias
-        except ImportError:
-            return None
-        try:
-            return match_curated_place_alias(text)
-        except Exception:
-            return None
-
-    def _validated_curated_alias_entry(self, text: str) -> Any | None:
-        entry = self._curated_alias_entry(text)
-        if entry is None:
-            return None
-        try:
-            from ..domain.geolocation.place_aliases import validate_curated_place_alias
-        except ImportError:
-            return None
-        source_iso = normalize_iso(getattr(entry, "country_iso", ""))
-        if not source_iso:
-            return None
-        city_index = {source_iso: self._city_rows_for_source(source_iso)}
-        return entry if validate_curated_place_alias(entry, city_index) else None
-
-    @staticmethod
-    def _curated_alias_diagnostic(entry: Any) -> dict[str, Any]:
-        return {
-            "kind": str(getattr(entry, "kind", "") or ""),
-            "version": str(getattr(entry, "version", "") or ""),
-            "city_id": str(getattr(entry, "city_id", "") or ""),
-            "country_iso": normalize_iso(getattr(entry, "country_iso", "")),
-            "sources": [
-                {
-                    "publisher": str(getattr(source, "publisher", "") or ""),
-                    "title": str(getattr(source, "title", "") or ""),
-                    "url": str(getattr(source, "url", "") or ""),
-                    "verified_on": str(getattr(source, "verified_on", "") or ""),
-                }
-                for source in (getattr(entry, "sources", ()) or ())
-            ],
-        }
-
-    @staticmethod
-    def _curated_alias_reason(entry: Any, literal: str, display: str) -> str:
-        kind = str(getattr(entry, "kind", "") or "")
-        if kind == "street_label":
-            alias = next(
-                (
-                    str(item)
-                    for item in getattr(entry, "aliases", ()) or ()
-                    if normalize_place_text(item) == normalize_place_text(literal)
-                ),
-                literal,
-            )
-            return f"街区名称关联：{alias} → {display}（待确认，可能存在同名道路）"
-        if kind == "city_name":
-            return f"用户提供城市名：{display}"
-        return "自由文本提议"
-
-    def _curated_proposals_from_clues(
+    def _record_place_resolution(
         self,
-        state: Mapping[str, Any],
-    ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
-        proposals: list[dict[str, Any]] = []
-        meta: dict[str, dict[str, Any]] = {}
+        state: dict[str, Any],
+        resolution: PlaceResolutionBatch,
+    ) -> bool:
+        """Persist bounded provenance and link it to active literal clues."""
+
+        terms = {
+            normalize_place_text(term)
+            for term in resolution.query_terms
+            if normalize_place_text(term)
+        }
+        clue_ids: list[str] = []
+        quote = ""
         for record in state.get("clues") or []:
             if not isinstance(record, Mapping):
                 continue
             if str(record.get("_origin") or "") != "guided_user":
                 continue
-            if str(record.get("status") or "pending") == "rejected":
-                continue
-            dimension = str(record.get("dimension") or "")
-            if dimension not in {"place_name", "signage"}:
+            if str(record.get("status") or "pending") not in {"pending", "confirmed"}:
                 continue
             extra = record.get("_extra") if isinstance(record.get("_extra"), Mapping) else {}
-            values = [str(record.get("value") or "").strip()]
-            literal = str(extra.get("literal") or "").strip()
-            if literal and literal not in values:
-                values.append(literal)
-            entry = next(
-                (
-                    matched
-                    for matched in (
-                        self._validated_curated_alias_entry(item)
-                        for item in values
-                        if item
-                    )
-                    if matched is not None
-                ),
-                None,
-            )
-            if entry is None:
+            record_terms = {
+                normalize_place_text(item)
+                for item in extra.get("place_terms", [])
+                if isinstance(item, str)
+            }
+            if not record_terms:
+                record_terms.add(normalize_place_text(record.get("value")))
+            if not terms or not (record_terms & terms):
                 continue
-            row = self._city_row_by_id(str(getattr(entry, "city_id", "") or ""))
-            if row is None:
-                continue
-            display = str(getattr(entry, "display_label", "") or getattr(entry, "city_name", "") or row.name)
-            target = self._city_target(row, label=display)
-            key = _target_state_key(target)
-            if key not in meta:
-                reason_literal = next(
-                    (
-                        item for item in values
-                        if self._validated_curated_alias_entry(item) is entry
-                    ),
-                    values[0],
-                )
-                proposals.append(target)
-                meta[key] = {
-                    "reason": self._curated_alias_reason(entry, reason_literal, display),
-                    "clue_ids": [],
-                    "selection_basis": "user_text",
-                }
             clue_id = str(record.get("id") or "")
-            if clue_id and clue_id not in meta[key]["clue_ids"]:
-                meta[key]["clue_ids"].append(clue_id)
-        return proposals, meta
+            if clue_id and clue_id not in clue_ids:
+                clue_ids.append(clue_id)
+            if not quote:
+                quote = str(extra.get("place_quote") or record.get("description") or "")[:200]
+        if not clue_ids:
+            logger.warning("place resolution had no active literal clue linkage")
+            return False
+        cities = [
+            {
+                "city_id": str(evidence.city_id),
+                "source_iso": normalize_iso(evidence.source_iso),
+                "confidence": float(evidence.confidence),
+                "match_kind": str(evidence.match_kind),
+            }
+            for evidence in resolution.city_evidence
+        ]
+        sources = [dict(item) for item in resolution.sources if isinstance(item, Mapping)]
+        identity = {
+            "status": resolution.status,
+            "query_terms": list(resolution.query_terms),
+            "city_ids": list(resolution.city_id_strings),
+            "foreign_country_isos": list(resolution.foreign_country_isos),
+        }
+        resolution_id = _json_hash("place-resolution", identity)
+        entries = [
+            dict(item) for item in state.get("place_resolutions") or []
+            if isinstance(item, Mapping)
+        ]
+        if resolution.status == "resolved":
+            for item in entries:
+                if str(item.get("status") or "") in {"unresolved", "ambiguous", "unavailable"}:
+                    item["superseded_by"] = resolution_id
+        else:
+            current_terms = {normalize_place_text(item) for item in resolution.query_terms}
+            for item in entries:
+                previous_terms = {
+                    normalize_place_text(value) for value in item.get("query_terms") or []
+                }
+                if (
+                    str(item.get("status") or "") in {"unresolved", "ambiguous", "unavailable"}
+                    and previous_terms == current_terms
+                    and str(item.get("id") or "") != resolution_id
+                ):
+                    item["superseded_by"] = resolution_id
+        existing_index = next(
+            (
+                index for index, item in enumerate(entries)
+                if str(item.get("id") or "") == resolution_id
+            ),
+            None,
+        )
+        if existing_index is not None:
+            existing = entries[existing_index]
+            merged_ids = sorted(set(existing.get("clue_ids") or []) | set(clue_ids))
+            changed = merged_ids != list(existing.get("clue_ids") or [])
+            if changed:
+                existing["clue_ids"] = merged_ids
+            known_sources = {
+                (str(item.get("provider")), str(item.get("provider_place_id")))
+                for item in existing.get("sources") or [] if isinstance(item, Mapping)
+            }
+            for source in sources:
+                key = (
+                    str(source.get("provider")),
+                    str(source.get("provider_place_id")),
+                )
+                if key not in known_sources:
+                    existing.setdefault("sources", []).append(source)
+                    known_sources.add(key)
+                    changed = True
+            if cities:
+                existing["cities"] = cities
+                changed = True
+            if changed:
+                state["place_resolutions"] = entries
+            return changed
+        entries.append({
+            "id": resolution_id,
+            "version": int(resolution.version),
+            "status": resolution.status,
+            "query_terms": list(resolution.query_terms),
+            "quote": quote or " ".join(resolution.query_terms),
+            "clue_ids": sorted(clue_ids),
+            "city_ids": list(resolution.city_id_strings),
+            "cities": cities,
+            "sources": sources,
+            "foreign_country_isos": list(resolution.foreign_country_isos),
+            "notice": resolution.notice,
+            "fetched_at": resolution.fetched_at,
+            "expires_at": resolution.expires_at,
+        })
+        state["place_resolutions"] = entries[-20:]
+        return True
+
+    @staticmethod
+    def _resolution_expired(entry: Mapping[str, Any]) -> bool:
+        raw = str(entry.get("expires_at") or "").strip()
+        if not raw:
+            return False
+        try:
+            expires = datetime.fromisoformat(raw)
+        except ValueError:
+            return True
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+        return expires <= datetime.now(timezone.utc)
+
+    def _active_resolution_entries(self, state: Mapping[str, Any]) -> list[dict[str, Any]]:
+        active_ids = self._active_guided_clue_ids(state)
+        result: list[dict[str, Any]] = []
+        for entry in state.get("place_resolutions") or []:
+            if not isinstance(entry, Mapping):
+                continue
+            if entry.get("superseded_by") or self._resolution_expired(entry):
+                continue
+            clue_ids = {str(item) for item in entry.get("clue_ids") or [] if str(item)}
+            if clue_ids and clue_ids.issubset(active_ids):
+                result.append(dict(entry))
+        return result
+
+    def _place_city_evidence(self, state: Mapping[str, Any]) -> list[CityEvidence]:
+        evidence: list[CityEvidence] = []
+        for entry in self._active_resolution_entries(state):
+            if str(entry.get("status") or "") != "resolved":
+                continue
+            clue_ids = tuple(str(item) for item in entry.get("clue_ids") or [] if str(item))
+            sources = tuple(
+                item for item in entry.get("sources") or [] if isinstance(item, Mapping)
+            )
+            for city in entry.get("cities") or []:
+                if not isinstance(city, Mapping):
+                    continue
+                try:
+                    city_id = int(str(city.get("city_id")))
+                except (TypeError, ValueError):
+                    continue
+                source_iso = normalize_iso(city.get("source_iso"))
+                if not source_iso:
+                    continue
+                evidence.append(CityEvidence(
+                    city_id=city_id,
+                    source_iso=source_iso,
+                    text=" ".join(str(item) for item in entry.get("query_terms") or []),
+                    confidence=float(city.get("confidence") or 0.0),
+                    match_kind=str(city.get("match_kind") or "catalog_exact"),
+                    clue_ids=clue_ids,
+                    sources=sources,
+                ))
+        return evidence
+
+    def _resolved_country_targets(self, state: Mapping[str, Any]) -> list[dict[str, Any]]:
+        """Project a unique resolved catalog city back to its country proposal."""
+
+        countries: set[str] = set()
+        for entry in self._active_resolution_entries(state):
+            if str(entry.get("status") or "") != "resolved":
+                continue
+            for city_id in entry.get("city_ids") or []:
+                row = self._city_row_by_id(str(city_id))
+                if row is None:
+                    continue
+                canonical = canonical_country_iso(row.iso)
+                if canonical:
+                    countries.add(canonical)
+        if len(countries) != 1:
+            return []
+        country = next(iter(countries))
+        if not self._country_exists(country):
+            return []
+        return [self._country_target(country)]
 
     def _refresh_derived_proposals(self, state: dict[str, Any]) -> None:
-        previous_meta = {
-            str(key): dict(item)
-            for key, item in (state.get("proposal_meta") or {}).items()
-            if isinstance(item, Mapping)
-        }
-        curated, meta = self._curated_proposals_from_clues(state)
-        previous_keys = set(previous_meta)
-        current_keys = set(meta)
-        if previous_keys - current_keys:
-            state["proposals"] = [
-                item for item in state.get("proposals") or []
-                if not (
-                    isinstance(item, Mapping)
-                    and _target_state_key(item) in previous_keys - current_keys
-                )
+        """Rebuild city proposals and metadata from active literal evidence."""
+
+        retained = [
+            dict(item) for item in state.get("proposals") or []
+            if isinstance(item, Mapping) and item.get("level") != "city"
+        ]
+        proposals: dict[str, dict[str, Any]] = {}
+        meta: dict[str, dict[str, Any]] = {}
+        scopes = set(self._country_source_scopes(state))
+        for entry in self._active_resolution_entries(state):
+            status = str(entry.get("status") or "")
+            if status not in {"resolved", "ambiguous"}:
+                continue
+            sources = [
+                dict(item) for item in entry.get("sources") or [] if isinstance(item, Mapping)
             ]
-        existing = {
-            _target_state_key(item)
-            for item in state.get("proposals") or []
-            if isinstance(item, Mapping)
-        }
-        for target in curated:
-            key = _target_state_key(target)
-            if key not in existing:
-                state.setdefault("proposals", []).append(dict(target))
-                existing.add(key)
+            city_details = {
+                str(item.get("city_id")): dict(item)
+                for item in entry.get("cities") or [] if isinstance(item, Mapping)
+            }
+            for city_id in entry.get("city_ids") or []:
+                row = self._city_row_by_id(str(city_id))
+                if row is None:
+                    continue
+                if scopes and normalize_iso(row.iso) not in scopes:
+                    continue
+                target = self._city_target(row)
+                if self._excluded_by_state(state, target) is not None:
+                    continue
+                key = _target_state_key(target)
+                proposals[key] = target
+                detail = city_details.get(str(city_id), {})
+                provider = next(
+                    (str(item.get("provider") or "") for item in sources if item.get("provider")),
+                    "local_catalog",
+                )
+                if status == "ambiguous":
+                    reason = (
+                        "文字可能指向多个目录城市；需补充城市、区名或附近地标，"
+                        "不会按人口或检索排名自动选择。"
+                    )
+                elif provider == "local_catalog":
+                    reason = f"目录名称精确匹配「{row.name}」，待确认。"
+                else:
+                    reason = (
+                        f"用户文字经 {provider} 检索并映射到目录城市「{row.name}」，待确认。"
+                    )
+                current = meta.get(key)
+                if current is None:
+                    meta[key] = {
+                        "reason": reason,
+                        "clue_ids": list(entry.get("clue_ids") or []),
+                        "resolution_ids": [str(entry.get("id") or "")],
+                        "selection_basis": "user_text",
+                        "ambiguous": status == "ambiguous",
+                        "query_terms": list(entry.get("query_terms") or []),
+                        "match_kind": str(detail.get("match_kind") or "geocoder_locality"),
+                        "sources": sources,
+                    }
+                else:
+                    current["clue_ids"] = sorted(
+                        set(current.get("clue_ids") or []) | set(entry.get("clue_ids") or [])
+                    )
+                    current["resolution_ids"] = sorted(
+                        set(current.get("resolution_ids") or []) | {str(entry.get("id") or "")}
+                    )
+                    current["ambiguous"] = bool(current.get("ambiguous") or status == "ambiguous")
+                    known = {
+                        (str(item.get("provider")), str(item.get("provider_place_id")))
+                        for item in current.get("sources") or []
+                        if isinstance(item, Mapping)
+                    }
+                    for source in sources:
+                        source_key = (
+                            str(source.get("provider")),
+                            str(source.get("provider_place_id")),
+                        )
+                        if source_key not in known:
+                            current.setdefault("sources", []).append(source)
+                            known.add(source_key)
+        state["proposals"] = [*retained, *proposals.values()][:PROPOSAL_LIMIT]
         state["proposal_meta"] = meta
 
     def _proposal_reason(self, state: Mapping[str, Any], row: CityRow) -> str:
@@ -3178,66 +3611,45 @@ class GuidedDialogueService:
         meta = (state.get("proposal_meta") or {}).get(key)
         if isinstance(meta, Mapping) and meta.get("reason"):
             return str(meta["reason"])
-        return "自由文本提议"
+        return "用户文字候选"
 
-    def _match_city_text(self, state: Mapping[str, Any], text: str) -> list[dict[str, Any]]:
-        normalized = normalize_place_text(text)
-        if not normalized:
-            return []
-        scopes = self._country_source_scopes(state)
-        if not scopes:
-            return []
-        result: list[dict[str, Any]] = []
-        seen: set[tuple[str, str]] = set()
-
-        def add(target: Mapping[str, Any] | None) -> None:
-            if not isinstance(target, Mapping):
-                return
-            key = _target_key(target)
-            if key in seen or self._excluded_by_state(state, target) is not None:
-                return
-            seen.add(key)
-            result.append(dict(target))
-
-        # Curated street aliases are proposals only. Validation is closed over
-        # the authoritative city index, and a known cross-country alias remains
-        # in proposals so the existing conflict flow can ask to return to the
-        # country stage. It is never emitted as a candidate for the wrong country.
-        entry = self._validated_curated_alias_entry(text)
-        if entry is not None:
-            row = self._city_row_by_id(str(getattr(entry, "city_id", "") or ""))
-            entry_country = canonical_country_iso(getattr(entry, "country_iso", ""))
-            if (
-                row is not None
-                and canonical_country_iso(row.iso) == entry_country
-                and normalize_iso(row.iso) == normalize_iso(getattr(entry, "country_iso", ""))
-            ):
-                add(self._city_target(
-                    row,
-                    label=str(
-                        getattr(entry, "display_label", "")
-                        or getattr(entry, "city_name", "")
-                        or row.name
+    def _place_match_from_meta(
+        self,
+        state: Mapping[str, Any],
+        row: CityRow,
+    ) -> dict[str, Any] | None:
+        key = f"city:{row.city_id}"
+        meta = (state.get("proposal_meta") or {}).get(key)
+        if not isinstance(meta, Mapping):
+            return None
+        return {
+            "query_terms": [str(item)[:60] for item in meta.get("query_terms") or []][:4],
+            "clue_ids": [str(item)[:120] for item in meta.get("clue_ids") or []][:20],
+            "match_kind": str(meta.get("match_kind") or "catalog_exact"),
+            "ambiguous": bool(meta.get("ambiguous")),
+            "sources": [
+                {
+                    "provider": str(item.get("provider") or "local_catalog")[:40],
+                    "provider_place_id": (
+                        str(item.get("provider_place_id"))[:200]
+                        if item.get("provider_place_id") is not None else None
                     ),
-                ))
-
-        # The catalog search covers name/ascii_name/name_zh/aliases. This is the
-        # hook for parser-provided street aliases; an alias must resolve to a
-        # real city row before it can become a proposal.
-        for target in self._catalog_city_search_targets(state, None, text):
-            add(target)
-
-        for source_iso in scopes:
-            scope = self._city_rows_for_source(source_iso)
-            for alias, city_id in _GUIDED_CITY_ALIAS_IDS.items():
-                if find_exact_phrase(normalized, normalize_place_text(alias)):
-                    row = scope.get(int(city_id))
-                    if row is not None:
-                        add(self._city_target(row))
-            for row in scope.values():
-                if find_exact_phrase(normalized, normalize_place_text(row.name)):
-                    add(self._city_target(row))
-        return result
+                    "label": str(item.get("label") or row.name)[:200],
+                    "query": str(item.get("query") or " ".join(meta.get("query_terms") or []))[:200],
+                    "attribution": (
+                        str(item.get("attribution"))[:200]
+                        if item.get("attribution") is not None else None
+                    ),
+                    "license": (
+                        str(item.get("license"))[:80]
+                        if item.get("license") is not None else None
+                    ),
+                    "fetched_at": str(item.get("fetched_at") or "")[:80],
+                }
+                for item in meta.get("sources") or []
+                if isinstance(item, Mapping)
+            ][:4],
+        }
 
     def _refresh_conflict(self, state: dict[str, Any]) -> None:
         proposals = [
@@ -3265,7 +3677,7 @@ class GuidedDialogueService:
             for item in proposals if isinstance(item, Mapping)
         }
         proposal_countries.discard("")
-        if len(proposal_countries) > 1:
+        if len(proposal_countries) > 1 and isinstance(country, Mapping):
             conflicts.append({"reason": "multiple countries proposed", "proposed": list(proposals)})
         for item in proposals:
             if not isinstance(item, Mapping):
@@ -3275,6 +3687,24 @@ class GuidedDialogueService:
                 continue
             if isinstance(city, Mapping) and item.get("level") == "city" and item.get("id") != city.get("id"):
                 conflicts.append({"reason": "different city proposed", "proposed": dict(item)})
+        if isinstance(country, Mapping):
+            confirmed_country = canonical_country_iso(country.get("id"))
+            for entry in self._active_resolution_entries(state):
+                foreign = {
+                    canonical_country_iso(item)
+                    for item in entry.get("foreign_country_isos") or []
+                }
+                foreign.discard("")
+                if foreign and confirmed_country not in foreign:
+                    conflicts.append({
+                        "reason": "different country proposed",
+                        "proposed": {
+                            "source": "place_resolution",
+                            "resolution_id": entry.get("id"),
+                            "country_iso": sorted(foreign),
+                            "query_terms": entry.get("query_terms") or [],
+                        },
+                    })
         if not conflicts:
             return None
         reasons = [str(item["reason"]) for item in conflicts]

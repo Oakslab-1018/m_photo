@@ -1,0 +1,8 @@
+# Isolated GPU OCR runtime. Do not merge these pins into the root CPU venv.
+rapidocr==3.10.0
+onnxruntime-gpu==1.26.0
+fastapi==0.142.4
+uvicorn==0.54.0
+flatbuffers>=25.12.19
+packaging>=26.3
+protobuf>=7.36.2

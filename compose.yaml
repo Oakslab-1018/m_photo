@@ -15,6 +15,12 @@ services:
       GEO_AI_MODE: mock
       OCR_PROVIDER: ${OCR_PROVIDER:-rapidocr}
       OCR_MODEL_TYPE: ${OCR_MODEL_TYPE:-server}
+      OCR_DEVICE: ${OCR_DEVICE:-cpu}
+      OCR_GPU_URL: ${OCR_GPU_URL:-http://host.docker.internal:8003}
+      GPUOCR_API_KEY: ${GPUOCR_API_KEY:-${STREETCLIP_API_KEY:-}}
+      OCR_GPU_TIMEOUT_SECONDS: ${OCR_GPU_TIMEOUT_SECONDS:-60}
+      OCR_CPU_INTRA_OP_THREADS: ${OCR_CPU_INTRA_OP_THREADS:-4}
+      OCR_CPU_INTER_OP_THREADS: ${OCR_CPU_INTER_OP_THREADS:-1}
       # Model weights are cached on the named volume so restarts need no download.
       M_PHOTO_OCR_MODEL_DIR: /data/ocr-models
       OCR_MIN_TEXT_SCORE: ${OCR_MIN_TEXT_SCORE:-0.5}
@@ -28,6 +34,12 @@ services:
       DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
       DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-flash}
       DEEPSEEK_TIMEOUT_SECONDS: ${DEEPSEEK_TIMEOUT_SECONDS:-15}
+      M_PHOTO_GEOCODER_ENABLED: ${M_PHOTO_GEOCODER_ENABLED:-true}
+      M_PHOTO_GEOCODER_PROVIDER: ${M_PHOTO_GEOCODER_PROVIDER:-photon}
+      M_PHOTO_GEOCODER_BASE_URL: ${M_PHOTO_GEOCODER_BASE_URL:-https://photon.komoot.io/api}
+      M_PHOTO_GEOCODER_LANGUAGE: ${M_PHOTO_GEOCODER_LANGUAGE:-en}
+      M_PHOTO_GEOCODER_TIMEOUT_SECONDS: ${M_PHOTO_GEOCODER_TIMEOUT_SECONDS:-6}
+      M_PHOTO_GEOCODER_MIN_INTERVAL_SECONDS: ${M_PHOTO_GEOCODER_MIN_INTERVAL_SECONDS:-1}
     volumes:
       - backend-data:/data
     expose:

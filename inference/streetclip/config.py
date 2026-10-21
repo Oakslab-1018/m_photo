@@ -22,6 +22,11 @@ PROMPT_TEMPLATES = (
 )
 UNCERTAIN_MARGIN_THRESHOLD = 0.015
 MAX_UPLOAD_BYTES = 16 * 1024 * 1024
+DEFAULT_BATCH_MAX_SIZE = 8
+MAX_BATCH_MAX_SIZE = 32
+DEFAULT_BATCH_MAX_AGGREGATE_BYTES = 64 * 1024 * 1024
+DEFAULT_BATCH_PROCESSOR_CHUNK = 8
+MAX_BATCH_PROCESSOR_CHUNK = 32
 DEFAULT_CITY_LIMIT_PER_COUNTRY = 100
 DEFAULT_CITY_PROMPT_CHUNK = 128
 CITY_REFERENCE_FUSION_WEIGHT = 0.6
@@ -97,6 +102,9 @@ class Settings:
     device: str = "cuda"
     precompute_dtype: str = "float32"
     max_upload_bytes: int = MAX_UPLOAD_BYTES
+    batch_max_size: int = DEFAULT_BATCH_MAX_SIZE
+    batch_max_aggregate_bytes: int = DEFAULT_BATCH_MAX_AGGREGATE_BYTES
+    batch_processor_chunk: int = DEFAULT_BATCH_PROCESSOR_CHUNK
     cache_embeddings: bool = True
     inference_semaphore_enabled: bool = True
     city_limit_per_country: int = DEFAULT_CITY_LIMIT_PER_COUNTRY
@@ -156,6 +164,26 @@ class Settings:
         cache_raw = get("STREETCLIP_CACHE_EMBEDDINGS")
         cache_embeddings = cache_raw is None or cache_raw.lower() not in {"0", "false", "no", "off"}
 
+        batch_max_size = _positive_int(
+            get("STREETCLIP_BATCH_MAX_SIZE"),
+            "STREETCLIP_BATCH_MAX_SIZE",
+            DEFAULT_BATCH_MAX_SIZE,
+        )
+        if batch_max_size > MAX_BATCH_MAX_SIZE:
+            raise ValueError(
+                f"STREETCLIP_BATCH_MAX_SIZE must be <= {MAX_BATCH_MAX_SIZE}"
+            )
+
+        batch_processor_chunk = _positive_int(
+            get("STREETCLIP_BATCH_PROCESSOR_CHUNK"),
+            "STREETCLIP_BATCH_PROCESSOR_CHUNK",
+            DEFAULT_BATCH_PROCESSOR_CHUNK,
+        )
+        if batch_processor_chunk > MAX_BATCH_PROCESSOR_CHUNK:
+            raise ValueError(
+                f"STREETCLIP_BATCH_PROCESSOR_CHUNK must be <= {MAX_BATCH_PROCESSOR_CHUNK}"
+            )
+
         return cls(
             catalog_db_path=catalog_db_path,
             storage_dir=storage_dir,
@@ -163,6 +191,13 @@ class Settings:
             device=device,
             precompute_dtype=(get("STREETCLIP_PRECOMPUTE_DTYPE") or "float32").lower(),
             max_upload_bytes=max_upload_bytes,
+            batch_max_size=batch_max_size,
+            batch_max_aggregate_bytes=_positive_int(
+                get("STREETCLIP_BATCH_MAX_AGGREGATE_BYTES"),
+                "STREETCLIP_BATCH_MAX_AGGREGATE_BYTES",
+                DEFAULT_BATCH_MAX_AGGREGATE_BYTES,
+            ),
+            batch_processor_chunk=batch_processor_chunk,
             cache_embeddings=cache_embeddings,
             inference_semaphore_enabled=True,
             city_limit_per_country=_positive_int(
@@ -187,6 +222,9 @@ __all__ = [
     "CITY_REFERENCE_FUSION_WEIGHT",
     "CITY_TEXT_FEATURE_CACHE_COUNTRIES",
     "CITY_TEXT_FUSION_WEIGHT",
+    "DEFAULT_BATCH_MAX_AGGREGATE_BYTES",
+    "DEFAULT_BATCH_MAX_SIZE",
+    "DEFAULT_BATCH_PROCESSOR_CHUNK",
     "DEFAULT_CATALOG_DB_PATH",
     "DEFAULT_CITIES_PATH",
     "DEFAULT_CITY_LIMIT_PER_COUNTRY",
@@ -194,6 +232,8 @@ __all__ = [
     "DEFAULT_COUNTRIES_PATH",
     "DEFAULT_STORAGE_DIR",
     "MAX_UPLOAD_BYTES",
+    "MAX_BATCH_MAX_SIZE",
+    "MAX_BATCH_PROCESSOR_CHUNK",
     "MODEL_ID",
     "MODEL_REVISION",
     "PROMPT_TEMPLATE_VERSION",

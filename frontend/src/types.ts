@@ -456,6 +456,24 @@ export interface LocationTarget extends GuidedTargetRef {
   coordinate_city_id?: number | null
 }
 
+export interface PlaceSource {
+  provider: string
+  provider_place_id?: string | null
+  label: string
+  query?: string
+  attribution?: string | null
+  license?: string | null
+  fetched_at?: string
+}
+
+export interface PlaceMatch {
+  query_terms: string[]
+  clue_ids: string[]
+  match_kind: 'catalog_exact' | 'geocoder_locality'
+  ambiguous: boolean
+  sources: PlaceSource[]
+}
+
 /** One ranked/sorted location option. score is absent for catalog-only rows. */
 export interface LocationCandidate {
   target: LocationTarget
@@ -464,6 +482,7 @@ export interface LocationCandidate {
   reason?: string | null
   /** Server-authorized provenance; explicit matches outrank model score rows. */
   selection_basis?: 'user_text' | 'catalog_search'
+  place_match?: PlaceMatch | null
 }
 
 export type ReviewedClueStatus = 'pending' | 'confirmed' | 'rejected' | 'uncertain'

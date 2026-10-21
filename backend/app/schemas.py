@@ -227,6 +227,32 @@ class GuidedLocationTarget(BaseModel):
     model_config = {"extra": "forbid"}
 
 
+class PlaceSourceModel(BaseModel):
+    """One bounded source supporting a catalog city match."""
+
+    provider: str = Field(min_length=1, max_length=40)
+    provider_place_id: str | None = Field(default=None, max_length=200)
+    label: str = Field(min_length=1, max_length=200)
+    query: str = Field(default="", max_length=200)
+    attribution: str | None = Field(default=None, max_length=200)
+    license: str | None = Field(default=None, max_length=80)
+    fetched_at: str = Field(default="", max_length=80)
+
+    model_config = {"extra": "forbid"}
+
+
+class PlaceMatchModel(BaseModel):
+    """User-text place evidence that resolved to authoritative catalog rows."""
+
+    query_terms: list[str] = Field(default_factory=list, max_length=4)
+    clue_ids: list[str] = Field(default_factory=list, max_length=20)
+    match_kind: Literal["catalog_exact", "geocoder_locality"]
+    ambiguous: bool = False
+    sources: list[PlaceSourceModel] = Field(default_factory=list, max_length=4)
+
+    model_config = {"extra": "forbid"}
+
+
 class GuidedCandidateModel(BaseModel):
     """One current option; catalog-only rows intentionally omit score fields."""
 
@@ -235,13 +261,14 @@ class GuidedCandidateModel(BaseModel):
     score_type: str | None = None
     reason: str | None = None
     selection_basis: Literal["user_text", "catalog_search"] | None = None
+    place_match: PlaceMatchModel | None = None
 
     model_config = {"extra": "forbid"}
 
     @model_serializer(mode="wrap")
     def _drop_absent_optional_fields(self, handler):
         data = handler(self)
-        for key in ("score", "score_type", "reason", "selection_basis"):
+        for key in ("score", "score_type", "reason", "selection_basis", "place_match"):
             if data.get(key) is None:
                 data.pop(key, None)
         return data
@@ -656,6 +683,8 @@ __all__ = [
     "GuidedLocationTarget",
     "GuidedQuestionModel",
     "GuidedQuestionOptionModel",
+    "PlaceMatchModel",
+    "PlaceSourceModel",
     "GuidedReceiptModel",
     "HealthResponse",
     "MatchedClueModel",

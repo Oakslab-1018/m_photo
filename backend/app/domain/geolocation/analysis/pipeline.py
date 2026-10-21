@@ -12,8 +12,13 @@ from .base import BaseAnalyzer
 from .ocr import (
     DEFAULT_MIN_TEXT_SCORE,
     DEFAULT_MODEL_TYPE,
+    DEFAULT_OCR_CPU_INTER_OP_THREADS,
+    DEFAULT_OCR_CPU_INTRA_OP_THREADS,
+    DEFAULT_OCR_DEVICE,
+    DEFAULT_OCR_GPU_TIMEOUT_SECONDS,
     MOCK_PROVIDER,
     OCRAnalyzer,
+    normalize_ocr_device,
     normalize_provider,
     sanitize_diagnostic,
 )
@@ -47,12 +52,23 @@ class AnalysisPipeline:
         ocr_cls_model_path: str | None = None,
         ocr_min_text_score: float = DEFAULT_MIN_TEXT_SCORE,
         ocr_language_min_confidence: float = DEFAULT_OCR_LANGUAGE_MIN_CONFIDENCE,
+        ocr_device: str = DEFAULT_OCR_DEVICE,
+        ocr_gpu_url: str | None = None,
+        ocr_gpu_api_key: str | None = None,
+        ocr_gpu_timeout_seconds: float = DEFAULT_OCR_GPU_TIMEOUT_SECONDS,
+        ocr_cpu_intra_op_threads: int = DEFAULT_OCR_CPU_INTRA_OP_THREADS,
+        ocr_cpu_inter_op_threads: int = DEFAULT_OCR_CPU_INTER_OP_THREADS,
         ocr_analyzer: OCRAnalyzer | None = None,
     ) -> None:
         self.mode = mode or AI_MODE
         provider = normalize_provider(ocr_provider or self.mode)
         self.ocr_provider = provider
         self.ocr_model_type = ocr_model_type or DEFAULT_MODEL_TYPE
+        self.ocr_device = (
+            normalize_ocr_device(str(ocr_analyzer.device))
+            if ocr_analyzer is not None and hasattr(ocr_analyzer, "device")
+            else normalize_ocr_device(ocr_device)
+        )
         self.ocr_language_min_confidence = ocr_language_min_confidence
         self.analyzers: List[BaseAnalyzer] = [
             ocr_analyzer
@@ -64,6 +80,12 @@ class AnalysisPipeline:
                 rec_model_path=ocr_rec_model_path,
                 cls_model_path=ocr_cls_model_path,
                 min_text_score=ocr_min_text_score,
+                device=self.ocr_device,
+                gpu_url=ocr_gpu_url,
+                gpu_api_key=ocr_gpu_api_key,
+                gpu_timeout_seconds=ocr_gpu_timeout_seconds,
+                cpu_intra_op_threads=ocr_cpu_intra_op_threads,
+                cpu_inter_op_threads=ocr_cpu_inter_op_threads,
             ),
             VegetationAnalyzer(),
             VehicleAnalyzer(),

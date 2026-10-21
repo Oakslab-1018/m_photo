@@ -159,6 +159,70 @@ def create_app(
             raise HTTPException(status_code=500, detail="internal inference error") from None
         return JSONResponse(status_code=200, content=result)
 
+    @application.post("/predict-batch")
+    async def predict_batch(
+        _auth: None = Depends(api_key_dependency),
+        files: list[UploadFile] = File(..., description="bounded list of street-level images"),
+    ) -> JSONResponse:
+        service_impl: StreetClipService = application.state.service
+        batch_max_size = service_impl.batch_max_size
+        aggregate_limit = service_impl.batch_max_aggregate_bytes
+        payloads: list[bytes] = []
+        try:
+            if not files:
+                raise HTTPException(status_code=400, detail="batch must contain at least one image")
+            if len(files) > batch_max_size:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"batch contains {len(files)} images; maximum is {batch_max_size}",
+                )
+
+            aggregate_bytes = 0
+            for index, file in enumerate(files, start=1):
+                try:
+                    payload = await file.read(resolved.max_upload_bytes + 1)
+                except Exception as exc:  # pragma: no cover - Starlette read errors
+                    raise HTTPException(status_code=400, detail="unable to read upload") from exc
+                if len(payload) > resolved.max_upload_bytes:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            f"image {index} exceeds "
+                            f"{resolved.max_upload_bytes} byte limit"
+                        ),
+                    )
+                aggregate_bytes += len(payload)
+                if aggregate_bytes > aggregate_limit:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            "batch exceeds "
+                            f"{aggregate_limit} aggregate byte limit"
+                        ),
+                    )
+                payloads.append(payload)
+        finally:
+            for file in files:
+                await file.close()
+
+        try:
+            result = await run_in_threadpool(service_impl.predict_batch, payloads)
+        except ImageTooLargeError as exc:
+            raise HTTPException(status_code=413, detail=_sanitize_error_detail(str(exc))) from exc
+        except EmptyImageError as exc:
+            raise HTTPException(status_code=400, detail=_sanitize_error_detail(str(exc))) from exc
+        except ExifGpsPresentError as exc:
+            raise HTTPException(status_code=422, detail=_sanitize_error_detail(str(exc))) from exc
+        except (DecodeError, ImageValidationError) as exc:
+            raise HTTPException(status_code=400, detail=_sanitize_error_detail(str(exc))) from exc
+        except PredictorUnavailableError as exc:
+            logger.warning("batch prediction unavailable: %s", exc)
+            raise HTTPException(status_code=503, detail="model unavailable") from exc
+        except Exception:  # pragma: no cover - defensive sanitization
+            logger.exception("unhandled batch prediction failure")
+            raise HTTPException(status_code=500, detail="internal inference error") from None
+        return JSONResponse(status_code=200, content=result)
+
     @application.post("/predict-cities")
     async def predict_cities(
         _auth: None = Depends(api_key_dependency),

@@ -25,7 +25,14 @@ from .cities import (
     load_cities,
     select_cities,
 )
-from .config import MODEL_ID, MODEL_REVISION, Settings
+from .config import (
+    DEFAULT_BATCH_MAX_AGGREGATE_BYTES,
+    DEFAULT_BATCH_MAX_SIZE,
+    MAX_BATCH_MAX_SIZE,
+    MODEL_ID,
+    MODEL_REVISION,
+    Settings,
+)
 from .predictor import (
     Predictor,
     PredictorUnavailableError,
@@ -109,6 +116,30 @@ class StreetClipService:
     @property
     def reference_loaded(self) -> bool:
         return self._reference_index is not None
+
+    def _batch_max_size(self) -> int:
+        try:
+            configured = int(self.settings.batch_max_size)
+        except (TypeError, ValueError):
+            configured = DEFAULT_BATCH_MAX_SIZE
+        if configured <= 0:
+            configured = DEFAULT_BATCH_MAX_SIZE
+        return min(MAX_BATCH_MAX_SIZE, configured)
+
+    def _batch_aggregate_limit(self) -> int:
+        try:
+            configured = int(self.settings.batch_max_aggregate_bytes)
+        except (TypeError, ValueError):
+            configured = DEFAULT_BATCH_MAX_AGGREGATE_BYTES
+        return configured if configured > 0 else DEFAULT_BATCH_MAX_AGGREGATE_BYTES
+
+    @property
+    def batch_max_size(self) -> int:
+        return self._batch_max_size()
+
+    @property
+    def batch_max_aggregate_bytes(self) -> int:
+        return self._batch_aggregate_limit()
 
     def load(self) -> None:
         """Resolve catalogs and load the real predictor exactly once.
@@ -263,11 +294,19 @@ class StreetClipService:
     def health(self) -> dict[str, Any]:
         ready = bool(self._predictor is not None and self._predictor.ready)
         device = self._predictor.device if self._predictor is not None else "unloaded"
+        country_batch = bool(
+            self._predictor is not None
+            and callable(getattr(self._predictor, "encode_images", None))
+            and callable(getattr(self._predictor, "predict_from_vector", None))
+        )
         payload: dict[str, Any] = {
             "ready": ready,
             "model": MODEL_ID,
             "model_revision": MODEL_REVISION,
             "device": device,
+            "country_batch": country_batch,
+            "batch_max_size": self.batch_max_size,
+            "batch_max_aggregate_bytes": self.batch_max_aggregate_bytes,
             "countries": len(self._countries),
             "city_capability": self._city_capability,
             "cities_loaded": self._cities_loaded,
@@ -314,6 +353,79 @@ class StreetClipService:
                 result = dict(result)
                 result["reference"] = sidecar
         return result
+
+    def predict_batch(self, payloads: list[bytes]) -> dict[str, Any]:
+        """Predict a bounded country batch under one inference critical section.
+
+        Every item is size-validated, decoded, orientation-normalized and
+        stripped of metadata before the GPU lock is acquired. The real
+        predictor then performs bounded processor batches, and the existing
+        per-vector country ranking preserves each single-prediction shape in
+        input order. Optional reference search uses the same per-vector helper
+        and remains outside the GPU lock.
+        """
+        if not isinstance(payloads, list) or not payloads:
+            raise ImageValidationError("batch must contain at least one image")
+        max_batch_size = self._batch_max_size()
+        if len(payloads) > max_batch_size:
+            raise ImageTooLargeError(
+                f"batch contains {len(payloads)} images; maximum is {max_batch_size}"
+            )
+        for payload in payloads:
+            if not isinstance(payload, bytes):
+                raise ImageValidationError("each batch item must be image bytes")
+        aggregate_bytes = sum(len(payload) for payload in payloads)
+        aggregate_limit = self._batch_aggregate_limit()
+        if aggregate_bytes > aggregate_limit:
+            raise ImageTooLargeError(
+                f"batch exceeds {aggregate_limit} aggregate byte limit"
+            )
+
+        for payload in payloads:
+            validate_image_bytes(payload, max_bytes=self.settings.max_upload_bytes)
+        if self._predictor is None or not self._predictor.ready:
+            raise PredictorUnavailableError("model is not ready")
+
+        images = [decode_image_bytes(payload) for payload in payloads]
+        encode_images = getattr(self._predictor, "encode_images", None)
+        predict_from_vector = getattr(self._predictor, "predict_from_vector", None)
+
+        if callable(encode_images) and callable(predict_from_vector):
+            # encode_images owns the predictor-level lock. predict_from_vector
+            # is deliberately lock-free, so this path never nests that lock.
+            with self._predict_lock:
+                vectors = np.asarray(encode_images(images), dtype=np.float32)
+                if (
+                    vectors.ndim != 2
+                    or vectors.shape[0] != len(payloads)
+                    or vectors.shape[1] == 0
+                ):
+                    raise PredictorUnavailableError(
+                        "StreetCLIP returned an invalid image embedding batch"
+                    )
+                results = [predict_from_vector(vector) for vector in vectors]
+
+            if self._reference_index is not None:
+                referenced_results: list[dict[str, Any]] = []
+                for vector, result in zip(vectors, results):
+                    sidecar = self._search_reference(vector)
+                    if sidecar is not None:
+                        result = dict(result)
+                        result["reference"] = sidecar
+                    referenced_results.append(result)
+                results = referenced_results
+            return {"results": results}
+
+        # Compatibility path for injected predictors that only implement the
+        # original single-image protocol. The real predictor always uses the
+        # true batched path above.
+        if self._reference_index is not None:
+            raise PredictorUnavailableError(
+                "batch reference sidecars require batched predictor support"
+            )
+        with self._predict_lock:
+            results = [self._predictor.predict(payload) for payload in payloads]
+        return {"results": results}
 
     def analyze_region(self, payload: bytes) -> dict[str, Any]:
         """Run bounded zero-shot scene hypotheses with the shared encoder.
