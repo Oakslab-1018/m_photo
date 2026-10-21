@@ -12,6 +12,7 @@ import type {
   ReviewedClue,
   ReviewedClueStatus,
 } from '@/types'
+import { displayCityName } from '@/utils/city'
 import { clueValueLabel, dimensionLabel } from '@/utils/clues'
 import { normalizeIsoCode } from '@/utils/geo'
 
@@ -167,8 +168,9 @@ export function guidedStepState(
   return 'pending'
 }
 
-/** Human-readable target label; never falls back to an internal catalog ID. */
+/** Human-readable target label; city titles follow the all-Chinese policy. */
 export function targetLabel(target: LocationTarget | null | undefined): string {
+  if (target?.level === 'city') return displayCityName(target)
   const label = typeof target?.label === 'string' ? target.label.trim() : ''
   return label || '未命名地点'
 }

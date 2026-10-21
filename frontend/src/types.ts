@@ -73,6 +73,8 @@ export interface CityScore {
   city_id: string
   iso: string
   name: string
+  /** Backend-localized Chinese city title when available. */
+  name_zh?: string | null
   region: string
   lat: number
   lng: number

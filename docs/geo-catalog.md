@@ -90,3 +90,16 @@ uv run --frozen python -m backend.app.services.geo_catalog_import --force
 
 只有需要从外部旧数据迁移时才使用 `scripts/import-legacy-geo-catalog.py`，并显式提供三个 JSON 输入路径；
 应用启动不会调用该工具。
+
+
+## 城市中文显示名
+
+`data/city-names.zh-CN.json` 是独立的展示词表，按现有城市 GeoNames ID 关联；不改目录 ID、原始模型名称、坐标、分数或目录版本。数据来自 GeoNames `alternateNamesV2` 的中文语言标签，排除历史、俗称和已结束使用的名字，优先简体中文及首选名称。当前覆盖 11286 / 34156 个城市；未收录者显示“中文名待补充”，不猜译。
+
+来源指纹、日期和 CC BY 4.0 署名保存在同目录 `.sources.json`。更新时将官方压缩包下载到本地缓存，然后运行：
+
+```powershell
+python scripts/import_city_names_zh.py --archive .cache/geo-catalog/alternateNamesV2-20261021.zip --retrieved 2026-10-21
+```
+
+运行时只读取生成的词表，不下载、翻译或调用 LLM。

@@ -43,6 +43,12 @@ export interface UseGuidedDialogueOptions {
 /** Event body before the composable attaches idempotency and revision fields. */
 export type GuidedEventInput = Omit<GuidedEventPayload, 'event_id' | 'expected_revision'>
 
+/** Concrete in-flight operation exposed for the app-level live status. */
+export interface GuidedPendingOperation {
+  kind: GuidedEventPayload['type']
+  label: string
+}
+
 let fallbackEventCounter = 0
 
 function defaultEventId(): string {
@@ -77,6 +83,46 @@ function buildEvent(
   if (input.text !== undefined) event.text = input.text
   if (input.level !== undefined) event.level = input.level
   return event
+}
+
+function describePendingOperation(
+  event: GuidedEventPayload,
+  dialogue: GuidedDialogue | null,
+): GuidedPendingOperation {
+  switch (event.type) {
+    case 'confirm_clue':
+      return { kind: event.type, label: '正在确认观察…' }
+    case 'reject_clue':
+      return { kind: event.type, label: '正在标记这条观察不准确…' }
+    case 'unknown':
+      return { kind: event.type, label: '正在记录无法判断…' }
+    case 'answer':
+      return { kind: event.type, label: '正在更新候选…' }
+    case 'confirm_location':
+      return {
+        kind: event.type,
+        label: dialogue?.stage === 'city' ? '正在确认城市…' : '正在确认国家 / 地区…',
+      }
+    case 'reject_location':
+      return {
+        kind: event.type,
+        label:
+          dialogue?.stage === 'city'
+            ? '正在排除城市候选…'
+            : '正在排除国家 / 地区候选…',
+      }
+    case 'retract':
+      return {
+        kind: event.type,
+        label: event.clue_id ? '正在恢复这条观察的核对…' : '正在撤回排除项…',
+      }
+    case 'backtrack':
+      return { kind: event.type, label: '正在返回上一层级…' }
+    case 'free_text':
+      return { kind: event.type, label: '正在解析补充线索…' }
+    default:
+      return { kind: event.type, label: '正在提交引导操作…' }
+  }
 }
 
 function validateEvent(input: GuidedEventInput): string | null {
@@ -129,6 +175,7 @@ export function useGuidedDialogue(
   const active = ref(false)
   const loading = ref(false)
   const applying = ref(false)
+  const pendingOperation = ref<GuidedPendingOperation | null>(null)
   const error = ref<string | null>(null)
   const conflict = ref<string | null>(null)
   const dialogue = ref<GuidedDialogue | null>(null)
@@ -246,6 +293,7 @@ export function useGuidedDialogue(
     active.value = false
     loading.value = false
     applying.value = false
+    pendingOperation.value = null
     error.value = null
     conflict.value = null
     dialogue.value = null
@@ -418,6 +466,7 @@ export function useGuidedDialogue(
     active.value = true
     loading.value = true
     applying.value = false
+    pendingOperation.value = null
     error.value = null
     conflict.value = null
     dialogue.value = null
@@ -448,13 +497,17 @@ export function useGuidedDialogue(
     }
   }
 
-  async function reload(keepFailure = false): Promise<boolean> {
+  async function reload(
+    keepFailure = false,
+    operation: GuidedPendingOperation | null = null,
+  ): Promise<boolean> {
     const target = activeSessionId.value ?? sessionId.value
     if (target === null || target === undefined) return false
 
     const token = ++generation
     loading.value = true
     applying.value = false
+    pendingOperation.value = keepFailure ? operation : null
     if (!keepFailure) {
       conflict.value = null
       error.value = null
@@ -477,7 +530,10 @@ export function useGuidedDialogue(
       error.value = normalizeApiError(caught, undefined, '无法读取引导状态，请重试').message
       return false
     } finally {
-      if (isCurrent(token, target)) loading.value = false
+      if (isCurrent(token, target)) {
+        loading.value = false
+        pendingOperation.value = null
+      }
     }
   }
 
@@ -553,6 +609,7 @@ export function useGuidedDialogue(
 
     const token = ++generation
     applying.value = true
+    pendingOperation.value = describePendingOperation(event, dialogue.value)
     error.value = null
     conflict.value = null
 
@@ -576,7 +633,10 @@ export function useGuidedDialogue(
         failedQuestion.value = questionContext
         retryable.value = true
         // Never replay automatically: reload and require a matching fresh state.
-        const reloaded = await reload(true)
+        const reloaded = await reload(true, pendingOperation.value)
+        // A session switch during the CAS refresh must not let this old event
+        // write failure state into the replacement session.
+        if (activeSessionId.value !== target || sessionId.value !== target) return false
         if (!reloaded || !canRetryFailedEvent(event, questionContext)) {
           discardFailedEvent(
             reloaded
@@ -601,7 +661,10 @@ export function useGuidedDialogue(
       retryable.value = isRetryableStatus(status)
       return false
     } finally {
-      if (isCurrent(token, target)) applying.value = false
+      if (isCurrent(token, target)) {
+        applying.value = false
+        pendingOperation.value = null
+      }
     }
   }
 
@@ -796,6 +859,7 @@ export function useGuidedDialogue(
     active,
     loading,
     applying,
+    pendingOperation,
     error,
     conflict,
     dialogue,

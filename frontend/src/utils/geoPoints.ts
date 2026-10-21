@@ -7,8 +7,9 @@ import type {
   LocationCandidate,
   LocationTarget,
 } from '@/types'
+import { displayCityName } from '@/utils/city'
 import { cityRegionLabel, regionScopeLabel } from '@/utils/geo'
-import { guidedTargetKey } from '@/utils/guided'
+import { guidedTargetKey, targetLabel } from '@/utils/guided'
 
 export interface GeoPoint {
   key: string
@@ -84,7 +85,7 @@ export function cityPoints(cities: readonly CityScore[] | undefined): GeoPoint[]
       key: `city:${city.city_id}`,
       kind: 'city',
       iso: city.iso,
-      name: city.name || city.city_id,
+      name: displayCityName(city),
       lat: city.lat,
       lng: city.lng,
       cosine: finite(city.raw_cosine),
@@ -106,11 +107,6 @@ export interface GuidedMapPointSet {
   fallbackPoints: GeoPoint[]
   /** Candidate targets without a usable lat/lng pair; these receive no marker. */
   missingCoordinates: LocationTarget[]
-}
-
-function targetLabelValue(target: LocationTarget): string {
-  const label = typeof target.label === 'string' ? target.label.trim() : ''
-  return label || target.id
 }
 
 /**
@@ -139,13 +135,14 @@ export function guidedLocationPoints(
   for (const level of confirmedLevels) {
     const target = confirmedPath ? confirmedPath[level] : null
     if (!target || !guidedTargetKey(target) || !isUsableLngLat(target.lng, target.lat)) continue
+    const label = targetLabel(target)
     addPoint({
       key: guidedTargetKey(target) as string,
       kind: target.level,
       level: target.level,
       iso: target.country_iso || target.source_iso || target.id,
-      name: targetLabelValue(target),
-      label: targetLabelValue(target),
+      name: label,
+      label,
       lat: target.lat as number,
       lng: target.lng as number,
       cosine: null,
@@ -174,13 +171,14 @@ export function guidedLocationPoints(
         missingByKey.set(key, target)
         continue
       }
+      const label = targetLabel(target)
       addPoint({
         key,
         kind: target.level,
         level: target.level,
         iso: target.country_iso || target.source_iso || target.id,
-        name: targetLabelValue(target),
-        label: targetLabelValue(target),
+        name: label,
+        label,
         lat: target.lat as number,
         lng: target.lng as number,
         cosine: null,

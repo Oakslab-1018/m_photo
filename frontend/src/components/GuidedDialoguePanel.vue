@@ -360,21 +360,21 @@ const receiptStatusText = computed(() => {
 const composerStatusText = computed(() => {
   const submission = props.freeTextSubmission
   if (!submission) return ''
-  if (submission.status === 'pending') return '正在发送这条线索，等待服务器确认…'
+  if (submission.status === 'pending') return '正在解析这条线索…'
   if (submission.status === 'failed') {
     const reason = safeGuidedText(submission.error).trim()
-    return `${reason || '提交失败'} · 草稿已保留，可修改后再次发送。`
+    return `${reason || '这次提交没有完成'} · 草稿已保留，可修改后再发送。`
   }
   if (submission.status === 'unconfirmed') {
     const reason = safeGuidedText(submission.error).trim()
-    return `${reason || '服务器未确认此次提交'} · 草稿已保留，请核对最新状态后重试。`
+    return `${reason || '这次提交还没有明确回执'} · 草稿已保留，请核对最新状态后再试。`
   }
   if (submission.status === 'unchanged') {
-    return '这条线索已记录，无需重复添加。'
+    return '这条线索之前已经记录过，无需重复提交。'
   }
   return composerReceiptText.value
     ? `助手反馈：${composerReceiptText.value}`
-    : '已发送，助手会结合这条线索更新判断。'
+    : '已收到这条线索，定位助手会结合它继续核对。'
 })
 
 /** Scroll only the guided panel; never scroll the document or a candidate card. */

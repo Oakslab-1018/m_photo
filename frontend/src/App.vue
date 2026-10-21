@@ -250,7 +250,13 @@ const liveStatus = computed<{ tone: FeedbackReceiptTone | 'info'; text: string }
   if (failed) return { tone: 'warn', text: `发送失败：${failed.error ?? '未知错误'} · 可在对话中重试或删除` }
   if (guided.conflict.value) return { tone: 'warn', text: safeGuidedText(guided.conflict.value) }
   if (guided.error.value) return { tone: 'warn', text: safeGuidedText(guided.error.value) }
-  if (guided.applying.value) return { tone: 'info', text: '正在提交引导操作，等待服务器确认…' }
+  if (
+    (guided.applying.value || guided.loading.value) &&
+    guided.pendingOperation.value
+  ) {
+    return { tone: 'info', text: guided.pendingOperation.value.label }
+  }
+  if (guided.applying.value) return { tone: 'info', text: '正在提交引导操作…' }
   if (guided.loading.value) return { tone: 'info', text: '正在同步引导状态…' }
   if (feedbackBusy.value) return { tone: 'info', text: '正在提交反馈，等待服务器回执…' }
   if (uploading.value) return { tone: 'info', text: '正在分析图像…' }

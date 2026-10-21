@@ -34,6 +34,7 @@ from PIL import Image, ImageOps
 from ..config import Settings
 from .catalog_access import catalog_for_settings
 from .city_catalog import CityCatalogError, load_city_index
+from .city_labels import city_name_zh
 
 MODEL_ID = "geolocal/StreetCLIP"
 MODEL_REVISION = "e3561ba2ad9bf14c9efd6b0092607b8497efbfea"
@@ -753,6 +754,7 @@ class StreetClipGateway:
                 "city_id": str(city_id),
                 "iso": requested,
                 "name": entry.name,
+                "name_zh": city_name_zh(entry.city_id, entry.name),
                 "region": entry.region,
                 "lat": entry.lat,
                 "lng": entry.lng,

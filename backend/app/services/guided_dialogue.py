@@ -59,12 +59,19 @@ from ..schemas import (
     ReviewedClueModel,
 )
 from .city_catalog import CityRow
+from .city_labels import city_name_zh
 from .city_reasoning import CityClueReasoner
 from .deepseek import DeepSeekClient, narration_matches_action
 from .geo_session import GeoSessionService
 from .geocoding import GeocodingConfig, get_shared_geocoder
+from .guided_city_cache import CITY_RANKING_CACHE, CityRankingKey
 from .place_resolution import CityEvidence, PlaceResolutionBatch, PlaceResolutionService
-from .model_gateway import StreetClipGateway, build_inference_notice
+from .model_gateway import (
+    MODEL_REVISION,
+    PROMPT_VERSION,
+    StreetClipGateway,
+    build_inference_notice,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -509,11 +516,12 @@ class GuidedDialogueService:
             query=query,
             ensure_question=bool(outcome["effective"]),
         )
-        prepared = self._maybe_narrate(
-            prepared,
-            session_id,
-            feedback=(event.text or event.value or outcome["summary"]),
-        )
+        if event.type == "free_text" and outcome["effective"]:
+            prepared = self._maybe_narrate(
+                prepared,
+                session_id,
+                feedback=(event.text or event.value or outcome["summary"]),
+            )
         receipt = {
             "event_id": event.event_id,
             "status": outcome["status"],
@@ -973,6 +981,16 @@ class GuidedDialogueService:
         if result.get("lng") is None:
             result["lng"] = fields["lng"]
         result.update(fields["provenance"])
+        if level == "city":
+            result["label"] = city_name_zh(
+                str(result.get("id") or result.get("city_id") or ""),
+                str(
+                    getattr(place, "label", "")
+                    or result.get("label")
+                    or getattr(place, "name", "")
+                    or ""
+                ),
+            )
         return result
 
     def _country_records(self) -> list[dict[str, Any]]:
@@ -1084,7 +1102,10 @@ class GuidedDialogueService:
         return {
             "level": "city",
             "id": str(row.city_id),
-            "label": label or row.name,
+            "label": city_name_zh(
+                row.city_id,
+                label or str(getattr(place, "label", "") or row.name),
+            ),
             "country_iso": canonical,
             "source_iso": row.iso,
             "admin1_id": admin1_id,
@@ -1412,12 +1433,46 @@ class GuidedDialogueService:
             raise self._unavailable(exc) from exc
 
         normalized = normalize_place_text(term)
-        found.sort(key=lambda item: (
-            normalize_place_text(str(item[1].get("label") or "")) != normalized,
-            -item[0].population,
-            item[0].city_id,
-        ))
+
+        def order(item: tuple[CityRow, dict[str, Any]]) -> tuple[Any, ...]:
+            row, target = item
+            match_labels = {
+                normalize_place_text(row.name),
+                normalize_place_text(str(target.get("label") or "")),
+            }
+            return (
+                normalized not in match_labels,
+                -row.population,
+                row.city_id,
+            )
+
+        found.sort(key=order)
         return [target for _row, target in found]
+
+    def _cached_city_ranking(
+        self,
+        image_path: Path,
+        source_iso: str,
+        cache_key: CityRankingKey | None,
+    ) -> Mapping[str, Any] | None:
+        """Load one validated raw city payload without holding locks over I/O."""
+
+        if cache_key is not None:
+            hit, cached = CITY_RANKING_CACHE.get(cache_key)
+            if hit:
+                return cached
+        try:
+            result = self.gateway.rank_cities(image_path, source_iso)
+        except Exception:
+            result = None
+        if cache_key is not None:
+            if isinstance(result, Mapping) and result:
+                CITY_RANKING_CACHE.put_success(cache_key, result)
+            else:
+                # A short-lived miss prevents repeated timeout waits, without
+                # making a provider outage permanent.
+                CITY_RANKING_CACHE.put_failure(cache_key)
+        return result if isinstance(result, Mapping) else None
 
     def _ranked_city_rows(
         self,
@@ -1428,14 +1483,36 @@ class GuidedDialogueService:
         image_path = Path(session.image_path)
         if not image_path.exists():
             return {}
+        fingerprint = CITY_RANKING_CACHE.image_fingerprint(image_path)
+        catalog_revision = ""
+        endpoint = ""
+        if fingerprint is not None:
+            try:
+                catalog_revision = str(self._store().revisions().get("cities") or "")
+            except Exception:
+                catalog_revision = ""
+            endpoint = (
+                str(self.settings.streetclip_url or "").rstrip("/") + "/predict-cities"
+            )
         merged: dict[str, Mapping[str, Any]] = {}
         for source_iso in self._country_source_scopes(state):
             if self._source_excluded(state, session, source_iso):
                 continue
-            try:
-                result = self.gateway.rank_cities(image_path, source_iso)
-            except Exception:
-                result = None
+            cache_key = (
+                CityRankingKey(
+                    image_sha256=fingerprint.sha256,
+                    image_size=fingerprint.size,
+                    image_mtime_ns=fingerprint.mtime_ns,
+                    model_revision=MODEL_REVISION,
+                    prompt_revision=PROMPT_VERSION,
+                    catalog_revision=catalog_revision,
+                    source_iso=normalize_iso(source_iso) or str(source_iso),
+                    endpoint=endpoint,
+                )
+                if fingerprint is not None and catalog_revision and endpoint
+                else None
+            )
+            result = self._cached_city_ranking(image_path, source_iso, cache_key)
             if not result:
                 continue
             rows = [
@@ -1566,11 +1643,21 @@ class GuidedDialogueService:
         def sort_key(item: Mapping[str, Any]) -> tuple[Any, ...]:
             target = item.get("target") or {}
             label_key = normalize_place_text(str(target.get("label") or ""))
+            try:
+                row = rows[int(str(target.get("id") or ""))]
+            except (KeyError, TypeError, ValueError):
+                row = None
+            original_name_key = normalize_place_text(row.name) if row is not None else ""
             basis = str(item.get("selection_basis") or "")
             basis_rank = 0 if basis == "user_text" else 1 if basis == "catalog_search" else 2
             if item.get("score") is None and basis_rank == 2:
                 basis_rank = 3
-            exact = 0 if query_key and label_key == query_key else 1
+            # Display labels are localized, while exact matching must continue
+            # to recognize the original catalog/model name.
+            exact = (
+                0 if query_key and query_key in {label_key, original_name_key}
+                else 1
+            )
             try:
                 score = -float(item.get("score"))
             except (TypeError, ValueError):
@@ -1583,11 +1670,7 @@ class GuidedDialogueService:
             )
             if ambiguous:
                 score = 1.0
-            try:
-                row = rows[int(str(target.get("id") or ""))]
-                population = 0 if ambiguous else -row.population
-            except (KeyError, TypeError, ValueError):
-                population = 0
+            population = 0 if ambiguous or row is None else -row.population
             label_order = label_key if ambiguous else ""
             return (
                 basis_rank, exact, score, 0 if ambiguous else 1,
@@ -1978,6 +2061,62 @@ class GuidedDialogueService:
             prepared.action = prepared.action.model_copy(update={"message": message})
         return prepared
 
+    @staticmethod
+    def _localize_city_target(value: object) -> tuple[dict[str, Any] | None, str]:
+        if not isinstance(value, Mapping) or value.get("level") != "city":
+            return None, ""
+        target = dict(value)
+        old_label = str(target.get("label") or "")
+        target["label"] = city_name_zh(
+            str(target.get("id") or target.get("city_id") or ""),
+            old_label,
+        )
+        return target, old_label
+
+    @classmethod
+    def _localize_city_labels(cls, state: dict[str, Any]) -> None:
+        """Localize legacy city display labels without changing identities."""
+
+        confirmed = state.get("confirmed")
+        if isinstance(confirmed, Mapping):
+            city, _ = cls._localize_city_target(confirmed.get("city"))
+            if city is not None:
+                updated = dict(confirmed)
+                updated["city"] = city
+                state["confirmed"] = updated
+
+        pending = state.get("pending_question")
+        if isinstance(pending, Mapping):
+            question = dict(pending)
+            target, old_label = cls._localize_city_target(question.get("target"))
+            if target is not None:
+                question["target"] = target
+                new_label = str(target.get("label") or "")
+                message = str(question.get("message") or "")
+                if old_label and old_label != new_label and old_label in message:
+                    question["message"] = message.replace(old_label, new_label)
+                options = []
+                for option in question.get("options") or []:
+                    if not isinstance(option, Mapping):
+                        continue
+                    localized = dict(option)
+                    city_id = str(localized.get("value") or "")
+                    if _CITY_ID_RE.fullmatch(city_id):
+                        localized["label"] = city_name_zh(
+                            city_id,
+                            str(localized.get("label") or ""),
+                        )
+                    options.append(localized)
+                if options:
+                    question["options"] = options
+            state["pending_question"] = question
+
+        proposals = []
+        for item in state.get("proposals") or []:
+            target, _ = cls._localize_city_target(item)
+            proposals.append(target if target is not None else item)
+        state["proposals"] = proposals
+
     def _prepare(
         self,
         state: dict[str, Any],
@@ -1987,6 +2126,7 @@ class GuidedDialogueService:
         ensure_question: bool = True,
     ) -> _Prepared:
         state = _normalise_state(state)
+        self._localize_city_labels(state)
         clues = self._ranking_clues(state)
         scores, inference_notice, validated_evidence = self._country_scores(state, session, clues)
         stage = self._stage_for_state(state)
@@ -2015,7 +2155,7 @@ class GuidedDialogueService:
             country_candidates = self._merge_candidates(proposed_countries, country_candidates)
         city_candidates = (
             self._city_candidates(state, session, clues, query=query, proposals=proposals)
-            if stage in {"city", "resolved"}
+            if stage == "city"
             else []
         )
         if inference_notice and not scores:
@@ -3554,6 +3694,7 @@ class GuidedDialogueService:
                     continue
                 key = _target_state_key(target)
                 proposals[key] = target
+                row_label = str(target.get("label") or row.name)
                 detail = city_details.get(str(city_id), {})
                 provider = next(
                     (str(item.get("provider") or "") for item in sources if item.get("provider")),
@@ -3565,10 +3706,10 @@ class GuidedDialogueService:
                         "不会按人口或检索排名自动选择。"
                     )
                 elif provider == "local_catalog":
-                    reason = f"目录名称精确匹配「{row.name}」，待确认。"
+                    reason = f"目录名称精确匹配「{row_label}」，待确认。"
                 else:
                     reason = (
-                        f"用户文字经 {provider} 检索并映射到目录城市「{row.name}」，待确认。"
+                        f"用户文字经 {provider} 检索并映射到目录城市「{row_label}」，待确认。"
                     )
                 current = meta.get(key)
                 if current is None:
@@ -3610,7 +3751,11 @@ class GuidedDialogueService:
         key = f"city:{row.city_id}"
         meta = (state.get("proposal_meta") or {}).get(key)
         if isinstance(meta, Mapping) and meta.get("reason"):
-            return str(meta["reason"])
+            reason = str(meta["reason"])
+            localized = city_name_zh(row.city_id, row.name)
+            if row.name and row.name != localized:
+                reason = reason.replace(row.name, localized)
+            return reason
         return "用户文字候选"
 
     def _place_match_from_meta(

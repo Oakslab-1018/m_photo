@@ -7,7 +7,7 @@ import type {
   LocationCandidate,
   LocationTarget,
 } from '@/types'
-import { cityMatchedClueCount, cityScoreLabel } from '@/utils/city'
+import { cityMatchedClueCount, cityScoreLabel, displayCityName } from '@/utils/city'
 import {
   candidateScoreLabel,
   guidedCandidateComposition,
@@ -447,7 +447,7 @@ function isForeignCitySelection(): boolean {
             <span class="candidate-rank city">城</span>
             <div>
               <div class="candidate-name">
-                {{ city.name }}
+                {{ displayCityName(city) }}
                 <span v-if="cityRegionLabel(city)" class="tag region">{{ cityRegionLabel(city) }}</span>
               </div>
               <div class="candidate-score">{{ city.region }} · {{ cityScoreLabel(city) }}</div>

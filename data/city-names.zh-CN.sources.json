@@ -1,0 +1,11 @@
+{
+  "source": "GeoNames alternateNamesV2",
+  "url": "https://download.geonames.org/export/dump/alternateNamesV2.zip",
+  "retrieved": "2026-10-21",
+  "sha256": "9f7de10e49711057b9267fc628826ccb79c69d2956da0afcbd5cdfb3055e5999",
+  "license": "CC BY 4.0",
+  "attribution": "GeoNames",
+  "catalog_city_count": 34156,
+  "translated_city_count": 11286,
+  "selection": "Match catalog GeoNames IDs; exclude historic, colloquial and ended names; prefer zh-CN, zh-Hans, zh, then other zh locales; prefer preferred/short names then length and alternate-name ID. Display only; catalog identity, coordinates, scores and revisions are unchanged."
+}

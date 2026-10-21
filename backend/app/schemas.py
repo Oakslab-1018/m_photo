@@ -410,6 +410,7 @@ class CityScoreModel(BaseModel):
     source_iso: str | None = None
     source_region: dict[str, Any] | None = None
     name: str
+    name_zh: str | None = None
     region: str = ""
     lat: float
     lng: float
