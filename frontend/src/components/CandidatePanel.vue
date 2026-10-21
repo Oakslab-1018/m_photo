@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, useSlots, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 import type {
   CityScore,
   CountryScore,
@@ -61,6 +61,8 @@ const props = defineProps<{
   guidedDataReady?: boolean
   /** Current server-guided level used to keep the candidate tab label accurate. */
   guidedStage?: GuidedStage | null
+  /** Render candidates, references, or both. The map never lives in this panel. */
+  surface?: 'all' | 'candidates' | 'references'
 }>()
 
 const emit = defineEmits<{
@@ -75,16 +77,14 @@ const emit = defineEmits<{
   expand: []
 }>()
 
-type CandidateTab = 'map' | 'country' | 'city' | 'reference'
+type CandidateTab = 'country' | 'city' | 'reference'
 
 const ALL_TABS: Array<{ key: CandidateTab; label: string }> = [
-  { key: 'map', label: '地图' },
   { key: 'country', label: '国家' },
   { key: 'city', label: '城市' },
   { key: 'reference', label: '参考' },
 ]
 
-const slots = useSlots()
 const guidedTabLabel = computed(() => {
   switch (props.guidedStage) {
     case 'country':
@@ -96,7 +96,11 @@ const guidedTabLabel = computed(() => {
   }
 })
 const tabs = computed(() => {
-  let available = slots.map ? ALL_TABS : ALL_TABS.filter((tab) => tab.key !== 'map')
+  const surface = props.surface ?? 'all'
+  if (surface === 'references') return []
+  let available = surface === 'candidates'
+    ? ALL_TABS.filter((tab) => tab.key !== 'reference')
+    : [...ALL_TABS]
   // In guided mode the server-ranked Top-5 is the only candidate source; the
   // legacy directory city tab would bypass that contract.
   if (props.guidedMode) available = available.filter((tab) => tab.key !== 'city')
@@ -106,7 +110,8 @@ const tabs = computed(() => {
       : tab,
   )
 })
-const activeTab = ref<CandidateTab>(slots.map ? 'map' : 'country')
+const initialTab = (): CandidateTab => props.surface === 'references' ? 'reference' : 'country'
+const activeTab = ref<CandidateTab>(initialTab())
 
 const guidedTopCandidates = computed(() =>
   props.guidedMode
@@ -159,8 +164,19 @@ const countryCount = computed(() =>
 )
 
 watch(tabs, (current) => {
+  if (!current.length) {
+    activeTab.value = 'reference'
+    return
+  }
   if (!current.some((tab) => tab.key === activeTab.value)) activeTab.value = 'country'
 })
+
+watch(
+  () => props.surface,
+  (surface) => {
+    activeTab.value = surface === 'references' ? 'reference' : 'country'
+  },
+)
 
 const cityPickerIso = ref('')
 const citySource = ref('')
@@ -242,8 +258,11 @@ function isForeignCitySelection(): boolean {
 </script>
 
 <template>
-  <section class="panel candidate-panel" :class="{ embedded }">
-    <div class="candidate-tabs" role="tablist" aria-label="候选结果">
+  <section
+    class="panel candidate-panel"
+    :class="[embedded ? 'embedded' : '', `candidate-panel--${surface ?? 'all'}`]"
+  >
+    <div v-if="tabs.length || collapsible" class="candidate-tabs" role="tablist" aria-label="候选结果">
       <button
         v-for="tab in tabs"
         :key="tab.key"
@@ -273,11 +292,7 @@ function isForeignCitySelection(): boolean {
       </button>
     </div>
 
-    <div v-show="activeTab === 'map' && !collapsed" class="candidate-body map-tab">
-      <slot name="map" />
-    </div>
-
-    <div v-show="activeTab === 'country' && !collapsed" class="candidate-body">
+    <div v-if="surface !== 'references'" v-show="activeTab === 'country' && !collapsed" class="candidate-body">
       <template v-if="guidedMode">
         <div v-if="guidedDataReady === false" class="candidate-empty">
           正在读取服务器保存的引导状态…
@@ -392,7 +407,7 @@ function isForeignCitySelection(): boolean {
       </template>
     </div>
 
-    <div v-if="!guidedMode" v-show="activeTab === 'city' && !collapsed" class="candidate-body">
+    <div v-if="surface !== 'references' && !guidedMode" v-show="activeTab === 'city' && !collapsed" class="candidate-body">
       <div v-if="guidedMode && guidedDataReady === false" class="candidate-empty">
         正在读取服务器保存的引导状态…
         <span class="next">加载完成前不会显示旧的城市候选</span>
@@ -461,7 +476,7 @@ function isForeignCitySelection(): boolean {
       </template>
     </div>
 
-    <div v-show="activeTab === 'reference' && !collapsed" class="candidate-body reference-tab">
+    <div v-if="surface !== 'candidates'" v-show="activeTab === 'reference' && !collapsed" class="candidate-body reference-tab">
       <div v-if="guidedMode && guidedDataReady === false" class="candidate-empty">
         正在读取服务器保存的引导状态…
       </div>

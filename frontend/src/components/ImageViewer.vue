@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import type {
   AnalyzePointRequest,
   AnalyzePurpose,
+  Clue,
   ImageRegion,
   Point,
   RegionAnalysisRecord,
@@ -10,6 +11,8 @@ import type {
   RegionReport,
 } from '@/types'
 import RegionReportPanel from '@/components/RegionReportPanel.vue'
+import { clueRegionBox } from '@/utils/clueRegion'
+import { clueSourceLabel, clueValueLabel } from '@/utils/clues'
 import { newRegionRequestId, observationBox } from '@/utils/regionAnalysis'
 
 const props = withDefaults(
@@ -23,6 +26,7 @@ const props = withDefaults(
     status: string
     statusKind: 'idle' | 'loading' | 'success' | 'error'
     disabled?: boolean
+    focusedClue?: Clue | null
   }>(),
   {
     clickPoints: () => [],
@@ -30,6 +34,7 @@ const props = withDefaults(
     selectedRegionReportId: null,
     regionRequests: () => [],
     disabled: false,
+    focusedClue: null,
   },
 )
 
@@ -78,6 +83,17 @@ const viewerTip = computed(() => {
   return '点选模式：单击图片选择点；拖拽平移，滚轮缩放；确认后点击“分析选定区域”'
 })
 const reportBox = computed(() => selectedReport.value?.bbox_norm ?? null)
+const focusedBox = computed(() => clueRegionBox(props.focusedClue))
+const focusedClueLabel = computed(() => {
+  const source = props.focusedClue ? clueSourceLabel(props.focusedClue) : ''
+  return source ? source + ' · 来源区域' : '线索来源区域'
+})
+const focusedClueTitle = computed(() => {
+  if (!props.focusedClue) return ''
+  const value = clueValueLabel(props.focusedClue.value)
+  const source = clueSourceLabel(props.focusedClue)
+  return source ? '线索：' + value + '（' + source + '）' : '线索：' + value
+})
 const evidenceBoxes = computed(() => {
   const report = selectedReport.value
   if (!report) return []
@@ -99,6 +115,43 @@ function boxStyle(bbox: { x: number; y: number; w: number; h: number } | null): 
     width: String(bbox.w * 100) + '%',
     height: String(bbox.h * 100) + '%',
   }
+}
+
+function clampScroll(value: number, maximum: number): number {
+  return Math.min(Math.max(0, value), Math.max(0, maximum))
+}
+
+/**
+ * Center the backend-provided clue source box in the scroll viewport. This is
+ * display-only: it never changes the draft selection or starts an analysis.
+ */
+function scrollToFocusedClue(): void {
+  const wrap = wrapRef.value
+  const image = imageRef.value
+  const bbox = focusedBox.value
+  if (!wrap || !image || !bbox || !image.complete || image.naturalWidth <= 0) return
+  const wrapRect = wrap.getBoundingClientRect()
+  const imageRect = image.getBoundingClientRect()
+  if (wrapRect.width <= 0 || wrapRect.height <= 0 || imageRect.width <= 0 || imageRect.height <= 0) return
+
+  const boxLeft = imageRect.left + bbox.x * imageRect.width
+  const boxTop = imageRect.top + bbox.y * imageRect.height
+  const boxWidth = bbox.w * imageRect.width
+  const boxHeight = bbox.h * imageRect.height
+  const horizontalTarget = boxWidth <= wrap.clientWidth
+    ? boxLeft + boxWidth / 2 - (wrapRect.left + wrap.clientWidth / 2)
+    : boxLeft - wrapRect.left - 8
+  const verticalTarget = boxHeight <= wrap.clientHeight
+    ? boxTop + boxHeight / 2 - (wrapRect.top + wrap.clientHeight / 2)
+    : boxTop - wrapRect.top - 8
+
+  wrap.scrollLeft = clampScroll(wrap.scrollLeft + horizontalTarget, wrap.scrollWidth - wrap.clientWidth)
+  wrap.scrollTop = clampScroll(wrap.scrollTop + verticalTarget, wrap.scrollHeight - wrap.clientHeight)
+}
+
+async function onImageLoad(): Promise<void> {
+  await nextTick()
+  scrollToFocusedClue()
 }
 
 function pointFromEvent(event: MouseEvent): Point | null {
@@ -266,6 +319,15 @@ watch(
   },
 )
 
+watch(
+  focusedBox,
+  async () => {
+    await nextTick()
+    scrollToFocusedClue()
+  },
+  { flush: 'post' },
+)
+
 onMounted(() => {
   window.addEventListener('keydown', onKeydown)
   window.addEventListener('mousemove', onMouseMove)
@@ -337,6 +399,7 @@ onBeforeUnmount(() => {
                 ref="imageRef"
                 :src="imageUrl ?? undefined"
                 alt="上传图片大图"
+                @load="onImageLoad"
                 @mousedown="onMouseDown"
                 @click="onImageClick"
               >
@@ -373,6 +436,20 @@ onBeforeUnmount(() => {
                   :class="`kind-${box.kind}`"
                   :style="boxStyle(box.bbox)"
                 />
+                <span
+                  v-if="focusedBox"
+                  class="focused-clue-box"
+                  :class="{
+                    'label-inside': focusedBox.y < 0.04,
+                    'label-right': focusedBox.x + focusedBox.w > 0.75,
+                  }"
+                  :style="boxStyle(focusedBox)"
+                  :title="focusedClueTitle"
+                  :aria-label="focusedClueLabel"
+                  role="img"
+                >
+                  <span class="focused-clue-label">{{ focusedClueLabel }}</span>
+                </span>
               </div>
             </div>
           </div>
@@ -397,3 +474,58 @@ onBeforeUnmount(() => {
     </div>
   </div>
 </template>
+
+<style scoped>
+.focused-clue-box {
+  position: absolute;
+  z-index: 3;
+  box-sizing: border-box;
+  border: 3px solid #d97706;
+  background: rgba(245, 158, 11, 0.16);
+  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.9), 0 0 18px rgba(180, 83, 9, 0.55);
+  pointer-events: none;
+  animation: clue-source-pulse 1.2s ease-out 1;
+}
+
+.focused-clue-label {
+  position: absolute;
+  left: 2px;
+  bottom: calc(100% + 2px);
+  max-width: min(240px, 70vw);
+  overflow: hidden;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: #92400e;
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.focused-clue-box.label-inside .focused-clue-label {
+  top: 2px;
+  bottom: auto;
+}
+
+.focused-clue-box.label-right .focused-clue-label {
+  right: 2px;
+  left: auto;
+}
+
+@keyframes clue-source-pulse {
+  0% {
+    box-shadow: 0 0 0 2px #fff, 0 0 0 8px rgba(217, 119, 6, 0.35);
+  }
+  100% {
+    box-shadow: 0 0 0 2px #fff, 0 0 18px rgba(180, 83, 9, 0.55);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .focused-clue-box {
+    animation: none;
+  }
+}
+</style>

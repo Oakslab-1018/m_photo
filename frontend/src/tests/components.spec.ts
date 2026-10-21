@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest'
 import ChatLog from '@/components/ChatLog.vue'
 import ClueList from '@/components/ClueList.vue'
 import FeedbackBar from '@/components/FeedbackBar.vue'
+import ImageViewer from '@/components/ImageViewer.vue'
 import type { Clue } from '@/types'
 import { clueIdentity } from '@/utils/clues'
 
@@ -31,12 +32,14 @@ describe('ClueList rendering (SSR)', () => {
     expect(html).toContain('文字语言')
     expect(html).toContain('招牌文字')
     expect(html).toContain('mystery_dimension')
-    expect(html).toMatch(/<strong>3<\/strong> 个维度/)
-    expect(html).toMatch(/<strong>8<\/strong> 条线索/)
+    expect(html).toMatch(/<strong[^>]*>3<\/strong> 个维度/)
+    expect(html).toMatch(/<strong[^>]*>8<\/strong> 条线索/)
     expect(html).toContain('展开其余 2 条')
     expect(html).toContain('用户补充')
     expect(html).toContain('OCR 识别')
-    expect(html).toContain('置信度 70%')
+    expect(html).toContain('识别置信度 70%')
+    expect(html).toContain('线索置信度 90%')
+    expect(html).toContain('不代表地点概率')
   })
 
   it('marks reference-only clues and catalog-validated clues distinctly', async () => {
@@ -93,6 +96,100 @@ describe('ClueList rendering (SSR)', () => {
     expect(html).toContain('新线索')
     expect(html).toMatch(/class="[^"]*is-new[^"]*"/)
     expect(html).not.toContain('展开其余')
+  })
+
+  it('keeps short evidence visible and puts long evidence behind details', async () => {
+    const html = await render(ClueList, {
+      clues: [
+        {
+          dimension: 'signage',
+          value: '短证据线索',
+          confidence: 0.8,
+          source: 'ocr',
+          evidence: '这是一条简短证据',
+        },
+        {
+          dimension: 'signage',
+          value: '长证据线索',
+          confidence: 0.7,
+          source: 'ocr',
+          evidence: '这是一条需要折叠展示的长证据。'.repeat(10),
+        },
+      ],
+    })
+
+    expect(html).toMatch(/class="ev"[^>]*>这是一条简短证据/)
+    expect(html).toContain('class="clue-evidence-details"')
+    expect(html).toMatch(/<summary[^>]*>查看证据详情<\/summary>/)
+  })
+
+  it('offers source-region jumps only for valid backend boxes', async () => {
+    const html = await render(ClueList, {
+      clues: [
+        {
+          dimension: 'signage',
+          value: '精确框线索',
+          confidence: 0.8,
+          source: 'ocr',
+          extra: { bbox_norm: { x: 0.1, y: 0.2, w: 0.3, h: 0.15 } },
+        },
+        {
+          dimension: 'road',
+          value: '区域框线索',
+          confidence: 0.6,
+          source: 'semantic',
+          extra: { region_bbox_norm: { x: 0.05, y: 0.1, w: 0.5, h: 0.4 } },
+        },
+        {
+          dimension: 'vehicle',
+          value: '无框线索',
+          confidence: 0.5,
+          source: 'model',
+          extra: { bbox_norm: { x: 0.8, y: 0.8, w: 0.3, h: 0.3 } },
+        },
+      ],
+    })
+
+    expect(html.match(/查看原图位置/g)).toHaveLength(2)
+    expect(html).toContain('查看原图位置')
+  })
+})
+
+describe('ImageViewer evidence focus (SSR)', () => {
+  const focusedClue: Clue = {
+    dimension: 'signage',
+    value: '出口',
+    confidence: 0.82,
+    source: 'ocr',
+    extra: { bbox_norm: { x: 0.2, y: 0.25, w: 0.25, h: 0.12 }, region_id: 'ra_test' },
+  }
+
+  it('renders a visibly labelled source box for a focused clue without creating a selection', async () => {
+    const html = await render(ImageViewer, {
+      imageUrl: '/media/photo.jpg',
+      analyzing: false,
+      status: '',
+      statusKind: 'idle',
+      focusedClue,
+    })
+
+    expect(html).toContain('class="focused-clue-box"')
+    expect(html).toContain('OCR 识别 · 来源区域')
+    expect(html).toContain('线索：出口（OCR 识别）')
+    expect(html).toContain('尚未选择区域')
+  })
+
+  it('does not render source geometry when the focused clue has no real box', async () => {
+    const html = await render(ImageViewer, {
+      imageUrl: '/media/photo.jpg',
+      analyzing: false,
+      status: '',
+      statusKind: 'idle',
+      focusedClue: { ...focusedClue, extra: { region_id: 'ra_without_geometry' } },
+    })
+
+    expect(html).not.toContain('class="focused-clue-box"')
+    expect(html).not.toContain('来源区域')
   })
 })
 

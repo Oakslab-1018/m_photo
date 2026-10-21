@@ -15,6 +15,7 @@ import {
   isReferenceOnly,
   type ClueGroup,
 } from '@/utils/clues'
+import { clueRegionBox } from '@/utils/clueRegion'
 
 const props = defineProps<{
   clues: Clue[]
@@ -23,8 +24,13 @@ const props = defineProps<{
   recentClueKeys?: string[]
 }>()
 
+const emit = defineEmits<{
+  'locate-clue': [clue: Clue]
+}>()
+
 /** OCR can emit one clue per line; long groups stay capped behind an expand button. */
 const ITEM_LIMIT = 4
+const EVIDENCE_PREVIEW_LIMIT = 96
 
 const groups = computed(() => groupClues(props.clues))
 const totalCount = computed(() => groups.value.reduce((total, group) => total + group.items.length, 0))
@@ -121,6 +127,24 @@ function previewFor(group: ClueGroup): { visible: Clue[]; hiddenCount: number } 
 function toggleExpanded(dimension: string): void {
   expanded.value = { ...expanded.value, [dimension]: !expanded.value[dimension] }
 }
+
+function confidenceLabel(clue: Clue): string {
+  return clueProvenance(clue) === 'ocr' ? '识别置信度' : '线索置信度'
+}
+
+function evidenceText(clue: Clue): string {
+  return typeof clue.evidence === 'string' ? clue.evidence.trim() : ''
+}
+
+function isLongEvidence(clue: Clue): boolean {
+  const text = evidenceText(clue)
+  return text.length > EVIDENCE_PREVIEW_LIMIT || text.split(/\r?\n/).length > 2
+}
+
+function locateClue(clue: Clue): void {
+  if (!clueRegionBox(clue)) return
+  emit('locate-clue', clue)
+}
 </script>
 
 <template>
@@ -154,24 +178,40 @@ function toggleExpanded(dimension: string): void {
             :data-clue-key="clueIdentity(clue.dimension, clue.value)"
           >
             <div class="val">
-              {{ clueValueLabel(clue.value) }}
-              <span v-if="isRecentClue(clue)" class="tag new">新线索</span>
+              <span class="clue-value">{{ clueValueLabel(clue.value) }}</span>
+              <span class="clue-tags">
+                <span v-if="isRecentClue(clue)" class="tag new">新线索</span>
+                <span
+                  v-if="clueSourceLabel(clue)"
+                  class="tag source"
+                  :data-provenance="clueProvenance(clue)"
+                  :title="clue.source || undefined"
+                >{{ clueSourceLabel(clue) }}</span>
+                <span v-if="isReferenceOnly(clue)" class="tag reference-only" title="仅作观察展示，不参与排序">仅供参考</span>
+                <span v-else-if="isCatalogValidated(clue)" class="tag validated" title="已按国家目录核对">目录已核对</span>
+              </span>
             </div>
-            <div class="conf">
+            <div class="conf" title="置信度表示线索识别或推断的可靠度，不代表地点概率">
               <span class="conf-bar" aria-hidden="true">
                 <span class="conf-fill" :style="{ width: confidencePercent(clue.confidence) }" />
               </span>
-              <span>置信度 {{ confidencePercent(clue.confidence) }}</span>
-              <span
-                v-if="clueSourceLabel(clue)"
-                class="tag source"
-                :data-provenance="clueProvenance(clue)"
-                :title="clue.source || undefined"
-              >{{ clueSourceLabel(clue) }}</span>
-              <span v-if="isReferenceOnly(clue)" class="tag reference-only" title="仅作观察展示，不参与排序">仅供参考</span>
-              <span v-else-if="isCatalogValidated(clue)" class="tag validated" title="已按国家目录核对">目录已核对</span>
+              <span>{{ confidenceLabel(clue) }} {{ confidencePercent(clue.confidence) }}</span>
             </div>
-            <div v-if="clue.evidence" class="ev">{{ clue.evidence }}</div>
+            <div v-if="clueRegionBox(clue)" class="clue-actions">
+              <button
+                type="button"
+                class="locate-clue"
+                title="在原始图片中定位后端标注的线索来源区域"
+                @click.stop="locateClue(clue)"
+              >查看原图位置</button>
+            </div>
+            <template v-if="evidenceText(clue)">
+              <p v-if="!isLongEvidence(clue)" class="ev">{{ evidenceText(clue) }}</p>
+              <details v-else class="clue-evidence-details">
+                <summary>查看证据详情</summary>
+                <p class="ev">{{ evidenceText(clue) }}</p>
+              </details>
+            </template>
           </article>
           <button
             v-if="previewFor(group).hiddenCount"
@@ -194,3 +234,68 @@ function toggleExpanded(dimension: string): void {
     </template>
   </div>
 </template>
+
+<style scoped>
+.clue-card .val {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.clue-value {
+  overflow-wrap: anywhere;
+}
+
+.clue-tags {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.clue-card .conf {
+  margin-top: 3px;
+}
+
+.clue-actions {
+  display: flex;
+  margin-top: 4px;
+}
+
+.locate-clue {
+  border: 1px solid var(--primary-soft);
+  border-radius: 999px;
+  background: var(--primary-soft);
+  color: var(--primary-dark);
+  cursor: pointer;
+  font-size: 10px;
+  line-height: 1.3;
+  padding: 3px 9px;
+}
+
+.locate-clue:hover,
+.locate-clue:focus-visible {
+  border-color: var(--primary);
+  outline: none;
+}
+
+.clue-evidence-details {
+  margin-top: 4px;
+}
+
+.clue-evidence-details summary {
+  width: fit-content;
+  color: var(--primary);
+  cursor: pointer;
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.clue-evidence-details .ev {
+  margin-bottom: 0;
+  padding-left: 8px;
+  border-left: 2px solid var(--border);
+}
+</style>

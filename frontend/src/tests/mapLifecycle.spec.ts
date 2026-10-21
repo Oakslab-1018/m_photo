@@ -5,6 +5,7 @@ import {
   type MapLike,
   type MapPoint,
   type MarkerLike,
+  type ViewportInsets,
 } from '@/composables/useMapLibre'
 
 interface FakeMarker extends MarkerLike {
@@ -19,6 +20,10 @@ interface FakeMap extends MapLike {
   controls: unknown[]
   fits: Array<{ bounds: unknown; options: unknown }>
   eases: Record<string, unknown>[]
+  paddings: ViewportInsets[]
+  padding: ViewportInsets
+  center: [number, number]
+  zoom: number
   markers: FakeMarker[]
   removed: boolean
   fire(type: string, event?: unknown): void
@@ -31,6 +36,10 @@ function fakeNamespace(): { api: MapLibreNamespace; last: () => FakeMap } {
     controls: unknown[] = []
     fits: Array<{ bounds: unknown; options: unknown }> = []
     eases: Record<string, unknown>[] = []
+    paddings: ViewportInsets[] = []
+    padding: ViewportInsets = { top: 0, right: 0, bottom: 0, left: 0 }
+    center: [number, number] = [0, 20]
+    zoom = 1
     markers: FakeMarker[] = []
     removed = false
     constructor(public options: Record<string, unknown>) {
@@ -50,6 +59,12 @@ function fakeNamespace(): { api: MapLibreNamespace; last: () => FakeMap } {
     }
     easeTo(options: Record<string, unknown>): this {
       this.eases.push(options)
+      return this
+    }
+    setPadding(padding: ViewportInsets): this {
+      const next = { ...padding }
+      this.paddings.push(next)
+      this.padding = next
       return this
     }
     remove(): void {
@@ -169,6 +184,99 @@ describe('createMapLifecycle', () => {
     lifecycle.dispose()
   })
 
+  it('fits multiple points inside asymmetric viewport insets with content margin once', () => {
+    const { api, last } = fakeNamespace()
+    const viewportInsets = { top: 72, right: 32, bottom: 220, left: 320 }
+    const lifecycle = createMapLifecycle(api, {
+      container: stubContainer(),
+      styleUrl: 'demo',
+      createMarkerElement: elementFor,
+      viewportInsets,
+    })
+    const map = last()
+
+    expect(map.padding).toEqual(viewportInsets)
+    lifecycle.fitToPoints(
+      [
+        point({ key: 'country:JP', lng: 138.25, lat: 36.2 }),
+        point({ key: 'country:CN', iso: 'CN', lng: 104.2, lat: 35.8 }),
+      ],
+      { padding: 36, maxZoom: 4 },
+    )
+
+    expect(map.fits.at(-1)?.options).toEqual({
+      padding: 36,
+      maxZoom: 4,
+      duration: 0,
+      absolutePadding: false,
+    })
+    lifecycle.dispose()
+  })
+
+  it('honors asymmetric viewport insets for a single fit point and focusPoint', () => {
+    const { api, last } = fakeNamespace()
+    const viewportInsets = { top: 48, right: 140, bottom: 96, left: 280 }
+    const lifecycle = createMapLifecycle(api, {
+      container: stubContainer(),
+      styleUrl: 'demo',
+      createMarkerElement: elementFor,
+      viewportInsets,
+    })
+    const map = last()
+    const japan = point()
+
+    lifecycle.fitToPoints([japan], { singleZoom: 8 })
+    expect(map.eases.at(-1)).toMatchObject({
+      center: [japan.lng, japan.lat],
+      zoom: 8,
+      duration: 0,
+      padding: viewportInsets,
+    })
+
+    lifecycle.focusPoint(point({ key: 'city:tokyo', kind: 'city', lng: 139.69, lat: 35.68 }), {
+      zoom: 11,
+    })
+    expect(map.eases.at(-1)).toMatchObject({
+      center: [139.69, 35.68],
+      zoom: 11,
+      padding: viewportInsets,
+    })
+    lifecycle.dispose()
+  })
+
+  it('updates viewport insets without refitting or moving the current camera', () => {
+    const { api, last } = fakeNamespace()
+    const lifecycle = createMapLifecycle(api, {
+      container: stubContainer(),
+      styleUrl: 'demo',
+      createMarkerElement: elementFor,
+      viewportInsets: { top: 0, right: 0, bottom: 0, left: 0 },
+    })
+    const map = last()
+    lifecycle.fitToPoints([point(), point({ key: 'country:CN', iso: 'CN', lng: 104.2 })])
+    const fitCount = map.fits.length
+    const easeCount = map.eases.length
+    map.center = [121.5, 31.2]
+    map.zoom = 6
+
+    const nextInsets = { top: 64, right: 180, bottom: 260, left: 340 }
+    lifecycle.setViewportInsets(nextInsets)
+
+    expect(map.paddings.at(-1)).toEqual(nextInsets)
+    expect(map.fits).toHaveLength(fitCount)
+    expect(map.eases).toHaveLength(easeCount)
+    expect(map.center).toEqual([121.5, 31.2])
+    expect(map.zoom).toBe(6)
+    expect(lifecycle.getViewportInsets()).toEqual(nextInsets)
+
+    lifecycle.setViewportInsets({ ...nextInsets })
+    expect(map.paddings).toHaveLength(2)
+
+    lifecycle.focusPoint(point({ lng: 121.47, lat: 31.23 }), { zoom: 9 })
+    expect(map.eases.at(-1)).toMatchObject({ padding: nextInsets })
+    lifecycle.dispose()
+  })
+
   it('ignores renders after dispose and is idempotent', () => {
     const { api, last } = fakeNamespace()
     const lifecycle = createMapLifecycle(api, {
@@ -180,6 +288,7 @@ describe('createMapLifecycle', () => {
     lifecycle.dispose()
     lifecycle.renderMarkers([point()])
     lifecycle.fitToPoints([point()])
+    lifecycle.setViewportInsets({ top: 10, right: 20, bottom: 30, left: 40 })
     const map = last()
     expect(map.markers).toHaveLength(0)
     expect(map.fits).toHaveLength(0)

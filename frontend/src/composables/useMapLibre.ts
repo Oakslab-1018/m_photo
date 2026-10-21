@@ -11,6 +11,7 @@ export interface MapLike {
   addControl(control: unknown, position?: string): unknown
   fitBounds(bounds: [[number, number], [number, number]], options?: Record<string, unknown>): unknown
   easeTo(options: Record<string, unknown>): unknown
+  setPadding(padding: ViewportInsets): unknown
   remove(): void
 }
 
@@ -53,6 +54,7 @@ export interface MapPoint {
 }
 
 export interface FitToPointsOptions {
+  /** Extra breathing room inside the current viewport insets. */
   padding?: number
   maxZoom?: number
   /** Zoom used for a single point; singlePointZoom is an accepted alias. */
@@ -66,10 +68,20 @@ export interface FocusPointOptions {
   duration?: number
 }
 
+/** Screen-space area covered by floating UI, measured against the map canvas. */
+export interface ViewportInsets {
+  top: number
+  right: number
+  bottom: number
+  left: number
+}
+
 export interface MapLifecycleOptions {
   container: HTMLElement
   styleUrl: string
   createMarkerElement: (point: MapPoint) => HTMLElement
+  /** Initial overlay safe area. Can be updated without changing the camera. */
+  viewportInsets?: ViewportInsets
   onLoad?: () => void
   onError?: (error: unknown) => void
 }
@@ -79,8 +91,35 @@ export interface MapLifecycle {
   renderMarkers(points: readonly MapPoint[]): void
   fitToPoints(points: readonly MapPoint[], options?: FitToPointsOptions): void
   focusPoint(point: MapPoint, options?: FocusPointOptions): void
+  setViewportInsets(insets: ViewportInsets): void
+  getViewportInsets(): ViewportInsets
   markers(): readonly MarkerLike[]
   dispose(): void
+}
+
+function normalizedInset(value: number): number {
+  return Number.isFinite(value) ? Math.max(0, Math.round(value)) : 0
+}
+
+/** Normalize an untrusted DOM measurement before handing it to MapLibre. */
+export function normalizeViewportInsets(
+  insets: Partial<ViewportInsets> | null | undefined,
+): ViewportInsets {
+  return {
+    top: normalizedInset(insets?.top ?? 0),
+    right: normalizedInset(insets?.right ?? 0),
+    bottom: normalizedInset(insets?.bottom ?? 0),
+    left: normalizedInset(insets?.left ?? 0),
+  }
+}
+
+function sameInsets(left: ViewportInsets, right: ViewportInsets): boolean {
+  return (
+    left.top === right.top &&
+    left.right === right.right &&
+    left.bottom === right.bottom &&
+    left.left === right.left
+  )
 }
 
 /** Build the MapLibre map plus marker/control lifecycle used by GeoMap.vue. */
@@ -107,6 +146,13 @@ export function createMapLifecycle(
 
   let active: MarkerLike[] = []
   let disposed = false
+  let viewportInsets = normalizeViewportInsets(options.viewportInsets)
+
+  // MapLibre's edge insets shift the vanishing point without changing the
+  // geographic camera center. Keeping this as the map's persistent padding lets
+  // fitBounds add its own content margin exactly once (padding is additive by
+  // default) and lets inset updates preserve manual pans and zoom.
+  map.setPadding({ ...viewportInsets })
 
   function renderMarkers(points: readonly MapPoint[]): void {
     if (disposed) return
@@ -127,7 +173,12 @@ export function createMapLifecycle(
     const duration = options.duration ?? 0
     if (bounds.west === bounds.east && bounds.south === bounds.north) {
       const zoom = options.singlePointZoom ?? options.singleZoom ?? 3
-      map.easeTo({ center: [bounds.west, bounds.south], zoom, duration })
+      map.easeTo({
+        center: [bounds.west, bounds.south],
+        zoom,
+        duration,
+        padding: { ...viewportInsets },
+      })
       return
     }
     map.fitBounds(
@@ -135,7 +186,8 @@ export function createMapLifecycle(
         [bounds.west, bounds.south],
         [bounds.east, bounds.north],
       ],
-      { padding, maxZoom, duration },
+      // MapLibre adds this value to the persistent viewport padding above.
+      { padding, maxZoom, duration, absolutePadding: false },
     )
   }
 
@@ -145,7 +197,18 @@ export function createMapLifecycle(
       center: [point.lng, point.lat],
       zoom: options.zoom ?? 3,
       duration: options.duration ?? 0,
+      padding: { ...viewportInsets },
     })
+  }
+
+  function setViewportInsets(nextInsets: ViewportInsets): void {
+    if (disposed) return
+    const next = normalizeViewportInsets(nextInsets)
+    if (sameInsets(viewportInsets, next)) return
+    viewportInsets = next
+    // Do not fit/ease here: this must preserve the user's current camera while
+    // moving its visible center into the newly uncovered part of the canvas.
+    map.setPadding({ ...viewportInsets })
   }
 
   return {
@@ -153,6 +216,8 @@ export function createMapLifecycle(
     renderMarkers,
     fitToPoints,
     focusPoint,
+    setViewportInsets,
+    getViewportInsets: () => ({ ...viewportInsets }),
     markers: () => active,
     dispose(): void {
       if (disposed) return

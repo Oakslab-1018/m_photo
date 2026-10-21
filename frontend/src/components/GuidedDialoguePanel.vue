@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import PlaceMatchEvidence from '@/components/PlaceMatchEvidence.vue'
 import type {
   ConfidenceRoute,
@@ -121,6 +121,23 @@ const emit = defineEmits<{
 
 const backtrackPrompt = ref<GuidedLocationLevel | null>(null)
 const panelRef = ref<HTMLElement | null>(null)
+let headerResizeObserver: ResizeObserver | null = null
+
+// Native focus/scrollIntoView must leave controls below the sticky task header.
+onMounted(() => {
+  const panel = panelRef.value
+  const header = panel?.querySelector<HTMLElement>('.guided-dock-header')
+  if (!panel || !header) return
+  const measureHeader = () => {
+    panel.style.setProperty('--guided-header-height', `${Math.ceil(header.getBoundingClientRect().height) + 8}px`)
+  }
+  measureHeader()
+  if (typeof ResizeObserver !== 'undefined') {
+    headerResizeObserver = new ResizeObserver(measureHeader)
+    headerResizeObserver.observe(header)
+  }
+})
+onBeforeUnmount(() => headerResizeObserver?.disconnect())
 const searchInputRef = ref<HTMLInputElement | null>(null)
 const questionSectionRef = ref<HTMLElement | null>(null)
 const candidateSectionRef = ref<HTMLElement | null>(null)
@@ -227,6 +244,21 @@ const nextStepLabel = computed(() =>
   stage.value === 'resolved' ? '' : `下一步：查看${locationLevelLabel(stage.value)}候选`,
 )
 
+const currentTaskLabel = computed(() => {
+  if (isResolved.value) return '定位完成'
+  if (countryShortcut.value) {
+    return props.confidence?.tier === 'low' ? '核对可选候选' : '确认国家推荐'
+  }
+  if (props.phase === 'candidates') return stage.value === 'city' ? '确认城市' : '确认国家 / 地区'
+  if (isReviewClueQuestion.value) {
+    const progress = reviewProgress.value
+    return progress ? `核对观察 ${progress.current}/${progress.total}` : '核对观察'
+  }
+  if (blockingQuestion.value) return guidedQuestionTitle(blockingQuestion.value)
+  if (pendingClueCount.value > 0) return `待核对 ${pendingClueCount.value} 条`
+  return reviewReady.value ? '查看候选' : '核对观察'
+})
+
 const progressText = computed(() => {
   if (isResolved.value) return '2 / 2 · 已完成'
   const current = GUIDED_STEPS.findIndex((step) => step.level === stage.value)
@@ -321,7 +353,7 @@ const questionReason = computed(() => {
   const question = pendingQuestion.value
   return question ? guidedQuestionReason(question) : ''
 })
-const composerAssistantMessage = computed(() => {
+const latestAssistantMessage = computed(() => {
   if (isResolved.value) {
     return safeGuidedText(props.action?.message).trim()
       || '定位已完成；如发现新线索，仍可继续补充。'
@@ -370,7 +402,7 @@ const composerStatusText = computed(() => {
     return `${reason || '这次提交还没有明确回执'} · 草稿已保留，请核对最新状态后再试。`
   }
   if (submission.status === 'unchanged') {
-    return '这条线索之前已经记录过，无需重复提交。'
+    return '这条线索已记录，无需重复添加。'
   }
   return composerReceiptText.value
     ? `助手反馈：${composerReceiptText.value}`
@@ -383,7 +415,9 @@ function scrollPanelTo(target: HTMLElement | null): void {
   if (!panel || !target) return
   const panelRect = panel.getBoundingClientRect()
   const targetRect = target.getBoundingClientRect()
-  const nextTop = panel.scrollTop + targetRect.top - panelRect.top
+  const header = panel.querySelector<HTMLElement>('.guided-dock-header')
+  const headerOffset = header?.offsetHeight ?? 0
+  const nextTop = panel.scrollTop + targetRect.top - panelRect.top - headerOffset
   const maxTop = Math.max(0, panel.scrollHeight - panel.clientHeight)
   panel.scrollTop = Math.min(Math.max(0, nextTop), maxTop)
 }
@@ -466,376 +500,455 @@ watch(stage, (nextStage, previousStage) => {
 
 <template>
   <section class="guided-dialogue-shell">
-    <div ref="panelRef" class="guided-panel" aria-live="polite">
-    <div class="guided-panel-head">
-      <div>
-        <span class="guided-kicker">引导定位</span>
-        <h2>{{ stageTitle }}</h2>
-      </div>
-      <div class="guided-panel-head-actions">
-        <span class="guided-progress">{{ progressText }}</span>
-        <button
-          v-if="previousLevel && dialogue"
-          type="button"
-          class="ghost-btn guided-back-btn"
-          :disabled="busy"
-          :title="`回到上一层级：${locationLevelLabel(previousLevel)}（保留其他证据与排除）`"
-          @click="emit('backtrack', previousLevel)"
-        >
-          返回上一步：{{ locationLevelLabel(previousLevel) }}
-        </button>
-      </div>
-    </div>
-
-    <div v-if="displayError" class="guided-error" role="alert">
-      <p>{{ displayError }}</p>
-      <button type="button" class="ghost-btn" :disabled="busy" @click="requestRetry">
-        {{ canRetry ? '重试上次操作' : '重新加载' }}
-      </button>
-    </div>
-
-    <div v-if="loading && !dialogue" class="guided-loading">
-      正在读取服务器保存的引导状态…
-    </div>
-
-    <template v-else-if="dialogue">
-      <div v-if="receipt?.summary || receipt?.status" class="guided-receipt" role="status">
-        {{ receiptStatusText }}
-      </div>
-
-      <div v-if="isResolved" class="guided-resolved">
-        <span class="guided-resolved-label">最终结果</span>
-        <strong>{{ targetLabel(dialogue.confirmed.city) }}</strong>
-        <p>已根据您的确认完成定位；城市坐标仅为代表点，不是照片 GPS。</p>
-      </div>
-
-      <ol class="guided-path" aria-label="已确认路径">
-        <li
-          v-for="(step, index) in pathSteps"
-          :key="step.level"
-          :class="`is-${step.state}`"
-        >
-          <span class="guided-step-index">{{ index + 1 }}</span>
-          <div class="guided-step-main">
-            <span class="guided-step-label">{{ step.label }}</span>
-            <strong>{{ step.target ? targetLabel(step.target) : '待确认' }}</strong>
-          </div>
-          <button
-            v-if="step.target && !busy"
-            type="button"
-            class="guided-backtrack-btn"
-            :title="`返回${step.label}会清除后续确认`"
-            @click="requestBacktrack(step.level)"
-          >
-            返回此步
-          </button>
-        </li>
-      </ol>
-
-      <div v-if="backtrackPrompt" class="guided-backtrack-confirm" role="alert">
-        <span>返回此步会清除它后面已经确认的层级，确定继续？</span>
-        <div>
-          <button type="button" class="ghost-btn" :disabled="busy" @click="backtrackPrompt = null">取消</button>
-          <button type="button" class="mini-btn reject" :disabled="busy" @click="confirmBacktrack">确认返回</button>
-        </div>
-      </div>
-
-      <section
-        v-if="!isResolved && countryShortcut"
-        class="guided-confidence-result"
-        :class="'is-' + countryShortcut"
-      >
-        <div class="guided-confidence-head">
-          <div>
-            <span class="guided-confidence-kicker">国家 / 地区预测</span>
-            <strong>{{ shortcutTitle }}</strong>
-          </div>
-          <span class="guided-confidence-note">{{ shortcutNote }}</span>
-        </div>
-        <p class="guided-confidence-explanation">{{ shortcutExplanation }}</p>
-
-        <article
-          v-for="candidate in shortcutCandidates"
-          :key="candidateTargetKey(candidate.target)"
-          class="guided-candidate-card guided-confidence-card"
-          :class="{ selected: isCandidateSelected(candidate.target) }"
-          :tabindex="busy ? -1 : 0"
-          :aria-current="isCandidateSelected(candidate.target) ? 'true' : undefined"
-          @click="selectCandidate(candidate.target)"
-          @keydown.enter.prevent="selectCandidate(candidate.target)"
-          @keydown.space.prevent="selectCandidate(candidate.target)"
-        >
-          <div class="guided-candidate-main">
-            <strong>{{ targetLabel(candidate.target) }}</strong>
-            <span class="guided-candidate-meta">{{ candidateScoreLabel(candidate) }}</span>
-            <span v-if="candidatePointLabel(candidate.target)" class="guided-candidate-point">
-              {{ candidatePointLabel(candidate.target) }}
-            </span>
-            <p v-if="candidate.reason" class="guided-candidate-reason">{{ candidate.reason }}</p>
-            <PlaceMatchEvidence v-if="candidate.place_match" :match="candidate.place_match" />
-          </div>
-          <div class="guided-candidate-actions">
-            <button
-              type="button"
-              class="mini-btn confirm"
-              :disabled="busy || !locationConfirmationReady"
-              @click.stop="emit('confirm-location', candidate.target)"
-            >
-              确认{{ locationLevelLabel(candidate.target.level) }}
-            </button>
-            <button
-              type="button"
-              class="mini-btn reject"
-              :disabled="busy || !locationConfirmationReady"
-              @click.stop="emit('reject-location', candidate.target)"
-            >
-              排除{{ locationLevelLabel(candidate.target.level) }}
-            </button>
-          </div>
-        </article>
-
-        <div v-if="!shortcutCandidates.length" class="guided-empty">
-          服务器候选暂未就绪，请重新加载；页面不会自行拼装地点。
-        </div>
-        <div class="guided-confidence-actions">
-          <button
-            v-if="countryShortcut === 'high'"
-            type="button"
-            class="ghost-btn"
-            :disabled="busy"
-            @click="focusFreeText"
-          >
-            补充线索细化
-          </button>
-          <span>{{ shortcutFooter }}</span>
-        </div>
-      </section>
-
-      <section
-        v-if="!isResolved && !countryShortcut"
-        ref="questionSectionRef"
-        class="guided-question"
-      >
-        <template v-if="phase === 'review'">
-          <div v-if="showLowCluePrompt" class="guided-low-confidence-note">
-            <strong>当前信息不足，先补充可观察线索</strong>
-            <span>请回答下面的问题，或在下方输入文字线索；提交后会重新比较国家候选，不会自动确认地点。</span>
-          </div>
-          <div v-if="isReviewClueQuestion" class="guided-review-box">
-            <div class="guided-section-head">
-              <span class="guided-section-title">核对观察</span>
-              <span v-if="reviewProgress" class="guided-review-progress">
-                第 {{ reviewProgress.current }} / {{ reviewProgress.total }}
+    <div ref="panelRef" class="guided-panel">
+      <header class="guided-dock-header">
+        <div class="guided-panel-head">
+          <div class="guided-title-block">
+            <span class="guided-kicker">引导定位</span>
+            <div class="guided-title-row">
+              <h2 id="guided-stage-heading">{{ stageTitle }}</h2>
+              <span class="guided-task-pill" role="status" aria-live="polite">
+                {{ currentTaskLabel }}
               </span>
-              <span v-else class="guided-one-question">本轮仅此一条观察</span>
             </div>
-            <template v-if="currentReviewClue">
-              <p class="guided-question-message">{{ questionMessage }}</p>
-              <p class="guided-question-reason">
-                {{ questionReason }}
-              </p>
-              <div class="guided-question-clue">
-                <strong>{{ reviewedClueText(currentReviewClue) }}</strong>
-                <span>{{ currentReviewClue.description || '未提供详细说明' }}</span>
-                <span v-if="isRecentClue(currentReviewClue.id)" class="guided-clue-new">新线索</span>
+          </div>
+          <div class="guided-panel-head-actions">
+            <span class="guided-progress">{{ progressText }}</span>
+            <button
+              v-if="previousLevel && dialogue"
+              type="button"
+              class="ghost-btn guided-back-btn"
+              :disabled="busy"
+              :title="`回到上一层级：${locationLevelLabel(previousLevel)}（保留其他证据与排除）`"
+              @click="emit('backtrack', previousLevel)"
+            >
+              返回上一步：{{ locationLevelLabel(previousLevel) }}
+            </button>
+          </div>
+        </div>
+
+        <ol class="guided-path" aria-label="已确认路径">
+          <li
+            v-for="(step, index) in pathSteps"
+            :key="step.level"
+            :class="`is-${step.state}`"
+          >
+            <span class="guided-step-index" aria-hidden="true">{{ index + 1 }}</span>
+            <span class="guided-step-main">
+              <span class="guided-step-label">{{ step.label }}</span>
+              <strong>{{ step.target ? targetLabel(step.target) : '待确认' }}</strong>
+            </span>
+            <button
+              v-if="step.target && !busy"
+              type="button"
+              class="guided-backtrack-btn"
+              :title="`返回${step.label}会清除后续确认`"
+              :aria-label="`返回${step.label}，会清除后续确认`"
+              @click="requestBacktrack(step.level)"
+            >
+              返回
+            </button>
+          </li>
+        </ol>
+
+        <details
+          v-if="dialogue && latestAssistantMessage"
+          class="guided-task-message"
+        >
+          <summary>
+            <span class="guided-task-message-label">最新助手提示</span>
+            <span class="guided-task-message-toggle" aria-hidden="true">详情</span>
+          </summary>
+          <p>{{ latestAssistantMessage }}</p>
+        </details>
+
+        <div v-if="backtrackPrompt" class="guided-backtrack-confirm" role="alert">
+          <span>返回此步会清除它后面已经确认的层级，确定继续？</span>
+          <div>
+            <button type="button" class="ghost-btn" :disabled="busy" @click="backtrackPrompt = null">
+              取消
+            </button>
+            <button type="button" class="mini-btn reject" :disabled="busy" @click="confirmBacktrack">
+              确认返回
+            </button>
+          </div>
+        </div>
+      </header>
+
+      <div class="guided-main">
+        <div v-if="displayError" class="guided-error" role="alert">
+          <p>{{ displayError }}</p>
+          <button type="button" class="ghost-btn" :disabled="busy" @click="requestRetry">
+            {{ canRetry ? '重试上次操作' : '重新加载' }}
+          </button>
+        </div>
+
+        <div v-if="loading && !dialogue" class="guided-loading" role="status" aria-live="polite">
+          正在读取服务器保存的引导状态…
+        </div>
+
+        <template v-else-if="dialogue">
+          <div v-if="receipt?.summary || receipt?.status" class="guided-receipt" role="status">
+            {{ receiptStatusText }}
+          </div>
+
+          <div v-if="isResolved" class="guided-resolved">
+            <span class="guided-resolved-label">最终结果</span>
+            <strong>{{ targetLabel(dialogue.confirmed.city) }}</strong>
+            <p>已根据您的确认完成定位；城市坐标仅为代表点，不是照片 GPS。</p>
+          </div>
+
+          <section
+            v-if="!isResolved && countryShortcut"
+            class="guided-confidence-result"
+            :class="'is-' + countryShortcut"
+          >
+            <div class="guided-confidence-head">
+              <div>
+                <span class="guided-confidence-kicker">国家 / 地区预测</span>
+                <strong>{{ shortcutTitle }}</strong>
               </div>
-              <div class="guided-inline-actions">
+              <span class="guided-confidence-note">{{ shortcutNote }}</span>
+            </div>
+            <p class="guided-confidence-explanation">{{ shortcutExplanation }}</p>
+
+            <article
+              v-for="(candidate, index) in shortcutCandidates"
+              :key="candidateTargetKey(candidate.target)"
+              class="guided-candidate-card guided-confidence-card"
+              :class="{ selected: isCandidateSelected(candidate.target) }"
+            >
+              <div class="guided-candidate-summary">
+                <button
+                  type="button"
+                  class="guided-candidate-select"
+                  :disabled="busy"
+                  :aria-current="isCandidateSelected(candidate.target) ? 'true' : undefined"
+                  :aria-label="`选择候选 ${index + 1}：${targetLabel(candidate.target)}，在地图查看`"
+                  @click="selectCandidate(candidate.target)"
+                >
+                  <span class="guided-candidate-number" aria-hidden="true">{{ index + 1 }}</span>
+                  <span class="guided-candidate-main">
+                    <strong>{{ targetLabel(candidate.target) }}</strong>
+                    <span class="guided-candidate-name-meta">
+                      <span class="guided-candidate-meta" :title="candidateScoreLabel(candidate)">
+                        {{ candidateScoreLabel(candidate) }}
+                      </span>
+                      <span v-if="candidatePointLabel(candidate.target)" class="guided-candidate-point">
+                        {{ candidatePointLabel(candidate.target) }}
+                      </span>
+                      <span v-else class="guided-candidate-point missing">无地图坐标</span>
+                    </span>
+                  </span>
+                </button>
+              </div>
+
+              <details
+                v-if="candidate.reason || candidate.place_match || !candidatePointLabel(candidate.target)"
+                class="guided-candidate-detail"
+              >
+                <summary>查看依据与坐标说明</summary>
+                <div class="guided-candidate-detail-body">
+                  <p v-if="candidate.reason" class="guided-candidate-reason">{{ candidate.reason }}</p>
+                  <p v-if="!candidatePointLabel(candidate.target)" class="guided-candidate-point-note">
+                    此候选无坐标，地图不放置候选标记；选中时仅聚焦已确认父级范围。
+                  </p>
+                  <PlaceMatchEvidence v-if="candidate.place_match" :match="candidate.place_match" />
+                </div>
+              </details>
+
+              <div class="guided-candidate-actions">
                 <button
                   type="button"
                   class="mini-btn confirm"
-                  :disabled="busy"
-                  @click="emit('confirm-clue', currentReviewClue.id)"
+                  :disabled="busy || !locationConfirmationReady"
+                  @click="emit('confirm-location', candidate.target)"
                 >
-                  判断准确
+                  确认{{ locationLevelLabel(candidate.target.level) }}
                 </button>
                 <button
                   type="button"
                   class="mini-btn reject"
-                  :disabled="busy"
-                  @click="emit('reject-clue', currentReviewClue.id)"
+                  :disabled="busy || !locationConfirmationReady"
+                  @click="emit('reject-location', candidate.target)"
                 >
-                  不准确
+                  排除{{ locationLevelLabel(candidate.target.level) }}
                 </button>
               </div>
+            </article>
+
+            <div v-if="!shortcutCandidates.length" class="guided-empty">
+              服务器候选暂未就绪，请重新加载；页面不会自行拼装地点。
+            </div>
+            <div class="guided-confidence-actions">
               <button
+                v-if="countryShortcut === 'high'"
                 type="button"
-                class="guided-unknown-btn"
+                class="ghost-btn"
                 :disabled="busy"
-                @click="emit('unknown')"
+                @click="focusFreeText"
               >
-                不确定 / 无法判断（不代表排除）
+                补充线索细化
               </button>
-            </template>
-            <div v-else class="guided-question-hint">
-              当前观察暂时无法显示，请重新加载后再试。
+              <span>{{ shortcutFooter }}</span>
             </div>
-          </div>
+          </section>
 
-          <div v-else-if="blockingQuestion" class="guided-review-box">
-            <div class="guided-section-head">
-              <span class="guided-section-title">{{ guidedQuestionTitle(blockingQuestion) }}</span>
-              <span class="guided-one-question">本轮仅此一问</span>
-            </div>
-            <p v-if="narratedLowQuestion" class="guided-question-reason">
-              <strong>问题说明：</strong>{{ narratedLowQuestion }}
-            </p>
-            <p class="guided-question-message">{{ questionMessage }}</p>
-            <p class="guided-question-reason">{{ guidedQuestionReason(blockingQuestion) }}</p>
-            <div v-if="answerChoiceOptions.length" class="guided-answer-options">
-              <button
-                v-for="option in answerChoiceOptions"
-                :key="option.value"
-                type="button"
-                class="option-chip"
-                :disabled="busy"
-                @click="emit('answer', { value: option.value, label: option.label })"
-              >
-                {{ option.label }}
-              </button>
-            </div>
-            <div v-else class="guided-question-hint">
-              请在下方输入可观察线索；自由文本不会直接推进确认层级。
-            </div>
-            <button
-              type="button"
-              class="guided-unknown-btn"
-              :disabled="busy"
-              @click="emit('unknown')"
-            >
-              不确定 / 跳过此问题
-            </button>
-          </div>
-
-          <div v-else-if="pendingClueCount > 0" class="guided-question-hint">
-            还有 {{ pendingClueCount }} 条观察待核对，请重新加载后再试。
-          </div>
-
-          <div v-else class="guided-next-step" role="status">
-            <div>
-              <strong>观察核对已完成</strong>
-              <span>下一步查看地点候选；选择符合照片的地点后再确认。</span>
-              <span v-if="questionMessage" class="guided-question-hint">{{ questionMessage }}</span>
-            </div>
-            <button
-              type="button"
-              class="primary-btn guided-next-step-action"
-              :disabled="busy || !reviewReady"
-              @click="emit('next-phase')"
-            >
-              {{ nextStepLabel }}
-            </button>
-          </div>
-
-          <div class="guided-review-nav">
-            <button
-              type="button"
-              class="ghost-btn"
-              :disabled="busy || !canReviewBack"
-              :title="canReviewBack ? '重新核对上一条已确认的观察' : '还没有已确认的观察'"
-              @click="emit('review-back')"
-            >
-              返回上一条观察（重新核对）
-            </button>
-          </div>
-        </template>
-      </section>
-
-      <section
-        v-if="candidatesPhase && !countryShortcut"
-        ref="candidateSectionRef"
-        class="guided-candidates"
-      >
-        <div class="guided-section-head">
-          <span class="guided-section-title">{{ candidateTitle }}</span>
-          <span class="guided-section-note">{{ candidateSectionNote }}</span>
-        </div>
-
-        <div class="guided-candidates-toolbar">
-          <button type="button" class="ghost-btn" :disabled="busy" @click="emit('back-to-review')">
-            返回核对
-          </button>
-          <button
-            type="button"
-            class="ghost-btn"
-            :disabled="busy || !canReviewBack"
-            :title="canReviewBack ? '重新核对上一条已确认的观察' : '还没有已确认的观察'"
-            @click="emit('review-back')"
+          <section
+            v-if="!isResolved && !countryShortcut && phase === 'review'"
+            ref="questionSectionRef"
+            class="guided-question"
           >
-            重审上一条观察
-          </button>
-        </div>
+            <template v-if="phase === 'review'">
+              <div v-if="showLowCluePrompt" class="guided-low-confidence-note">
+                <strong>当前信息不足，先补充可观察线索</strong>
+                <span>请回答下面的问题，或在下方输入文字线索；提交后会重新比较国家候选，不会自动确认地点。</span>
+              </div>
+              <div v-if="isReviewClueQuestion" class="guided-review-box">
+                <div class="guided-section-head">
+                  <span class="guided-section-title">核对观察</span>
+                  <span v-if="reviewProgress" class="guided-review-progress">
+                    第 {{ reviewProgress.current }} / {{ reviewProgress.total }}
+                  </span>
+                  <span v-else class="guided-one-question">本轮仅此一条观察</span>
+                </div>
+                <template v-if="currentReviewClue">
+                  <p class="guided-question-message">{{ questionMessage }}</p>
+                  <p class="guided-question-reason">{{ questionReason }}</p>
+                  <div class="guided-question-clue">
+                    <strong>{{ reviewedClueText(currentReviewClue) }}</strong>
+                    <span>{{ currentReviewClue.description || '未提供详细说明' }}</span>
+                    <span v-if="isRecentClue(currentReviewClue.id)" class="guided-clue-new">新线索</span>
+                  </div>
+                  <div class="guided-inline-actions">
+                    <button
+                      type="button"
+                      class="mini-btn confirm"
+                      :disabled="busy"
+                      @click="emit('confirm-clue', currentReviewClue.id)"
+                    >
+                      判断准确
+                    </button>
+                    <button
+                      type="button"
+                      class="mini-btn reject"
+                      :disabled="busy"
+                      @click="emit('reject-clue', currentReviewClue.id)"
+                    >
+                      不准确
+                    </button>
+                  </div>
+                  <button
+                    type="button"
+                    class="guided-unknown-btn"
+                    :disabled="busy"
+                    @click="emit('unknown')"
+                  >
+                    不确定 / 无法判断（不代表排除）
+                  </button>
+                </template>
+                <div v-else class="guided-question-hint">
+                  当前观察暂时无法显示，请重新加载后再试。
+                </div>
+              </div>
 
-        <div v-if="pendingQuestion?.kind === 'confirm_location'" class="guided-question-hint">
-          请在下方候选中明确确认当前层级；不会根据排序第一名自动确认。
-        </div>
+              <div v-else-if="blockingQuestion" class="guided-review-box">
+                <div class="guided-section-head">
+                  <span class="guided-section-title">{{ guidedQuestionTitle(blockingQuestion) }}</span>
+                  <span class="guided-one-question">本轮仅此一问</span>
+                </div>
+                <p v-if="narratedLowQuestion" class="guided-question-reason">
+                  <strong>问题说明：</strong>{{ narratedLowQuestion }}
+                </p>
+                <p class="guided-question-message">{{ questionMessage }}</p>
+                <p class="guided-question-reason">{{ guidedQuestionReason(blockingQuestion) }}</p>
+                <div v-if="answerChoiceOptions.length" class="guided-answer-options">
+                  <button
+                    v-for="option in answerChoiceOptions"
+                    :key="option.value"
+                    type="button"
+                    class="option-chip"
+                    :disabled="busy"
+                    @click="emit('answer', { value: option.value, label: option.label })"
+                  >
+                    {{ option.label }}
+                  </button>
+                </div>
+                <div v-else class="guided-question-hint">
+                  请在下方输入可观察线索；自由文本不会直接推进确认层级。
+                </div>
+                <button
+                  type="button"
+                  class="guided-unknown-btn"
+                  :disabled="busy"
+                  @click="emit('unknown')"
+                >
+                  不确定 / 跳过此问题
+                </button>
+              </div>
 
-        <p class="guided-section-hint">{{ candidateSectionHint }}</p>
-        <div v-if="!topCandidates.length" class="guided-empty">
-          当前层级暂无候选。请在下方补充照片中可见的招牌、地名或文字；补充线索不会自动确认地点。
-        </div>
-        <article
-          v-for="candidate in topCandidates"
-          :key="candidateTargetKey(candidate.target)"
-          class="guided-candidate-card"
-          :class="{ selected: isCandidateSelected(candidate.target) }"
-          :tabindex="busy ? -1 : 0"
-          :aria-current="isCandidateSelected(candidate.target) ? 'true' : undefined"
-          @click="selectCandidate(candidate.target)"
-          @keydown.enter.prevent="selectCandidate(candidate.target)"
-          @keydown.space.prevent="selectCandidate(candidate.target)"
-        >
-          <div class="guided-candidate-main">
-            <strong>{{ targetLabel(candidate.target) }}</strong>
-            <span class="guided-candidate-meta">{{ candidateScoreLabel(candidate) }}</span>
-            <span v-if="candidatePointLabel(candidate.target)" class="guided-candidate-point">
-              {{ candidatePointLabel(candidate.target) }}
-            </span>
-            <span v-else class="guided-candidate-point missing">
-              此候选无坐标，地图不放置候选标记；选中时仅聚焦已确认父级范围
-            </span>
-            <p v-if="candidate.reason" class="guided-candidate-reason">{{ candidate.reason }}</p>
-            <PlaceMatchEvidence v-if="candidate.place_match" :match="candidate.place_match" />
-          </div>
-          <div class="guided-candidate-actions">
-            <button
-              type="button"
-              class="mini-btn confirm"
-              :disabled="busy || !locationConfirmationReady"
-              @click.stop="emit('confirm-location', candidate.target)"
+              <div v-else-if="pendingClueCount > 0" class="guided-question-hint">
+                还有 {{ pendingClueCount }} 条观察待核对，请重新加载后再试。
+              </div>
+
+              <div v-else class="guided-next-step" role="status">
+                <div>
+                  <strong>观察核对已完成</strong>
+                  <span>下一步查看地点候选；选择符合照片的地点后再确认。</span>
+                  <span v-if="questionMessage" class="guided-question-hint">{{ questionMessage }}</span>
+                </div>
+                <button
+                  type="button"
+                  class="primary-btn guided-next-step-action"
+                  :disabled="busy || !reviewReady"
+                  @click="emit('next-phase')"
+                >
+                  {{ nextStepLabel }}
+                </button>
+              </div>
+
+              <div class="guided-review-nav">
+                <button
+                  type="button"
+                  class="ghost-btn"
+                  :disabled="busy || !canReviewBack"
+                  :title="canReviewBack ? '重新核对上一条已确认的观察' : '还没有已确认的观察'"
+                  @click="emit('review-back')"
+                >
+                  返回上一条观察（重新核对）
+                </button>
+              </div>
+            </template>
+          </section>
+
+          <section
+            v-if="candidatesPhase && !countryShortcut"
+            ref="candidateSectionRef"
+            class="guided-candidates"
+          >
+            <div class="guided-section-head">
+              <span class="guided-section-title">{{ candidateTitle }}</span>
+              <span class="guided-section-note">{{ candidateSectionNote }}</span>
+            </div>
+
+            <div class="guided-candidates-toolbar">
+              <button type="button" class="ghost-btn" :disabled="busy" @click="emit('back-to-review')">
+                返回核对
+              </button>
+              <button
+                type="button"
+                class="ghost-btn"
+                :disabled="busy || !canReviewBack"
+                :title="canReviewBack ? '重新核对上一条已确认的观察' : '还没有已确认的观察'"
+                @click="emit('review-back')"
+              >
+                重审上一条观察
+              </button>
+            </div>
+
+            <div v-if="pendingQuestion?.kind === 'confirm_location'" class="guided-question-hint">
+              请在下方候选中明确确认当前层级；不会根据排序第一名自动确认。
+            </div>
+
+            <p class="guided-section-hint">{{ candidateSectionHint }}</p>
+            <div v-if="!topCandidates.length" class="guided-empty">
+              当前层级暂无候选。请在下方补充照片中可见的招牌、地名或文字；补充线索不会自动确认地点。
+            </div>
+
+            <article
+              v-for="(candidate, index) in topCandidates"
+              :key="candidateTargetKey(candidate.target)"
+              class="guided-candidate-card"
+              :class="{ selected: isCandidateSelected(candidate.target) }"
             >
-              确认{{ locationLevelLabel(candidate.target.level) }}
-            </button>
-            <button
-              type="button"
-              class="mini-btn reject"
-              :disabled="busy || !locationConfirmationReady"
-              @click.stop="emit('reject-location', candidate.target)"
+              <div class="guided-candidate-summary">
+                <button
+                  type="button"
+                  class="guided-candidate-select"
+                  :disabled="busy"
+                  :aria-current="isCandidateSelected(candidate.target) ? 'true' : undefined"
+                  :aria-label="`选择候选 ${index + 1}：${targetLabel(candidate.target)}，在地图查看`"
+                  @click="selectCandidate(candidate.target)"
+                >
+                  <span class="guided-candidate-number" aria-hidden="true">{{ index + 1 }}</span>
+                  <span class="guided-candidate-main">
+                    <strong>{{ targetLabel(candidate.target) }}</strong>
+                    <span class="guided-candidate-name-meta">
+                      <span class="guided-candidate-meta" :title="candidateScoreLabel(candidate)">
+                        {{ candidateScoreLabel(candidate) }}
+                      </span>
+                      <span v-if="candidatePointLabel(candidate.target)" class="guided-candidate-point">
+                        {{ candidatePointLabel(candidate.target) }}
+                      </span>
+                      <span v-else class="guided-candidate-point missing">无地图坐标</span>
+                    </span>
+                  </span>
+                </button>
+              </div>
+
+              <details
+                v-if="candidate.reason || candidate.place_match || !candidatePointLabel(candidate.target)"
+                class="guided-candidate-detail"
+              >
+                <summary>查看依据与坐标说明</summary>
+                <div class="guided-candidate-detail-body">
+                  <p v-if="candidate.reason" class="guided-candidate-reason">{{ candidate.reason }}</p>
+                  <p v-if="!candidatePointLabel(candidate.target)" class="guided-candidate-point-note">
+                    此候选无坐标，地图不放置候选标记；选中时仅聚焦已确认父级范围。
+                  </p>
+                  <PlaceMatchEvidence v-if="candidate.place_match" :match="candidate.place_match" />
+                </div>
+              </details>
+
+              <div class="guided-candidate-actions">
+                <button
+                  type="button"
+                  class="mini-btn confirm"
+                  :disabled="busy || !locationConfirmationReady"
+                  @click="emit('confirm-location', candidate.target)"
+                >
+                  确认{{ locationLevelLabel(candidate.target.level) }}
+                </button>
+                <button
+                  type="button"
+                  class="mini-btn reject"
+                  :disabled="busy || !locationConfirmationReady"
+                  @click="emit('reject-location', candidate.target)"
+                >
+                  排除{{ locationLevelLabel(candidate.target.level) }}
+                </button>
+              </div>
+            </article>
+          </section>
+
+          <section v-if="candidatesPhase && dialogue.exclusions.length" class="guided-exclusions">
+            <div class="guided-section-head">
+              <span class="guided-section-title">已排除地点</span>
+              <span class="guided-section-note">可撤回</span>
+            </div>
+            <p class="guided-section-hint">地点排除只作用于对应目标，不会影响同名地点或其他层级。</p>
+            <div
+              v-for="target in dialogue.exclusions"
+              :key="`${target.level}-${target.id}`"
+              class="guided-exclusion-row"
             >
-              排除{{ locationLevelLabel(candidate.target.level) }}
-            </button>
-          </div>
-        </article>
-      </section>
+              <span>{{ locationLevelLabel(target.level) }} · {{ targetLabel(target) }}</span>
+              <button
+                type="button"
+                class="guided-link-btn"
+                :disabled="busy"
+                @click="emit('retract-target', target)"
+              >
+                撤回排除
+              </button>
+            </div>
+          </section>
+        </template>
 
-      <section v-if="candidatesPhase && dialogue.exclusions.length" class="guided-exclusions">
-        <div class="guided-section-head">
-          <span class="guided-section-title">已排除地点</span>
-          <span class="guided-section-note">可撤回</span>
+        <div v-else-if="!loading" class="guided-loading">
+          引导状态尚未就绪，请重试。
         </div>
-        <p class="guided-section-hint">地点排除只作用于对应目标，不会影响同名地点或其他层级。</p>
-        <div v-for="target in dialogue.exclusions" :key="`${target.level}-${target.id}`" class="guided-exclusion-row">
-          <span>{{ locationLevelLabel(target.level) }} · {{ targetLabel(target) }}</span>
-          <button type="button" class="guided-link-btn" :disabled="busy" @click="emit('retract-target', target)">
-            撤回排除
-          </button>
-        </div>
-      </section>
-
-    </template>
-
-    <div v-else-if="!loading" class="guided-loading">
-      引导状态尚未就绪，请重试。
-    </div>
+      </div>
     </div>
 
     <form
@@ -846,49 +959,33 @@ watch(stage, (nextStage, previousStage) => {
       :aria-busy="busy ? 'true' : 'false'"
       @submit.prevent="submitComposer"
     >
-      <div class="guided-composer-head">
-        <div class="guided-composer-heading">
-          <span class="guided-composer-icon" aria-hidden="true">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M20 15a3 3 0 0 1-3 3H8l-4 3V6a3 3 0 0 1 3-3h10a3 3 0 0 1 3 3z" />
-              <path d="M8 9h8M8 13h5" />
-            </svg>
-          </span>
-          <span class="guided-composer-title">
-            <span class="guided-composer-kicker">看到新线索？随时补充</span>
-            <label id="guided-composer-label" for="guided-conversation-input">
-              补充线索，与定位助手对话
-            </label>
-          </span>
-        </div>
-        <span v-if="busy" class="guided-composer-mode is-busy">
+      <label id="guided-composer-label" for="guided-conversation-input" class="sr-only">
+        补充线索，与定位助手对话
+      </label>
+
+      <p
+        v-if="busy || freeTextSubmission"
+        class="guided-composer-status-line guided-composer-submission"
+        :class="freeTextSubmission ? `is-${freeTextSubmission.status}` : 'is-busy'"
+        :role="freeTextSubmission?.status === 'failed' ? 'alert' : 'status'"
+        aria-live="polite"
+      >
+        <span v-if="busy" class="guided-composer-busy">
           <span class="guided-composer-status-dot" aria-hidden="true" />
           助手处理中
         </span>
-        <span v-else class="guided-composer-mode">文字线索 · 地名检索</span>
-      </div>
-
-      <p
-        v-if="composerAssistantMessage"
-        class="guided-composer-assistant"
-        :title="composerAssistantMessage"
-      >
-        <strong>助手</strong>
-        <span>{{ composerAssistantMessage }}</span>
-      </p>
-
-      <p
-        v-if="freeTextSubmission"
-        class="guided-composer-submission"
-        :class="`is-${freeTextSubmission.status}`"
-        :role="freeTextSubmission.status === 'failed' ? 'alert' : 'status'"
-        aria-live="polite"
-      >
-        <strong>你说</strong>
-        <span class="guided-composer-submitted-text" :title="freeTextSubmission.text">
-          “{{ freeTextSubmission.text }}”
+        <span
+          v-if="freeTextSubmission"
+          class="guided-composer-submitted-text"
+          :title="freeTextSubmission.text"
+        >
+          你说：“{{ freeTextSubmission.text }}”
         </span>
-        <span class="guided-composer-status" :title="composerStatusText">
+        <span
+          v-if="freeTextSubmission"
+          class="guided-composer-status"
+          :title="composerStatusText"
+        >
           {{ composerStatusText }}
         </span>
       </p>
@@ -924,7 +1021,16 @@ watch(stage, (nextStage, previousStage) => {
         >
           <span v-if="busy" class="guided-composer-spinner" aria-hidden="true" />
           <span>{{ applying ? '发送中…' : busy ? '处理中…' : '发送线索' }}</span>
-          <svg v-if="!busy" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+          <svg
+            v-if="!busy"
+            width="15"
+            height="15"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            aria-hidden="true"
+          >
             <path d="m5 12 14-7-4 14-3-6z" />
             <path d="m12 13 7-8" />
           </svg>
@@ -937,113 +1043,1010 @@ watch(stage, (nextStage, previousStage) => {
       </div>
     </form>
   </section>
-</template>
-<style scoped>
-.guided-composer {
-  position: relative;
-  gap: 8px;
-  padding: 12px;
-  border: 1px solid rgba(15, 118, 110, 0.28);
-  border-radius: 14px;
-  background:
-    radial-gradient(circle at 96% 0%, rgba(15, 118, 110, 0.12), transparent 34%),
-    linear-gradient(135deg, rgba(230, 242, 240, 0.92), rgba(255, 255, 255, 0.98) 48%);
-  box-shadow:
-    0 0 0 1px rgba(255, 255, 255, 0.72) inset,
-    0 9px 24px rgba(15, 118, 110, 0.1),
-    0 2px 5px rgba(30, 41, 59, 0.04);
-  transition: border-color 0.16s ease, box-shadow 0.16s ease;
-}
-
-.guided-composer::before {
-  content: '';
-  position: absolute;
-  top: 12px;
-  bottom: 12px;
-  left: 0;
-  width: 3px;
-  border-radius: 0 999px 999px 0;
-  background: linear-gradient(180deg, #2aa198, var(--primary));
-  pointer-events: none;
-}
-
-.guided-composer.is-busy {
-  border-color: rgba(15, 118, 110, 0.4);
-  box-shadow:
-    0 0 0 1px rgba(255, 255, 255, 0.72) inset,
-    0 8px 22px rgba(15, 118, 110, 0.14);
-}
-
-.guided-composer-head {
-  align-items: center;
-  gap: 7px 12px;
-  flex-wrap: wrap;
-}
-
-.guided-composer-heading {
+</template><style scoped>
+.guided-dialogue-shell {
+  --guided-ink: #172522;
+  --guided-muted: #66746f;
+  --guided-line: #dbe7e3;
+  --guided-line-strong: #c5d7d2;
+  --guided-teal: #0f766e;
+  --guided-teal-dark: #0b5b56;
+  --guided-teal-soft: #edf7f4;
+  --guided-warn: #9a5b0b;
+  --guided-danger: #b42318;
   display: flex;
-  flex: 1 1 280px;
-  align-items: center;
-  gap: 9px;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 0;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  border: 1px solid var(--guided-line);
+  border-radius: 16px;
+  color: var(--guided-ink);
+  background: #fff;
+  box-shadow: 0 10px 28px rgba(27, 56, 49, 0.06);
+  font-size: 14px;
+}
+
+.guided-panel {
+  display: block;
+  flex: 1 1 0;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  scroll-behavior: smooth;
+  scroll-padding-top: var(--guided-header-height, 160px);
+  padding: 0;
+  background: #fff;
+}
+
+.guided-dock-header {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  display: grid;
+  gap: 8px;
+  padding: 12px 12px 10px;
+  border-bottom: 1px solid var(--guided-line);
+  border-radius: 15px 15px 0 0;
+  background: rgba(255, 255, 255, 0.98);
+  box-shadow: 0 6px 18px rgba(27, 56, 49, 0.06);
+  backdrop-filter: blur(8px);
+}
+
+.guided-panel-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.guided-title-block {
   min-width: 0;
 }
 
-.guided-composer-icon {
+.guided-title-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 8px;
+  margin-top: 1px;
+}
+
+.guided-kicker {
+  display: block;
+  color: var(--guided-teal);
+  font-size: 10.5px;
+  font-weight: 800;
+  line-height: 1.2;
+  letter-spacing: 0.11em;
+}
+
+.guided-panel-head h2 {
+  margin: 0;
+  color: var(--guided-ink);
+  font-size: 17px;
+  line-height: 1.25;
+}
+
+.guided-task-pill {
+  display: inline-flex;
+  align-items: center;
+  min-height: 23px;
+  padding: 2px 8px;
+  border: 1px solid #b9dcd5;
+  border-radius: 999px;
+  color: var(--guided-teal-dark);
+  background: var(--guided-teal-soft);
+  font-size: 11.5px;
+  font-weight: 700;
+  line-height: 1.25;
+  white-space: nowrap;
+}
+
+.guided-panel-head-actions {
+  display: flex;
+  flex: 0 0 auto;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 5px;
+}
+
+.guided-progress {
+  flex-shrink: 0;
+  padding: 2px 8px;
+  border: 1px solid var(--guided-line);
+  border-radius: 999px;
+  color: var(--guided-muted);
+  background: #f8fbfa;
+  font-size: 11px;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+
+.guided-back-btn {
+  min-height: 27px;
+  padding: 3px 8px;
+  border-color: var(--guided-line-strong);
+  border-radius: 8px;
+  color: var(--guided-teal-dark);
+  font-size: 11px;
+  line-height: 1.3;
+  white-space: nowrap;
+}
+
+.guided-path {
+  display: flex;
+  flex-direction: row;
+  align-items: stretch;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.guided-path li {
+  position: relative;
+  display: flex;
+  flex: 1 1 0;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  min-height: 42px;
+  margin: 0;
+  padding: 5px 7px;
+  border: 1px solid var(--guided-line);
+  border-radius: 10px;
+  background: #f8fbfa;
+  opacity: 1;
+}
+
+.guided-path li:not(:last-child)::after {
+  content: '→';
+  position: absolute;
+  right: -8px;
+  z-index: 1;
+  width: 8px;
+  color: #8ba39d;
+  font-size: 11px;
+  line-height: 1;
+  text-align: center;
+  transform: translateX(50%);
+  pointer-events: none;
+}
+
+.guided-path li.is-current {
+  border-color: #8fc6be;
+  background: var(--guided-teal-soft);
+}
+
+.guided-path li.is-done {
+  border-color: #c6ded9;
+  background: #f6fbfa;
+}
+
+.guided-path li.is-pending {
+  opacity: 0.68;
+}
+
+.guided-step-index {
   display: inline-flex;
   flex: 0 0 auto;
   align-items: center;
   justify-content: center;
-  width: 34px;
-  height: 34px;
-  border-radius: 10px;
+  width: 22px;
+  height: 22px;
+  border-radius: 7px;
   color: #fff;
-  background: linear-gradient(145deg, var(--primary), var(--primary-dark));
-  box-shadow: 0 4px 10px rgba(15, 118, 110, 0.22);
+  background: #9aa8a4;
+  font-size: 11px;
+  font-weight: 700;
 }
 
-.guided-composer-title {
+.guided-path li.is-done .guided-step-index {
+  background: var(--guided-teal);
+}
+
+.guided-path li.is-current .guided-step-index {
+  background: var(--guided-teal-dark);
+}
+
+.guided-step-main {
   display: flex;
+  flex: 1 1 auto;
   flex-direction: column;
   min-width: 0;
-  gap: 1px;
 }
 
-.guided-composer-kicker {
-  color: var(--primary-dark);
-  font-size: 9px;
-  font-weight: 800;
-  line-height: 1.2;
-  letter-spacing: 0.12em;
+.guided-step-label {
+  color: var(--guided-muted);
+  font-size: 10px;
+  line-height: 1.25;
 }
 
-.guided-composer-head label {
-  color: var(--ink);
-  font-size: 14px;
-  font-weight: 800;
-  line-height: 1.3;
+.guided-step-main strong {
+  overflow: hidden;
+  color: var(--guided-ink);
+  font-size: 12.5px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.guided-backtrack-btn,
+.guided-link-btn {
+  flex: 0 0 auto;
+  min-height: 24px;
+  padding: 2px 3px;
+  border: 0;
+  border-radius: 5px;
+  color: var(--guided-teal);
+  background: transparent;
+  font-size: 10.5px;
   cursor: pointer;
 }
 
-.guided-composer-mode {
+.guided-backtrack-btn:hover:not(:disabled),
+.guided-link-btn:hover:not(:disabled) {
+  color: var(--guided-teal-dark);
+  text-decoration: underline;
+}
+
+.guided-backtrack-btn:disabled,
+.guided-link-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.guided-task-message {
+  overflow: hidden;
+  margin: 0;
+  border: 1px solid var(--guided-line);
+  border-radius: 9px;
+  background: #f9fbfb;
+}
+
+.guided-task-message summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 30px;
+  padding: 4px 8px;
+  color: var(--guided-muted);
+  font-size: 11.5px;
+  line-height: 1.35;
+  cursor: pointer;
+  list-style: none;
+}
+
+.guided-task-message summary::-webkit-details-marker,
+.guided-candidate-detail summary::-webkit-details-marker {
+  display: none;
+}
+
+.guided-task-message-label {
+  color: var(--guided-teal-dark);
+  font-weight: 700;
+}
+
+.guided-task-message-toggle {
+  flex: 0 0 auto;
+  color: var(--guided-teal);
+  font-size: 10.5px;
+}
+
+.guided-task-message[open] .guided-task-message-toggle {
+  color: var(--guided-ink);
+}
+
+.guided-task-message p {
+  margin: 0;
+  padding: 0 9px 8px;
+  color: var(--guided-muted);
+  font-size: 13px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.guided-backtrack-confirm {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 8px;
+  border: 1px solid #efd6ad;
+  border-radius: 9px;
+  color: var(--guided-warn);
+  background: #fffaf0;
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+.guided-backtrack-confirm > div {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 5px;
+}
+
+.guided-backtrack-confirm .ghost-btn,
+.guided-backtrack-confirm .mini-btn {
+  min-height: 28px;
+  padding: 3px 7px;
+  font-size: 11px;
+}
+
+.guided-main {
+  display: grid;
+  gap: 10px;
+  padding: 10px 12px 14px;
+}
+
+.guided-error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 9px;
+  border: 1px solid #f1c9c6;
+  border-radius: 9px;
+  background: #fff7f6;
+}
+
+.guided-error p {
+  color: var(--guided-danger);
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+
+.guided-error .ghost-btn {
+  min-height: 29px;
+  padding: 4px 8px;
+  font-size: 11px;
+}
+
+.guided-loading {
+  padding: 18px 10px;
+  color: var(--guided-muted);
+  font-size: 12.5px;
+  line-height: 1.5;
+  text-align: center;
+}
+
+.guided-receipt {
+  justify-self: start;
+  padding: 4px 9px;
+  border-radius: 999px;
+  color: var(--guided-teal-dark);
+  background: var(--guided-teal-soft);
+  font-size: 11.5px;
+  line-height: 1.4;
+}
+
+.guided-resolved {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 12px;
+  border: 1px solid #a9d2cb;
+  border-radius: 11px;
+  background: linear-gradient(180deg, #f5fbf9, #fff);
+}
+
+.guided-resolved-label {
+  color: var(--guided-teal);
+  font-size: 10.5px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+}
+
+.guided-resolved strong {
+  color: var(--guided-ink);
+  font-size: 18px;
+  line-height: 1.3;
+}
+
+.guided-resolved p {
+  color: var(--guided-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.guided-confidence-result {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid #a9d2cb;
+  border-radius: 11px;
+  background: #fff;
+  box-shadow: 0 0 0 2px rgba(15, 118, 110, 0.05);
+}
+
+.guided-confidence-result.is-candidates {
+  border-color: #e6c997;
+  box-shadow: 0 0 0 2px rgba(154, 91, 11, 0.04);
+}
+
+.guided-confidence-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 9px;
+}
+
+.guided-confidence-head > div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.guided-confidence-kicker {
+  color: var(--guided-teal);
+  font-size: 10.5px;
+  font-weight: 800;
+  letter-spacing: 0.07em;
+}
+
+.guided-confidence-result.is-candidates .guided-confidence-kicker {
+  color: var(--guided-warn);
+}
+
+.guided-confidence-head strong {
+  color: var(--guided-ink);
+  font-size: 15px;
+  line-height: 1.3;
+}
+
+.guided-confidence-note {
+  flex: 0 0 auto;
+  padding: 2px 7px;
+  border: 1px solid var(--guided-line);
+  border-radius: 999px;
+  color: var(--guided-muted);
+  background: #fff;
+  font-size: 10.5px;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+
+.guided-confidence-explanation {
+  color: var(--guided-muted);
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+
+.guided-confidence-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding-top: 7px;
+  border-top: 1px dashed var(--guided-line);
+}
+
+.guided-confidence-actions .ghost-btn {
+  min-height: 29px;
+  padding: 4px 8px;
+  font-size: 11px;
+}
+
+.guided-confidence-actions span {
+  color: var(--guided-muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.guided-question {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid #9dcbc4;
+  border-radius: 12px;
+  background: #fff;
+  box-shadow: 0 0 0 2px rgba(15, 118, 110, 0.045);
+}
+
+.guided-review-box {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.guided-low-confidence-note {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 8px 9px;
+  border: 1px solid #eed7b1;
+  border-radius: 9px;
+  background: #fffaf1;
+}
+
+.guided-low-confidence-note strong {
+  color: var(--guided-warn);
+  font-size: 12.5px;
+  line-height: 1.4;
+}
+
+.guided-low-confidence-note span {
+  color: #756650;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.guided-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.guided-section-title {
+  color: var(--guided-ink);
+  font-size: 13px;
+  font-weight: 800;
+  line-height: 1.35;
+}
+
+.guided-one-question,
+.guided-section-note {
+  color: var(--guided-muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.guided-review-progress {
+  flex-shrink: 0;
+  padding: 2px 7px;
+  border: 1px solid #9dcbc4;
+  border-radius: 999px;
+  color: var(--guided-teal-dark);
+  background: var(--guided-teal-soft);
+  font-size: 10.5px;
+  font-weight: 700;
+}
+
+.guided-question-message {
+  color: var(--guided-ink);
+  font-size: 14px;
+  font-weight: 650;
+  line-height: 1.55;
+}
+
+.guided-question-reason,
+.guided-section-hint {
+  color: var(--guided-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.guided-question-clue {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 7px 8px;
+  border: 1px dashed var(--guided-line-strong);
+  border-radius: 8px;
+  background: #f8fbfa;
+}
+
+.guided-question-clue strong {
+  color: var(--guided-ink);
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.guided-question-clue > span,
+.guided-question-hint {
+  color: var(--guided-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.guided-clue-new {
+  justify-self: start;
+  padding: 1px 6px;
+  border-radius: 999px;
+  color: var(--guided-teal-dark) !important;
+  background: var(--guided-teal-soft);
+  font-size: 10.5px !important;
+  font-weight: 700;
+}
+
+.guided-inline-actions,
+.guided-answer-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.guided-inline-actions .mini-btn,
+.guided-answer-options .option-chip {
+  min-height: 32px;
+  padding: 5px 10px;
+  font-size: 12px;
+}
+
+.guided-unknown-btn {
+  align-self: flex-start;
+  min-height: 31px;
+  padding: 5px 10px;
+  border: 1px dashed var(--guided-line-strong);
+  border-radius: 999px;
+  color: var(--guided-muted);
+  background: #fff;
+  font-size: 11.5px;
+  line-height: 1.35;
+  cursor: pointer;
+}
+
+.guided-unknown-btn:hover:not(:disabled) {
+  border-color: var(--guided-teal);
+  color: var(--guided-teal);
+}
+
+.guided-unknown-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.guided-review-nav {
+  display: flex;
+  justify-content: flex-start;
+}
+
+.guided-review-nav .ghost-btn,
+.guided-candidates-toolbar .ghost-btn {
+  min-height: 30px;
+  padding: 4px 9px;
+  font-size: 11.5px;
+}
+
+.guided-next-step {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 9px;
+  padding: 10px;
+  border: 1px solid #a9d2cb;
+  border-radius: 10px;
+  background: linear-gradient(180deg, #f3faf8, #fff);
+}
+
+.guided-next-step > div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.guided-next-step strong {
+  color: var(--guided-teal-dark);
+  font-size: 12.5px;
+  line-height: 1.4;
+}
+
+.guided-next-step span {
+  color: var(--guided-muted);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+.guided-next-step .primary-btn {
+  flex: 0 0 auto;
+  min-height: 33px;
+  padding: 6px 10px;
+  font-size: 11.5px;
+}
+
+.guided-candidates,
+.guided-exclusions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 10px;
+  border-top: 1px solid var(--guided-line);
+}
+
+.guided-candidates-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.guided-empty {
+  padding: 10px;
+  border: 1px dashed var(--guided-line-strong);
+  border-radius: 9px;
+  color: var(--guided-muted);
+  background: #fbfcfc;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.guided-candidate-card {
+  display: grid;
+  flex: 0 0 auto;
+  gap: 7px;
+  align-items: stretch;
+  justify-content: initial;
+  min-width: 0;
+  padding: 9px;
+  border: 1px solid var(--guided-line);
+  border-radius: 10px;
+  background: #fff;
+  cursor: default;
+  transition: border-color 0.15s ease, background 0.15s ease, box-shadow 0.15s ease;
+}
+
+.guided-candidate-card:hover {
+  border-color: var(--guided-line-strong);
+  background: #fff;
+}
+
+.guided-candidate-card.selected {
+  border-color: #82beb5;
+  background: #f5fbf9;
+  box-shadow: 0 0 0 2px rgba(15, 118, 110, 0.09);
+}
+
+.guided-candidate-summary {
+  display: flex;
+  align-items: flex-start;
+  min-width: 0;
+}
+
+.guided-candidate-select {
+  display: flex;
+  flex: 1 1 auto;
+  align-items: flex-start;
+  gap: 8px;
+  min-width: 0;
+  padding: 2px;
+  border: 0;
+  border-radius: 7px;
+  color: inherit;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.guided-candidate-select:hover:not(:disabled) .guided-candidate-main strong {
+  color: var(--guided-teal-dark);
+}
+
+.guided-candidate-select:disabled {
+  cursor: not-allowed;
+}
+
+.guided-candidate-number {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  width: 27px;
+  height: 27px;
+  border: 1px solid #b9dcd5;
+  border-radius: 8px;
+  color: var(--guided-teal-dark);
+  background: var(--guided-teal-soft);
+  font-size: 12px;
+  font-weight: 800;
+  line-height: 1;
+}
+
+.guided-candidate-card.selected .guided-candidate-number {
+  border-color: var(--guided-teal);
+  color: #fff;
+  background: var(--guided-teal);
+}
+
+.guided-candidate-main {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.guided-candidate-main strong {
+  overflow: hidden;
+  color: var(--guided-ink);
+  font-size: 14px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.guided-candidate-name-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 8px;
+  min-width: 0;
+}
+
+.guided-candidate-meta,
+.guided-candidate-point {
+  color: var(--guided-muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.guided-candidate-meta {
+  display: -webkit-box;
+  overflow: hidden;
+  min-width: 0;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+}
+
+.guided-candidate-point {
+  flex: 0 0 auto;
+  color: var(--guided-warn);
+}
+
+.guided-candidate-point.missing {
+  color: var(--guided-muted);
+}
+
+.guided-candidate-detail {
+  margin-left: 35px;
+  border-top: 1px dashed var(--guided-line);
+}
+
+.guided-candidate-detail summary {
+  min-height: 27px;
+  padding: 5px 1px 2px;
+  color: var(--guided-teal);
+  font-size: 11px;
+  line-height: 1.35;
+  cursor: pointer;
+  list-style: none;
+}
+
+.guided-candidate-detail-body {
+  display: grid;
+  gap: 5px;
+  padding: 2px 1px 1px;
+}
+
+.guided-candidate-reason,
+.guided-candidate-point-note {
+  color: var(--guided-muted);
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.guided-candidate-point-note {
+  color: var(--guided-warn);
+}
+
+.guided-candidate-detail :deep(.place-evidence) {
+  margin-top: 0;
+  color: var(--guided-muted);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+.guided-candidate-actions {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+  padding-left: 35px;
+}
+
+.guided-candidate-actions .mini-btn {
+  min-height: 32px;
+  padding: 5px 10px;
+  border-radius: 8px;
+  font-size: 11.5px;
+  font-weight: 650;
+}
+
+.guided-candidate-actions .mini-btn.confirm {
+  border-color: var(--guided-teal);
+  color: #fff;
+  background: var(--guided-teal);
+}
+
+.guided-candidate-actions .mini-btn.confirm:hover:not(:disabled) {
+  border-color: var(--guided-teal-dark);
+  background: var(--guided-teal-dark);
+}
+
+.guided-candidate-actions .mini-btn.reject {
+  border-color: #eccbc8;
+  color: var(--guided-danger);
+  background: #fff;
+}
+
+.guided-candidate-actions .mini-btn.reject:hover:not(:disabled) {
+  border-color: var(--guided-danger);
+  color: #fff;
+  background: var(--guided-danger);
+}
+
+.guided-candidate-actions .mini-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.guided-exclusion-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 1px solid #f0d4d2;
+  border-radius: 8px;
+  color: var(--guided-danger);
+  background: #fff9f8;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.guided-composer {
+  position: relative;
+  z-index: 30;
+  display: grid;
+  flex: 0 0 auto;
+  gap: 7px;
+  min-width: 0;
+  padding: 9px 12px 10px;
+  border-top: 1px solid var(--guided-line);
+  background: #fff;
+  box-shadow: 0 -7px 18px rgba(27, 56, 49, 0.055);
+  transition: border-color 0.16s ease;
+}
+
+.guided-composer.is-busy {
+  border-top-color: #b9dcd5;
+}
+
+.guided-composer-status-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 3px 7px;
+  min-width: 0;
+  margin: 0;
+  padding: 5px 7px;
+  border: 1px solid var(--guided-line);
+  border-radius: 8px;
+  color: var(--guided-muted);
+  background: #f8fbfa;
+  font-size: 11.5px;
+  line-height: 1.4;
+}
+
+.guided-composer-status-line.is-failed {
+  border-color: #f0cfcc;
+  color: var(--guided-danger);
+  background: #fff7f6;
+}
+
+.guided-composer-status-line.is-unconfirmed {
+  border-color: #eed7b1;
+  color: var(--guided-warn);
+  background: #fffaf1;
+}
+
+.guided-composer-busy {
   display: inline-flex;
   flex: 0 0 auto;
   align-items: center;
   gap: 5px;
-  min-height: 22px;
-  padding: 2px 8px;
-  border: 1px solid rgba(15, 118, 110, 0.16);
-  border-radius: 999px;
-  color: var(--primary-dark);
-  background: rgba(255, 255, 255, 0.72);
-  font-size: 9.5px;
+  color: var(--guided-teal-dark);
   font-weight: 700;
-  white-space: nowrap;
-}
-
-.guided-composer-mode.is-busy {
-  border-color: rgba(217, 119, 6, 0.26);
-  color: var(--warn);
-  background: rgba(253, 243, 227, 0.82);
 }
 
 .guided-composer-status-dot {
@@ -1054,76 +2057,25 @@ watch(stage, (nextStage, previousStage) => {
   animation: guided-composer-pulse 1.1s ease-in-out infinite;
 }
 
-.guided-composer-assistant,
-.guided-composer-submission {
-  align-items: flex-start;
-  gap: 7px;
-  padding: 5px 7px;
-  border: 1px solid rgba(15, 118, 110, 0.1);
-  border-radius: 8px;
-  background: rgba(255, 255, 255, 0.68);
-}
-
-.guided-composer-assistant strong,
-.guided-composer-submission strong {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  min-height: 18px;
-  padding: 0 7px;
-  border-radius: 999px;
-  color: #fff;
-  background: var(--primary);
-  font-size: 9px;
-  line-height: 1;
-}
-
-.guided-composer-assistant span {
-  display: -webkit-box;
-  overflow: hidden;
-  white-space: normal;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 1;
-  line-clamp: 1;
-}
-
 .guided-composer-submitted-text {
-  color: var(--primary-dark);
+  overflow: hidden;
+  flex: 0 1 auto;
+  max-width: 100%;
+  color: var(--guided-teal-dark);
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .guided-composer-status {
-  display: -webkit-box;
-  overflow: hidden;
-  white-space: normal;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 1;
-  line-clamp: 1;
-}
-
-.guided-composer-submission.is-pending,
-.guided-composer-submission.is-unconfirmed {
-  border-color: rgba(217, 119, 6, 0.2);
-  background: rgba(253, 243, 227, 0.7);
-}
-
-.guided-composer-submission.is-pending strong,
-.guided-composer-submission.is-unconfirmed strong {
-  background: var(--city);
-}
-
-.guided-composer-submission.is-failed {
-  border-color: rgba(185, 28, 28, 0.2);
-  background: rgba(253, 234, 234, 0.72);
-}
-
-.guided-composer-submission.is-failed strong {
-  background: var(--danger);
+  flex: 1 1 180px;
+  min-width: 0;
+  color: currentColor;
 }
 
 .guided-composer-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
-  gap: 8px;
+  gap: 7px;
   align-items: stretch;
 }
 
@@ -1132,50 +2084,49 @@ watch(stage, (nextStage, previousStage) => {
   display: flex;
   align-items: center;
   min-width: 0;
-  border-radius: 10px;
+  border-radius: 9px;
 }
 
 .guided-composer-field-icon {
   position: absolute;
-  left: 12px;
+  left: 11px;
   z-index: 1;
   display: inline-flex;
-  color: var(--primary);
+  color: var(--guided-teal);
   pointer-events: none;
 }
 
 .guided-composer-row .guided-composer-field input {
   width: 100%;
-  min-height: 42px;
-  padding: 10px 12px 10px 38px;
-  border: 1.5px solid var(--border-strong);
-  border-radius: 10px;
-  color: var(--ink);
-  background: rgba(255, 255, 255, 0.96);
-  font-size: 13px;
+  min-height: 41px;
+  padding: 9px 11px 9px 34px;
+  border: 1.5px solid var(--guided-line-strong);
+  border-radius: 9px;
+  color: var(--guided-ink);
+  background: #fff;
+  font-size: 14px;
   line-height: 1.4;
-  box-shadow: 0 1px 2px rgba(30, 41, 59, 0.03) inset;
-  transition: border-color 0.15s ease, box-shadow 0.15s ease, background 0.15s ease;
+  outline: none;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
 
 .guided-composer-row .guided-composer-field input::placeholder {
-  color: #989286;
+  color: #929e9a;
 }
 
 .guided-composer-field:focus-within {
-  outline: 2px solid var(--primary);
+  outline: 2px solid var(--guided-teal);
   outline-offset: 1px;
-  box-shadow: 0 0 0 4px rgba(15, 118, 110, 0.12);
+  box-shadow: 0 0 0 3px rgba(15, 118, 110, 0.1);
 }
 
 .guided-composer-row .guided-composer-field input:focus {
-  border-color: var(--primary);
-  outline: none;
+  border-color: var(--guided-teal);
 }
 
 .guided-composer-row .guided-composer-field input:disabled {
-  color: var(--ink-soft);
-  background: #f3f3ef;
+  color: var(--guided-muted);
+  background: #f3f6f5;
   cursor: not-allowed;
 }
 
@@ -1183,22 +2134,25 @@ watch(stage, (nextStage, previousStage) => {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 7px;
-  min-height: 42px;
-  padding: 0 15px;
-  border-radius: 10px;
-  background: linear-gradient(135deg, var(--primary), var(--primary-dark));
-  box-shadow: 0 5px 12px rgba(15, 118, 110, 0.2);
-  font-size: 12px;
+  gap: 6px;
+  min-height: 41px;
+  padding: 0 13px;
+  border-radius: 9px;
+  color: #fff;
+  background: var(--guided-teal);
+  box-shadow: 0 4px 10px rgba(15, 118, 110, 0.16);
+  font-size: 12.5px;
+  font-weight: 700;
   white-space: nowrap;
 }
 
 .guided-composer-row .guided-composer-submit:hover:not(:disabled) {
-  background: linear-gradient(135deg, var(--primary-dark), #0d4f4b);
+  background: var(--guided-teal-dark);
 }
 
 .guided-composer-row .guided-composer-submit:disabled {
-  background: #cfd6d4;
+  color: #fff;
+  background: #aebbb7;
   box-shadow: none;
 }
 
@@ -1217,33 +2171,55 @@ watch(stage, (nextStage, previousStage) => {
   justify-content: space-between;
   gap: 8px;
   min-width: 0;
-  padding: 0 1px;
 }
 
 .guided-composer-hint {
+  display: -webkit-box;
+  overflow: hidden;
   flex: 1 1 auto;
   min-width: 0;
-  color: var(--ink-soft);
-  font-size: 10.5px;
-  line-height: 1.45;
+  color: var(--guided-muted);
+  font-size: 11px;
+  line-height: 1.4;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
 }
 
 .guided-composer-enter-hint {
   flex: 0 0 auto;
-  color: var(--muted);
-  font-size: 9.5px;
+  color: var(--guided-muted);
+  font-size: 10px;
   line-height: 1.6;
   white-space: nowrap;
 }
 
 .guided-composer-enter-hint kbd {
   padding: 1px 5px;
-  border: 1px solid var(--border-strong);
+  border: 1px solid var(--guided-line-strong);
   border-bottom-width: 2px;
   border-radius: 5px;
-  color: var(--ink-soft);
+  color: var(--guided-muted);
   background: #fff;
   font: inherit;
+}
+
+.guided-dialogue-shell button:focus-visible,
+.guided-dialogue-shell summary:focus-visible {
+  outline: 2px solid var(--guided-teal);
+  outline-offset: 2px;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 
 @keyframes guided-composer-pulse {
@@ -1264,28 +2240,95 @@ watch(stage, (nextStage, previousStage) => {
   }
 }
 
-@media (max-width: 620px) {
-  .guided-composer {
+@media (max-width: 480px) {
+  .guided-dialogue-shell {
+    border-radius: 13px;
+  }
+
+  .guided-dock-header {
     gap: 7px;
-    padding: 10px 10px 10px 11px;
-    border-radius: 12px;
+    padding: 10px 10px 9px;
+    border-radius: 12px 12px 0 0;
   }
 
-  .guided-composer-heading {
-    flex-basis: 100%;
+  .guided-panel-head {
+    gap: 7px;
   }
 
-  .guided-composer-mode:not(.is-busy) {
+  .guided-progress {
+    padding-inline: 6px;
+  }
+
+  .guided-back-btn {
+    max-width: 132px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .guided-path {
+    gap: 6px;
+  }
+
+  .guided-path li {
+    gap: 6px;
+    padding: 5px;
+  }
+
+  .guided-path li:not(:last-child)::after {
+    right: -6px;
+  }
+
+  .guided-main {
+    gap: 9px;
+    padding: 9px 10px 12px;
+  }
+
+  .guided-question,
+  .guided-confidence-result {
+    padding: 10px;
+  }
+
+  .guided-next-step {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .guided-next-step .primary-btn {
+    align-self: stretch;
+  }
+
+  .guided-candidate-detail,
+  .guided-candidate-actions {
+    margin-left: 0;
+    padding-left: 0;
+  }
+
+  .guided-candidate-actions {
+    justify-content: stretch;
+  }
+
+  .guided-candidate-actions .mini-btn {
+    flex: 1 1 0;
+  }
+
+  .guided-composer {
+    padding: 8px 10px 9px;
+  }
+
+  .guided-composer-enter-hint {
     display: none;
-  }
-
-  .guided-composer-assistant span {
-    -webkit-line-clamp: 2;
-    line-clamp: 2;
   }
 }
 
-@media (max-width: 380px) {
+@media (max-width: 360px) {
+  .guided-task-pill {
+    white-space: normal;
+  }
+
+  .guided-backtrack-btn {
+    padding-inline: 0;
+  }
+
   .guided-composer-row {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -1302,6 +2345,11 @@ watch(stage, (nextStage, previousStage) => {
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .guided-panel {
+    scroll-behavior: auto;
+  }
+
+  .guided-candidate-card,
   .guided-composer,
   .guided-composer-row .guided-composer-field input {
     transition: none;

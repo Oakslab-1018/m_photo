@@ -577,6 +577,8 @@ describe('GuidedDialoguePanel utilities', () => {
     expect(html).toContain('id="guided-conversation-input"')
     expect(html.match(/id="guided-conversation-input"/g)).toHaveLength(1)
     expect(html).not.toContain('搜索 / 提交文字')
+    expect(html).not.toContain('guided-composer-head')
+    expect(html).not.toContain('看到新线索？随时补充')
     expect(html).toMatch(
       /<div[^>]*class="guided-panel"[^>]*>[\s\S]*<\/div>\s*<form[^>]*class="guided-composer"/,
     )
@@ -605,7 +607,7 @@ describe('GuidedDialoguePanel utilities', () => {
     const css = readFileSync(new URL('../style.css', import.meta.url), 'utf8')
 
     expect(html).toMatch(
-      /<section class="guided-dialogue-shell">\s*<div[^>]*class="guided-panel"[^>]*>[\s\S]*<\/div>\s*<form[^>]*class="guided-composer"/,
+      /<section class="guided-dialogue-shell"[^>]*>\s*<div[^>]*class="guided-panel"[^>]*>[\s\S]*<\/div>\s*<form[^>]*class="guided-composer"/,
     )
     expect(css).toMatch(
       /\.guided-dialogue-shell\s*\{[^}]*overflow:\s*hidden;[^}]*display:\s*flex;[^}]*flex-direction:\s*column;/s,
@@ -629,7 +631,7 @@ describe('GuidedDialoguePanel utilities', () => {
     )
   })
 
-  it('shows the current assistant explanation near the lower-stage composer', async () => {
+  it('shows the latest assistant explanation in the compact dock header', async () => {
     const html = await render(
       dialogue({
         stage: 'city',
@@ -644,8 +646,54 @@ describe('GuidedDialoguePanel utilities', () => {
       },
     )
 
-    expect(html).toContain('guided-composer-assistant')
+    expect(html).toContain('guided-task-message')
+    expect(html).toContain('最新助手提示')
     expect(html).toContain('请结合照片中的道路方向和地名，确认城市候选。')
+    expect(html).not.toContain('guided-composer-assistant')
+    expect(html).not.toContain('guided-composer-head')
+  })
+
+  it('numbers candidates in visible order and keeps long evidence behind a disclosure', async () => {
+    const otaru: LocationTarget = {
+      ...sapporo,
+      id: '1002',
+      label: '小樽',
+      city_id: '1002',
+    }
+    const html = await render(
+      dialogue({
+        stage: 'city',
+        confirmed: { country: japan, admin1: null, city: null },
+      }),
+      [
+        { target: sapporo, score: 0.8, reason: '目录匹配到城市名' },
+        { target: otaru, score: 0.7, reason: '长依据'.repeat(30) },
+      ],
+      { phase: 'candidates' },
+    )
+
+    expect(html).toContain('aria-label="选择候选 1：札幌，在地图查看"')
+    expect(html).toContain('aria-label="选择候选 2：小樽，在地图查看"')
+    expect(html.match(/class="guided-candidate-number"/g)).toHaveLength(2)
+    expect(html).toContain('<details class="guided-candidate-detail"')
+    expect(html).toContain('查看依据与坐标说明')
+    expect(html).toContain('目录匹配到城市名')
+    expect(html.indexOf('札幌')).toBeLessThan(html.indexOf('小樽'))
+  })
+
+  it('keeps one sticky task header, one scroll panel, and a compact external composer', () => {
+    const source = readFileSync(
+      new URL('../components/GuidedDialoguePanel.vue', import.meta.url),
+      'utf8',
+    )
+
+    expect(source).toContain('class="guided-dock-header"')
+    expect(source).toMatch(/\.guided-dock-header\s*\{[^}]*position:\s*sticky;/s)
+    expect(source).toMatch(/\.guided-panel\s*\{[^}]*overflow-y:\s*auto;/s)
+    expect(source).toMatch(/\.guided-composer\s*\{[^}]*flex:\s*0 0 auto;/s)
+    expect(source).toMatch(/\.guided-path\s*\{[^}]*display:\s*flex;[^}]*flex-direction:\s*row;/s)
+    expect(source).not.toContain('guided-composer-head')
+    expect(source).not.toContain('看到新线索？随时补充')
   })
 
   it('builds a natural review question from the localized clue instead of raw enums', async () => {

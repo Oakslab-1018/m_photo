@@ -20,13 +20,15 @@ import type {
   LocationTarget,
 } from '@/types'
 import { cityPoints, countryPoints, guidedLocationPoints } from '@/utils/geoPoints'
-import { locationLevelLabel } from '@/utils/guided'
+import { guidedTargetKey, locationLevelLabel } from '@/utils/guided'
 import { resolveMapStyle } from '@/utils/mapConfig'
 import {
   createMapLifecycle,
+  normalizeViewportInsets,
   type FitToPointsOptions,
   type MapLifecycle,
   type MapPoint,
+  type ViewportInsets,
 } from '@/composables/useMapLibre'
 
 // Idempotent, and the Map itself is only built in onMounted, so ordering is safe.
@@ -49,6 +51,10 @@ const props = withDefaults(
     selectedGuidedTargetKey?: string | null
     guidedConfirmationReady?: boolean
     busy?: boolean
+    /** Render the map legend/navigation as a safe-area overlay inside the canvas. */
+    immersive?: boolean
+    /** Floating UI coverage measured against the map canvas, not the page. */
+    viewportInsets?: ViewportInsets
   }>(),
   {
     cityScores: () => [],
@@ -62,6 +68,8 @@ const props = withDefaults(
     selectedGuidedTargetKey: null,
     guidedConfirmationReady: true,
     busy: false,
+    immersive: false,
+    viewportInsets: () => ({ top: 0, right: 0, bottom: 0, left: 0 }),
   },
 )
 
@@ -93,6 +101,13 @@ function scheduleMarkerClick(action: () => void): void {
 }
 
 const styleConfig = resolveMapStyle(import.meta.env as unknown as { VITE_MAP_STYLE_URL?: string; VITE_MAPTILER_API_KEY?: string })
+const normalizedViewportInsets = computed(() => normalizeViewportInsets(props.viewportInsets))
+const viewportInsetStyle = computed<Record<string, string>>(() => ({
+  '--geo-map-inset-top': normalizedViewportInsets.value.top + 'px',
+  '--geo-map-inset-right': normalizedViewportInsets.value.right + 'px',
+  '--geo-map-inset-bottom': normalizedViewportInsets.value.bottom + 'px',
+  '--geo-map-inset-left': normalizedViewportInsets.value.left + 'px',
+}))
 
 const guidedMode = computed(() => props.guided)
 const guidedMap = computed(() =>
@@ -103,6 +118,14 @@ const guidedMap = computed(() =>
     props.guidedStage,
   ),
 )
+const guidedCandidateNumbers = computed(() => {
+  const numbers = new Map<string, number>()
+  props.guidedCandidates.forEach((candidate, index) => {
+    const key = guidedTargetKey(candidate?.target)
+    if (key && !numbers.has(key)) numbers.set(key, index + 1)
+  })
+  return numbers
+})
 const countries = computed<MapPoint[]>(() => countryPoints(props.scores, props.confirmedIso))
 const cities = computed<MapPoint[]>(() => cityPoints(props.cityScores))
 const legacyPoints = computed<MapPoint[]>(() => [...countries.value, ...cities.value])
@@ -124,9 +147,9 @@ const guidedFrameSignature = computed(() => {
     .map((point) =>
       [
         point.key,
-        point.name,
         point.lat,
         point.lng,
+        point.level ?? point.kind,
         point.confirmed ? 'confirmed' : 'candidate',
         point.resolved ? 'resolved' : '',
       ].join(':'),
@@ -149,6 +172,7 @@ const guidedMarkerSignature = computed(() => {
         point.scoreType ?? '',
         point.coordinateSource ?? '',
         point.coordinateQuality ?? '',
+        point.isCurrentCandidate ? guidedCandidateNumber(point) ?? '' : '',
       ].join(':'),
     )
     .join('|')
@@ -182,6 +206,11 @@ const guidedMapNotice = computed(() => guidedSelectionNote.value ?? guidedMissin
 function pointIsSelected(point: MapPoint): boolean {
   if (guidedMode.value) return point.key === props.selectedGuidedTargetKey
   return point.kind === 'country' && point.iso === props.selectedIso
+}
+
+function guidedCandidateNumber(point: MapPoint): number | null {
+  if (!point.isCurrentCandidate) return null
+  return guidedCandidateNumbers.value.get(point.key) ?? null
 }
 
 function scoreText(point: MapPoint): string {
@@ -221,11 +250,14 @@ function guidedPointTooltip(point: MapPoint): string {
   const actionHint = props.guidedConfirmationReady
     ? '双击确认'
     : '完成新增观察核对后可双击确认'
+  const candidateNumber = guidedCandidateNumber(point)
+  const candidatePrefix = candidateNumber === null ? '候选' : '候选 ' + candidateNumber + ' · '
   if (level === 'city') {
-    return '候选城市 ' + point.name + ' · 城市目录代表点，不是照片 GPS' + score + ' · 单击选中，' + actionHint + '城市'
+    return candidatePrefix + '城市 ' + point.name + ' · 城市目录代表点，不是照片 GPS' + score + ' · 单击选中，' + actionHint + '城市'
   }
   return (
-    '候选国家 / 地区 ' +
+    candidatePrefix +
+    '国家 / 地区 ' +
     point.name +
     ' · 目录代表点，不是照片 GPS' +
     score +
@@ -238,18 +270,37 @@ function guidedPointTooltip(point: MapPoint): string {
 function markerElement(point: MapPoint): HTMLElement {
   const el = document.createElement('button')
   el.type = 'button'
-  const classes = ['maplibre-marker', 'maplibre-marker-' + point.kind]
+  const classes = ['maplibre-marker', 'geo-map-marker', 'maplibre-marker-' + point.kind]
+  const candidateNumber = guidedCandidateNumber(point)
   if (pointIsSelected(point)) classes.push('selected')
   if (point.confirmed) classes.push('confirmed')
   if (point.resolved) classes.push('resolved')
   if (point.isCurrentCandidate) classes.push('current-stage')
+  if (candidateNumber !== null) classes.push('numbered-candidate')
   if (!point.isCurrentCandidate && point.confirmed) classes.push('passive-parent')
   if (props.busy) classes.push('busy')
   el.className = classes.join(' ')
   el.disabled = props.busy
   el.setAttribute('data-target-key', point.key)
   el.setAttribute('data-kind', point.kind)
+  el.setAttribute('data-selected', pointIsSelected(point) ? 'true' : 'false')
+  el.setAttribute('data-confirmed', point.confirmed ? 'true' : 'false')
   if (point.level) el.setAttribute('data-level', point.level)
+  if (candidateNumber !== null) el.setAttribute('data-candidate-number', String(candidateNumber))
+
+  // Keep the button as a generous 38px hit target while the nested visual
+  // remains crisp and compact. Native buttons preserve Enter/Space behavior.
+  const visual = document.createElement('span')
+  visual.className = 'geo-map-marker-visual'
+  visual.setAttribute('aria-hidden', 'true')
+  if (point.confirmed) {
+    visual.textContent = '✓'
+    visual.classList.add('confirmed-check')
+  } else if (candidateNumber !== null) {
+    visual.textContent = String(candidateNumber)
+    visual.classList.add('candidate-index')
+  }
+  el.appendChild(visual)
 
   const tooltip = guidedMode.value
     ? guidedPointTooltip(point)
@@ -446,6 +497,7 @@ onMounted(() => {
       container: container.value,
       styleUrl: styleConfig.styleUrl,
       createMarkerElement: markerElement,
+      viewportInsets: normalizedViewportInsets.value,
       onLoad: () => {
         mapError.value = null
       },
@@ -492,6 +544,24 @@ watch(
 )
 
 watch(
+  () => props.busy,
+  () => {
+    renderMarkers()
+  },
+)
+
+// Inset changes are a viewport-only adjustment. MapLibre keeps the geographic
+// camera center/zoom while the visible center moves out from under the docks.
+// Never reframe candidates here: a status/layout update must not reset a manual pan.
+watch(
+  normalizedViewportInsets,
+  (nextInsets) => {
+    lifecycle?.setViewportInsets(nextInsets)
+  },
+  { deep: true, flush: 'post' },
+)
+
+watch(
   () => [props.scores, props.cityScores],
   () => {
     if (!guidedMode.value) {
@@ -519,27 +589,40 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="map-panel-inner">
-    <div class="map-wrap">
+  <div
+    class="map-panel-inner geo-map"
+    :class="{ 'geo-map--immersive': immersive }"
+    :style="viewportInsetStyle"
+    data-geo-map
+    :data-immersive="immersive ? 'true' : 'false'"
+    :data-inset-top="normalizedViewportInsets.top"
+    :data-inset-right="normalizedViewportInsets.right"
+    :data-inset-bottom="normalizedViewportInsets.bottom"
+    :data-inset-left="normalizedViewportInsets.left"
+  >
+    <div class="map-wrap geo-map__map-wrap" data-map-shell>
       <div
         ref="container"
-        class="maplibre-map"
+        class="maplibre-map geo-map__canvas"
+        data-map-canvas
         role="application"
         :aria-label="guidedMode ? '国家与城市引导候选代表点交互地图' : '候选国家与城市代表点交互地图'"
       />
-      <div v-if="styleConfig.demoOnly" class="map-badge demo">
+      <div v-if="styleConfig.demoOnly" class="map-badge demo geo-map__badge">
         Demo 底图 · 仅开发预览，不可用于生产
       </div>
-      <div v-if="guidedMapNotice" class="map-coordinate-note" role="status">
-        {{ guidedMapNotice }}
+      <div class="geo-map__safe-center">
+        <div v-if="!displayPoints.length" class="map-empty-overlay">
+          {{ guidedMode ? '当前阶段暂无可显示的有效坐标候选' : '上传图片后，候选国家与城市代表点会显示在这里' }}
+        </div>
+        <div v-if="mapError" class="map-error-overlay" role="status">{{ mapError }}</div>
       </div>
-      <div v-if="!displayPoints.length" class="map-empty-overlay">
-        {{ guidedMode ? '当前阶段暂无可显示的有效坐标候选' : '上传图片后，候选国家与城市代表点会显示在这里' }}
-      </div>
-      <div v-if="mapError" class="map-error-overlay" role="status">{{ mapError }}</div>
     </div>
 
-    <div class="map-footer">
+    <div class="map-footer geo-map-footer">
+      <div v-if="guidedMapNotice" class="map-coordinate-note geo-map-coordinate-note" role="status">
+        {{ guidedMapNotice }}
+      </div>
       <div v-if="guidedMode" class="map-legend">
         <span><i class="legend-dot" />国家 / 地区候选</span>
         <span><i class="legend-dot city" />城市候选</span>
@@ -575,3 +658,256 @@ onBeforeUnmount(() => {
     </div>
   </div>
 </template>
+
+<style scoped>
+.geo-map.map-panel-inner {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr) auto;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
+
+.geo-map__map-wrap {
+  grid-column: 1;
+  grid-row: 1;
+  min-width: 0;
+}
+
+.geo-map-footer {
+  grid-column: 1;
+  grid-row: 2;
+  min-width: 0;
+}
+
+.geo-map--immersive {
+  grid-template-rows: minmax(0, 1fr);
+}
+
+.geo-map--immersive > .geo-map-footer {
+  grid-column: 1;
+  grid-row: 1;
+  align-self: end;
+  z-index: 20;
+  box-sizing: border-box;
+  max-height: calc(100% - var(--geo-map-inset-top) - var(--geo-map-inset-bottom) - 52px);
+  /* Leave the compact attribution control its own unobstructed bottom row. */
+  margin: 0 calc(var(--geo-map-inset-right) + 10px) calc(var(--geo-map-inset-bottom) + 42px) calc(var(--geo-map-inset-left) + 10px);
+  padding: 8px 10px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  border: 1px solid rgba(148, 163, 184, 0.42);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.92);
+  box-shadow: 0 8px 28px rgba(15, 23, 42, 0.18);
+  backdrop-filter: blur(10px);
+}
+
+.geo-map--immersive > .geo-map-footer .ghost-btn {
+  min-height: 34px;
+  background: rgba(255, 255, 255, 0.94);
+}
+
+.geo-map-coordinate-note {
+  position: static;
+  inset: auto;
+  flex: 0 0 100%;
+  width: 100%;
+  max-width: none;
+  box-sizing: border-box;
+}
+
+.geo-map__safe-center {
+  position: absolute;
+  inset: var(--geo-map-inset-top) var(--geo-map-inset-right) var(--geo-map-inset-bottom) var(--geo-map-inset-left);
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  box-sizing: border-box;
+  padding: 10px;
+  pointer-events: none;
+}
+
+.geo-map__safe-center .map-empty-overlay,
+.geo-map__safe-center .map-error-overlay {
+  position: static;
+  inset: auto;
+  transform: none;
+  max-width: min(86%, 520px);
+}
+
+.geo-map__badge {
+  top: calc(var(--geo-map-inset-top) + 10px);
+  left: calc(var(--geo-map-inset-left) + 10px);
+  max-width: calc(100% - var(--geo-map-inset-left) - var(--geo-map-inset-right) - 20px);
+  box-sizing: border-box;
+}
+
+/* Keep MapLibre's own controls out of the measured floating-dock area. */
+.geo-map :deep(.maplibregl-ctrl-top-left) {
+  top: var(--geo-map-inset-top);
+  left: var(--geo-map-inset-left);
+  z-index: 30;
+}
+
+.geo-map :deep(.maplibregl-ctrl-top-right) {
+  top: var(--geo-map-inset-top);
+  right: var(--geo-map-inset-right);
+  z-index: 30;
+}
+
+.geo-map :deep(.maplibregl-ctrl-bottom-left) {
+  bottom: var(--geo-map-inset-bottom);
+  left: var(--geo-map-inset-left);
+  z-index: 30;
+}
+
+.geo-map :deep(.maplibregl-ctrl-bottom-right) {
+  right: var(--geo-map-inset-right);
+  bottom: var(--geo-map-inset-bottom);
+  z-index: 30;
+}
+
+/* Markers are created imperatively, so :deep reaches MapLibre's child nodes. */
+.geo-map :deep(.maplibre-marker) {
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  min-width: 44px;
+  min-height: 44px;
+  box-sizing: border-box;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  box-shadow: none;
+  color: inherit;
+  cursor: pointer;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.geo-map :deep(.maplibre-marker.busy) {
+  cursor: not-allowed;
+}
+
+.geo-map :deep(.maplibre-marker:focus-visible) {
+  outline: 3px solid #0f766e;
+  outline-offset: 2px;
+}
+
+.geo-map :deep(.geo-map-marker-visual) {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  box-sizing: border-box;
+  border: 2px solid #fff;
+  border-radius: 50%;
+  background: var(--primary);
+  color: #fff;
+  box-shadow: 0 1px 4px rgba(30, 41, 59, 0.38);
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-size: 11px;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  -webkit-font-smoothing: antialiased;
+  pointer-events: none;
+}
+
+.geo-map :deep(.maplibre-marker-city .geo-map-marker-visual) {
+  border: 3px solid var(--city);
+  border-radius: 5px;
+  background: #fff;
+  color: var(--city);
+}
+
+.geo-map :deep(.maplibre-marker.confirmed .geo-map-marker-visual) {
+  border-color: #fff;
+  background: var(--danger);
+  color: #fff;
+}
+
+.geo-map :deep(.maplibre-marker.resolved .geo-map-marker-visual) {
+  box-shadow: 0 0 0 5px rgba(220, 38, 38, 0.24), 0 1px 5px rgba(30, 41, 59, 0.4);
+}
+
+.geo-map :deep(.maplibre-marker.passive-parent .geo-map-marker-visual) {
+  box-shadow: 0 0 0 3px rgba(100, 116, 139, 0.35), 0 1px 4px rgba(30, 41, 59, 0.32);
+}
+
+.geo-map :deep(.maplibre-marker.selected .geo-map-marker-visual) {
+  box-shadow: 0 0 0 4px rgba(15, 118, 110, 0.35), 0 1px 4px rgba(30, 41, 59, 0.38);
+}
+
+.geo-map :deep(.geo-map-marker-visual.confirmed-check) {
+  font-size: 14px;
+  font-weight: 900;
+}
+
+@media (max-width: 760px) {
+  .geo-map--immersive > .geo-map-footer {
+    /* Attribution can wrap to two lines on a narrow screen. */
+    margin-bottom: calc(var(--geo-map-inset-bottom) + 62px);
+    gap: 8px;
+    padding: 7px 9px;
+    overflow-x: hidden;
+  }
+
+  .geo-map-footer .map-legend {
+    flex-wrap: wrap;
+    gap: 5px 10px;
+    width: 100%;
+  }
+
+  .geo-map-footer .map-legend > span {
+    white-space: nowrap;
+  }
+
+  .geo-map-footer .map-hint {
+    flex: 1 1 100%;
+    min-width: 0;
+    line-height: 1.45;
+  }
+
+  .geo-map-footer .focus-group {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+    width: 100%;
+    margin-left: 0;
+  }
+
+  .geo-map--immersive > .geo-map-footer .ghost-btn {
+    width: 100%;
+    min-width: 0;
+    min-height: 36px;
+    padding-inline: 8px;
+    font-size: 11px;
+    white-space: normal;
+  }
+}
+
+@media (hover: hover) and (prefers-reduced-motion: no-preference) {
+  .geo-map :deep(.geo-map-marker-visual) {
+    transition: transform 120ms ease, box-shadow 120ms ease;
+  }
+
+  .geo-map :deep(.maplibre-marker:not(:disabled):hover .geo-map-marker-visual) {
+    transform: scale(1.08);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .geo-map :deep(.maplibre-marker),
+  .geo-map :deep(.geo-map-marker-visual) {
+    transition: none;
+  }
+}
+</style>
