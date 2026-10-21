@@ -99,27 +99,12 @@ function formatNumber(value: number | null | undefined, digits = 3): string {
   return typeof value === 'number' && Number.isFinite(value) ? value.toFixed(digits) : '—'
 }
 
-function formatMetric(value: unknown): string {
-  if (typeof value === 'string') return value
-  if (typeof value === 'number') return Number.isFinite(value) ? String(value) : '—'
-  if (typeof value === 'boolean') return value ? '是' : '否'
-  if (Array.isArray(value)) return value.map((item: unknown) => formatMetric(item)).join('、')
-  if (value && typeof value === 'object') {
-    try {
-      return JSON.stringify(value) ?? '—'
-    } catch {
-      return '无法显示'
-    }
-  }
-  return '—'
-}
-
-const metricEntries = computed(() => Object.entries(selectedReport.value?.quality.metrics ?? {}).slice(0, 10))
-
 const visibleObservations = computed(() => {
   const report = selectedReport.value
   if (!report) return []
   return report.observations.filter((observation) => {
+    // 像素统计只是测量信号，不是分析依据，不在报告中展示
+    if (observation.kind === 'pixel_signal') return false
     if (observation.kind !== 'ocr_text') return true
     return report.ocr.available && report.ocr.state.toLowerCase() !== 'mock' && Boolean(observation.text?.trim())
   })
@@ -245,21 +230,10 @@ function observationHasBox(observation: RegionObservation): boolean {
           </div>
         </section>
 
-        <section class="region-quality">
-          <div class="region-section-title">质量提示</div>
-          <ul v-if="selectedReport.quality.issues.length">
-            <li v-for="issue in selectedReport.quality.issues" :key="issue">{{ issue }}</li>
-          </ul>
-          <p v-else>未报告明显质量问题。</p>
-          <div v-if="metricEntries.length" class="region-metrics">
-            <span v-for="entry in metricEntries" :key="entry[0]">{{ entry[0] }}：{{ formatMetric(entry[1]) }}</span>
-          </div>
-        </section>
-
         <section class="region-observations">
-          <div class="region-section-title">证据与观察</div>
+          <div class="region-section-title">分析依据</div>
           <div v-if="!visibleObservations.length" class="region-report-empty">
-            没有可展示的真实 OCR/模型/像素观察；不可用状态不会被猜测文本填充。
+            没有可展示的真实 OCR/模型观察；不可用状态不会被猜测文本填充。
           </div>
           <article v-for="observation in visibleObservations" :key="observation.id" class="region-observation-card">
             <div class="region-observation-head">
@@ -284,9 +258,6 @@ function observationHasBox(observation: RegionObservation): boolean {
             </div>
             <p v-if="observation.kind === 'scene_hypothesis'" class="region-scene-note">
               场景假设仅用于人工复核，不是拍摄地概率，也不参与引导确认。
-            </p>
-            <p v-if="observation.kind === 'pixel_signal'" class="region-pixel-note">
-              该条为图像测量信号，只说明当前裁剪中的可见特征，不推断建筑、车辆或气候等事实。
             </p>
           </article>
         </section>
