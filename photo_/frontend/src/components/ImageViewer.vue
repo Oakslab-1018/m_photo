@@ -1,0 +1,465 @@
+<script setup lang="ts">
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import type {
+  AnalyzePointRequest,
+  AnalyzePurpose,
+  ImageRegion,
+  Point,
+  RegionAnalysisRecord,
+  RegionQuestion,
+  RegionReport,
+} from '@/types'
+import RegionReportPanel from '@/components/RegionReportPanel.vue'
+import { newRegionRequestId, observationBox } from '@/utils/regionAnalysis'
+
+const props = withDefaults(
+  defineProps<{
+    imageUrl: string | null
+    clickPoints?: Point[]
+    regionReports?: RegionReport[]
+    selectedRegionReportId?: string | null
+    regionRequests?: RegionAnalysisRecord[]
+    analyzing: boolean
+    status: string
+    statusKind: 'idle' | 'loading' | 'success' | 'error'
+    disabled?: boolean
+  }>(),
+  {
+    clickPoints: () => [],
+    regionReports: () => [],
+    selectedRegionReportId: null,
+    regionRequests: () => [],
+    disabled: false,
+  },
+)
+
+const emit = defineEmits<{
+  analyze: [request: AnalyzePointRequest]
+  'select-region': [reportId: string]
+  'retry-region': [request: AnalyzePointRequest]
+  'ask-question': [question: RegionQuestion]
+  'selection-change': []
+  close: []
+}>()
+
+// 缩放倍数：100% 表示图片刚好完整显示在固定大小的图片区域内，只允许在此基础上放大
+const zoom = ref(1)
+const MIN_ZOOM = 1
+const MAX_ZOOM = 5
+const naturalWidth = ref(0)
+const naturalHeight = ref(0)
+// 100% 时图片实际像素相对于原图的缩放比例（contain 适配）
+const fitScale = ref(1)
+
+const hasReport = computed(() => props.regionReports.length > 0 || props.regionRequests.length > 0)
+
+const stageStyle = computed<Record<string, string> | undefined>(() => {
+  if (!naturalWidth.value || !naturalHeight.value) return undefined
+  const width = naturalWidth.value * fitScale.value * zoom.value
+  return { width: `${Math.floor(width)}px` }
+})
+const mode = ref<'point' | 'rect' | 'pan'>('point')
+const scale = ref(0.25)
+const purpose = ref<AnalyzePurpose>('auto')
+const draftPoint = ref<Point | null>(null)
+const draftRegion = ref<ImageRegion | null>(null)
+const imageRef = ref<HTMLImageElement | null>(null)
+const wrapRef = ref<HTMLElement | null>(null)
+const panning = ref(false)
+const rectDragging = ref(false)
+let moved = false
+let rectOrigin: Point | null = null
+let panStart = { x: 0, y: 0, scrollLeft: 0, scrollTop: 0 }
+let resizeObserver: ResizeObserver | null = null
+
+const interactionDisabled = computed(() => props.disabled || props.analyzing)
+const selectedReport = computed(() =>
+  props.regionReports.find((report) => report.id === props.selectedRegionReportId)
+  ?? props.regionReports[0]
+  ?? null,
+)
+const canAnalyze = computed(() => !interactionDisabled.value && buildRequest(false) !== null)
+const selectionText = computed(() => {
+  if (draftRegion.value && draftRegion.value.w > 0 && draftRegion.value.h > 0) {
+    const region = draftRegion.value
+    return '矩形 ROI：' + formatPercent(region.x) + ', ' + formatPercent(region.y) + ' · ' + formatPercent(region.w) + ' × ' + formatPercent(region.h)
+  }
+  if (draftPoint.value) return '点选：' + formatPercent(draftPoint.value.x) + ', ' + formatPercent(draftPoint.value.y)
+  return '尚未选择区域'
+})
+const viewerTip = computed(() => {
+  if (interactionDisabled.value) return '分析中或当前忙碌，暂时锁定选区与引导操作'
+  if (mode.value === 'rect') return '框选模式：拖拽画出矩形 ROI；滚轮缩放，切换平移动态图'
+  if (mode.value === 'pan') return '平移模式：拖拽移动图片；滚轮缩放'
+  return '点选模式：单击图片选择点；拖拽平移，滚轮缩放；确认后点击“分析选定区域”'
+})
+const reportBox = computed(() => selectedReport.value?.bbox_norm ?? null)
+const evidenceBoxes = computed(() => {
+  const report = selectedReport.value
+  if (!report) return []
+  return report.observations
+    .filter((observation) => observation.kind !== 'pixel_signal')
+    .filter((observation) => observationBox(observation) !== null)
+    .filter((observation) => observation.kind !== 'ocr_text' || (report.ocr.available && report.ocr.state.toLowerCase() !== 'mock' && Boolean(observation.text?.trim())))
+    .map((observation) => ({ id: observation.id, bbox: observationBox(observation)!, kind: observation.kind }))
+})
+
+function formatPercent(value: number): string {
+  return Math.round(value * 100) + '%'
+}
+
+function boxStyle(bbox: { x: number; y: number; w: number; h: number } | null): Record<string, string> {
+  if (!bbox) return {}
+  return {
+    left: String(bbox.x * 100) + '%',
+    top: String(bbox.y * 100) + '%',
+    width: String(bbox.w * 100) + '%',
+    height: String(bbox.h * 100) + '%',
+  }
+}
+
+function pointFromEvent(event: MouseEvent): Point | null {
+  const image = imageRef.value
+  if (!image) return null
+  const rect = image.getBoundingClientRect()
+  if (rect.width <= 0 || rect.height <= 0) return null
+  return {
+    x: Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width)),
+    y: Math.min(1, Math.max(0, (event.clientY - rect.top) / rect.height)),
+  }
+}
+function buildRequest(assignId: boolean): AnalyzePointRequest | null {
+  const region = draftRegion.value
+  const point = draftPoint.value
+  if (region && region.w > 0 && region.h > 0) {
+    const request: AnalyzePointRequest = {
+      x: region.x + region.w / 2,
+      y: region.y + region.h / 2,
+      scale: Math.min(0.8, Math.max(0.08, scale.value)),
+      image_region: { ...region },
+      purpose: purpose.value,
+    }
+    if (assignId) request.client_request_id = newRegionRequestId()
+    return request
+  }
+  if (!point) return null
+  const request: AnalyzePointRequest = {
+    x: point.x,
+    y: point.y,
+    scale: Math.min(0.8, Math.max(0.08, scale.value)),
+    purpose: purpose.value,
+  }
+  if (assignId) request.client_request_id = newRegionRequestId()
+  return request
+}
+
+function analyzeSelection(): void {
+  if (interactionDisabled.value) return
+  const request = buildRequest(true)
+  if (request) emit('analyze', request)
+}
+
+function clearSelection(): void {
+  draftPoint.value = null
+  draftRegion.value = null
+  rectOrigin = null
+}
+
+function setMode(next: 'point' | 'rect' | 'pan'): void {
+  if (interactionDisabled.value || mode.value === next) return
+  const hadSelection = draftPoint.value !== null || draftRegion.value !== null
+  mode.value = next
+  if (next === 'point') draftRegion.value = null
+  if (next === 'rect') draftPoint.value = null
+  if (hadSelection) emit('selection-change')
+}
+
+function regionFromPoints(start: Point, end: Point): ImageRegion {
+  const x = Math.min(start.x, end.x)
+  const y = Math.min(start.y, end.y)
+  return {
+    x,
+    y,
+    w: Math.abs(end.x - start.x),
+    h: Math.abs(end.y - start.y),
+  }
+}
+
+function onMouseDown(event: MouseEvent): void {
+  if (event.button !== 0 || interactionDisabled.value || !imageRef.value || !wrapRef.value) return
+  moved = false
+  if (mode.value === 'rect') {
+    const point = pointFromEvent(event)
+    if (!point) return
+    rectOrigin = point
+    rectDragging.value = true
+    draftRegion.value = { x: point.x, y: point.y, w: 0, h: 0 }
+    event.preventDefault()
+    return
+  }
+  panning.value = true
+  panStart = {
+    x: event.clientX,
+    y: event.clientY,
+    scrollLeft: wrapRef.value.scrollLeft,
+    scrollTop: wrapRef.value.scrollTop,
+  }
+  event.preventDefault()
+}
+
+function onMouseMove(event: MouseEvent): void {
+  if (rectDragging.value && rectOrigin) {
+    const current = pointFromEvent(event)
+    if (!current) return
+    if (Math.abs(current.x - rectOrigin.x) > 0.004 || Math.abs(current.y - rectOrigin.y) > 0.004) moved = true
+    draftRegion.value = regionFromPoints(rectOrigin, current)
+    return
+  }
+  if (!panning.value || !wrapRef.value) return
+  const dx = event.clientX - panStart.x
+  const dy = event.clientY - panStart.y
+  if (Math.abs(dx) > 3 || Math.abs(dy) > 3) moved = true
+  wrapRef.value.scrollLeft = panStart.scrollLeft - dx
+  wrapRef.value.scrollTop = panStart.scrollTop - dy
+}
+
+function onMouseUp(): void {
+  if (rectDragging.value) {
+    rectDragging.value = false
+    const region = draftRegion.value
+    if (!region || region.w < 0.005 || region.h < 0.005) {
+      draftRegion.value = null
+    } else {
+      emit('selection-change')
+    }
+    rectOrigin = null
+  }
+  panning.value = false
+}
+
+function onImageClick(event: MouseEvent): void {
+  if (moved || interactionDisabled.value || mode.value !== 'point') return
+  const point = pointFromEvent(event)
+  if (!point) return
+  draftPoint.value = point
+  draftRegion.value = null
+  emit('selection-change')
+}
+
+function computeFitState(): void {
+  const image = imageRef.value
+  const wrap = wrapRef.value
+  if (!image || !wrap) return
+  const nw = image.naturalWidth
+  const nh = image.naturalHeight
+  const ww = wrap.clientWidth
+  const wh = wrap.clientHeight
+  if (!nw || !nh || ww <= 0 || wh <= 0) return
+  // 图片按 100% 时刚好完整塞进图片区域（contain）：X、Y 两个方向取较小缩放比例
+  // 预留 2px 余量，避免亚像素取整后出现不必要的滚动条
+  const fit = Math.min((ww - 2) / nw, (wh - 2) / nh)
+  fitScale.value = fit
+}
+function onImageLoad(): void {
+  const image = imageRef.value
+  naturalWidth.value = image?.naturalWidth ?? 0
+  naturalHeight.value = image?.naturalHeight ?? 0
+  computeFitState()
+  zoom.value = 1
+}
+
+function onWheel(event: WheelEvent): void {
+  event.preventDefault()
+  const next = event.deltaY < 0 ? zoom.value * 1.15 : zoom.value / 1.15
+  zoom.value = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, next))
+}
+
+function zoomIn(): void {
+  zoom.value = Math.min(MAX_ZOOM, zoom.value * 1.15)
+}
+
+function zoomOut(): void {
+  zoom.value = Math.max(MIN_ZOOM, zoom.value / 1.15)
+}
+
+function onKeydown(event: KeyboardEvent): void {
+  if (event.key === 'Escape') emit('close')
+}
+
+function close(): void {
+  emit('close')
+}
+
+function retryRequest(request: AnalyzePointRequest): void {
+  if (!interactionDisabled.value) emit('retry-region', request)
+}
+
+function askQuestion(question: RegionQuestion): void {
+  if (!interactionDisabled.value) emit('ask-question', question)
+}
+
+function selectReport(reportId: string): void {
+  emit('select-region', reportId)
+}
+
+watch(
+  () => props.imageUrl,
+  () => {
+    zoom.value = 1
+    naturalWidth.value = 0
+    naturalHeight.value = 0
+    fitScale.value = 1
+    mode.value = 'point'
+    scale.value = 0.25
+    purpose.value = 'auto'
+    clearSelection()
+  },
+)
+
+onMounted(() => {
+  window.addEventListener('keydown', onKeydown)
+  window.addEventListener('mousemove', onMouseMove)
+  window.addEventListener('mouseup', onMouseUp)
+  // 缓存图片可能在监听前已触发 load，这里补一次
+  if (imageRef.value?.complete) onImageLoad()
+  // 图片区域尺寸固定，但窗口大小变化时仍需重新计算 contain 适配比例
+  if (wrapRef.value && 'ResizeObserver' in window) {
+    resizeObserver = new ResizeObserver(() => computeFitState())
+    resizeObserver.observe(wrapRef.value)
+  }
+})
+
+onBeforeUnmount(() => {
+  window.removeEventListener('keydown', onKeydown)
+  window.removeEventListener('mousemove', onMouseMove)
+  window.removeEventListener('mouseup', onMouseUp)
+  resizeObserver?.disconnect()
+  resizeObserver = null
+})
+</script>
+
+<template>
+  <div class="image-viewer" role="dialog" aria-modal="true" aria-label="图片局部分析">
+    <div class="viewer-backdrop" @click="close" />
+    <div class="viewer-content">
+      <div class="viewer-header">
+        <div class="viewer-heading">
+          <span class="viewer-tip">{{ viewerTip }}</span>
+          <span v-if="analyzing" class="viewer-busy" role="status">分析中，暂不允许改选区或引导操作</span>
+        </div>
+        <div class="viewer-tools">
+          <div class="viewer-mode-group" role="group" aria-label="图片交互模式">
+            <button type="button" class="viewer-mode" :class="{ active: mode === 'point' }" :disabled="interactionDisabled" @click="setMode('point')">
+              点选
+            </button>
+            <button type="button" class="viewer-mode" :class="{ active: mode === 'rect' }" :disabled="interactionDisabled" @click="setMode('rect')">
+              框选
+            </button>
+            <button type="button" class="viewer-mode" :class="{ active: mode === 'pan' }" :disabled="interactionDisabled" @click="setMode('pan')">
+              平移
+            </button>
+          </div>
+          <button type="button" class="viewer-zoom" aria-label="缩小" :disabled="interactionDisabled || zoom <= 1.0001" @click="zoomOut">−</button>
+          <span class="viewer-zoom-label">{{ Math.round(zoom * 100) }}%</span>
+          <button type="button" class="viewer-zoom" aria-label="放大" :disabled="interactionDisabled" @click="zoomIn">＋</button>
+          <button type="button" class="viewer-close" aria-label="关闭" @click="close">×</button>
+        </div>
+      </div>
+
+      <div class="viewer-controls">
+        <label class="viewer-scale-control">
+          <span>点击尺度</span>
+          <input v-model.number="scale" type="range" min="0.08" max="0.8" step="0.01" :disabled="interactionDisabled">
+          <strong>{{ Math.round(scale * 100) }}%</strong>
+        </label>
+        <div class="viewer-purpose-group" role="group" aria-label="分析用途">
+          <button type="button" class="viewer-purpose" :class="{ active: purpose === 'auto' }" :disabled="interactionDisabled" @click="purpose = 'auto'">自动</button>
+          <button type="button" class="viewer-purpose" :class="{ active: purpose === 'ocr' }" :disabled="interactionDisabled" @click="purpose = 'ocr'">文字</button>
+          <button type="button" class="viewer-purpose" :class="{ active: purpose === 'scene' }" :disabled="interactionDisabled" @click="purpose = 'scene'">场景</button>
+        </div>
+        <span class="viewer-selection-summary">{{ selectionText }}</span>
+        <button type="button" class="primary-btn viewer-analyze-btn" :disabled="!canAnalyze" @click="analyzeSelection">
+          {{ analyzing ? '分析中…' : '分析选定区域' }}
+        </button>
+      </div>
+
+      <div class="viewer-layout">
+        <div class="viewer-main">
+          <div
+            ref="wrapRef"
+            class="viewer-image-wrap"
+            :class="[`mode-${mode}`, { dragging: panning || rectDragging, disabled: interactionDisabled }]"
+            @wheel="onWheel"
+          >
+            <div class="viewer-stage" :style="stageStyle">
+              <img
+                ref="imageRef"
+                :src="imageUrl ?? undefined"
+                alt="上传图片大图"
+                @load="onImageLoad"
+                @mousedown="onMouseDown"
+                @click="onImageClick"
+              >
+              <div class="viewer-markers">
+                <span
+                  v-for="(point, index) in clickPoints"
+                  :key="`point-${point.x}-${point.y}-${index}`"
+                  class="click-marker"
+                  :style="{ left: point.x * 100 + '%', top: point.y * 100 + '%' }"
+                >
+                  <span class="click-num">{{ index + 1 }}</span>
+                </span>
+                <span
+                  v-if="draftPoint"
+                  class="click-marker draft-point"
+                  :style="{ left: draftPoint.x * 100 + '%', top: draftPoint.y * 100 + '%' }"
+                >
+                  <span class="click-num">选</span>
+                </span>
+                <span
+                  v-if="draftRegion"
+                  class="draft-region"
+                  :style="boxStyle(draftRegion)"
+                >ROI</span>
+                <span
+                  v-if="reportBox"
+                  class="report-region-box"
+                  :style="boxStyle(reportBox)"
+                >报告 ROI</span>
+                <span
+                  v-for="box in evidenceBoxes"
+                  :key="`evidence-${box.id}`"
+                  class="report-evidence-box"
+                  :class="`kind-${box.kind}`"
+                  :style="boxStyle(box.bbox)"
+                />
+              </div>
+            </div>
+          </div>
+          <div class="viewer-status" :class="statusKind">
+            {{ status }}
+          </div>
+        </div>
+
+        <div class="viewer-report-slot">
+          <RegionReportPanel
+            v-if="hasReport"
+            :image-url="imageUrl"
+            :reports="regionReports"
+            :selected-report-id="selectedRegionReportId"
+            :requests="regionRequests"
+            :analyzing="analyzing"
+            :disabled="disabled"
+            @select-region="selectReport"
+            @retry-region="retryRequest"
+            @ask-question="askQuestion"
+          />
+          <div v-else class="viewer-report-empty">
+            <strong>分析报告</strong>
+            <p>在左侧图片上点选或框选区域，点击「分析选定区域」后，这里会显示文字识别结果、场景线索与区域质量。</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</template>
