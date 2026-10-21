@@ -964,7 +964,10 @@ class GuidedDialogueService:
             elif level == "admin1":
                 place = self._store().get_place("admin1", str(result.get("id") or ""))
             elif level == "city":
-                place = self._store().get_place("city", str(result.get("id") or ""))
+                place = self._store().get_place(
+                    "city",
+                    str(result.get("city_id") or result.get("id") or ""),
+                )
             else:
                 place = None
         except Exception as exc:
@@ -983,13 +986,8 @@ class GuidedDialogueService:
         result.update(fields["provenance"])
         if level == "city":
             result["label"] = city_name_zh(
-                str(result.get("id") or result.get("city_id") or ""),
-                str(
-                    getattr(place, "label", "")
-                    or result.get("label")
-                    or getattr(place, "name", "")
-                    or ""
-                ),
+                str(result.get("city_id") or result.get("id") or ""),
+                str(getattr(place, "name", "") or ""),
             )
         return result
 
@@ -1089,7 +1087,7 @@ class GuidedDialogueService:
             raise self._unavailable(exc) from exc
         return self._city_row_from_place(place) if place is not None else None
 
-    def _city_target(self, row: CityRow, *, label: str | None = None) -> dict[str, Any]:
+    def _city_target(self, row: CityRow) -> dict[str, Any]:
         canonical = canonical_country_iso(row.iso)
         admin1_id = f"{row.iso}.{row.region}" if row.region else None
         try:
@@ -1104,7 +1102,7 @@ class GuidedDialogueService:
             "id": str(row.city_id),
             "label": city_name_zh(
                 row.city_id,
-                label or str(getattr(place, "label", "") or row.name),
+                str(getattr(place, "name", "") or row.name),
             ),
             "country_iso": canonical,
             "source_iso": row.iso,
@@ -1421,7 +1419,7 @@ class GuidedDialogueService:
                         row = self._city_row_from_place(place)
                     except GuidedUnavailable:
                         continue
-                    target = self._city_target(row, label=str(getattr(place, "label", "") or row.name))
+                    target = self._city_target(row)
                     key = _target_key(target)
                     if key in seen or self._excluded_by_state(state, target) is not None:
                         continue
@@ -1607,7 +1605,7 @@ class GuidedDialogueService:
             if row is None or row.iso not in country_scopes:
                 continue
             add(
-                self._city_target(row, label=str(raw.get("label") or row.name)),
+                self._city_target(row),
                 reason=self._proposal_reason(state, row),
                 selection_basis="user_text",
                 place_match=self._place_match_from_meta(state, row),
@@ -2061,25 +2059,39 @@ class GuidedDialogueService:
             prepared.action = prepared.action.model_copy(update={"message": message})
         return prepared
 
-    @staticmethod
-    def _localize_city_target(value: object) -> tuple[dict[str, Any] | None, str]:
+    def _city_catalog_name(self, city_id: object, fallback: object = "") -> str:
+        """Recover the authoritative original name for an old persisted label."""
+
+        identifier = str(city_id or "").strip()
+        fallback_name = str(fallback or "").strip()
+        if not _CITY_ID_RE.fullmatch(identifier):
+            return fallback_name
+        try:
+            place = self._store().get_place("city", identifier)
+        except Exception as exc:
+            raise self._unavailable(exc) from exc
+        if place is None:
+            return fallback_name
+        return str(getattr(place, "name", "") or "").strip() or fallback_name
+
+    def _localize_city_target(self, value: object) -> tuple[dict[str, Any] | None, str]:
         if not isinstance(value, Mapping) or value.get("level") != "city":
             return None, ""
         target = dict(value)
         old_label = str(target.get("label") or "")
+        city_id = str(target.get("id") or target.get("city_id") or "")
         target["label"] = city_name_zh(
-            str(target.get("id") or target.get("city_id") or ""),
-            old_label,
+            city_id,
+            self._city_catalog_name(city_id, old_label),
         )
         return target, old_label
 
-    @classmethod
-    def _localize_city_labels(cls, state: dict[str, Any]) -> None:
+    def _localize_city_labels(self, state: dict[str, Any]) -> None:
         """Localize legacy city display labels without changing identities."""
 
         confirmed = state.get("confirmed")
         if isinstance(confirmed, Mapping):
-            city, _ = cls._localize_city_target(confirmed.get("city"))
+            city, _ = self._localize_city_target(confirmed.get("city"))
             if city is not None:
                 updated = dict(confirmed)
                 updated["city"] = city
@@ -2088,32 +2100,32 @@ class GuidedDialogueService:
         pending = state.get("pending_question")
         if isinstance(pending, Mapping):
             question = dict(pending)
-            target, old_label = cls._localize_city_target(question.get("target"))
+            target, old_label = self._localize_city_target(question.get("target"))
             if target is not None:
                 question["target"] = target
                 new_label = str(target.get("label") or "")
                 message = str(question.get("message") or "")
                 if old_label and old_label != new_label and old_label in message:
                     question["message"] = message.replace(old_label, new_label)
-                options = []
-                for option in question.get("options") or []:
-                    if not isinstance(option, Mapping):
-                        continue
-                    localized = dict(option)
-                    city_id = str(localized.get("value") or "")
-                    if _CITY_ID_RE.fullmatch(city_id):
-                        localized["label"] = city_name_zh(
-                            city_id,
-                            str(localized.get("label") or ""),
-                        )
-                    options.append(localized)
-                if options:
-                    question["options"] = options
+            options = []
+            for option in question.get("options") or []:
+                if not isinstance(option, Mapping):
+                    continue
+                localized = dict(option)
+                city_id = str(localized.get("value") or "")
+                if _CITY_ID_RE.fullmatch(city_id):
+                    localized["label"] = city_name_zh(
+                        city_id,
+                        self._city_catalog_name(city_id, localized.get("label")),
+                    )
+                options.append(localized)
+            if options:
+                question["options"] = options
             state["pending_question"] = question
 
         proposals = []
         for item in state.get("proposals") or []:
-            target, _ = cls._localize_city_target(item)
+            target, _ = self._localize_city_target(item)
             proposals.append(target if target is not None else item)
         state["proposals"] = proposals
 

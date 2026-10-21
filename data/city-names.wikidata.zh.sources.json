@@ -1,0 +1,1479 @@
+{
+  "source": "Wikidata",
+  "endpoint": "https://query.wikidata.org/sparql",
+  "property": "P1566",
+  "license": "CC0",
+  "generated_at": "2026-10-21T09:02:47.322846+00:00",
+  "catalog_city_count": 34156,
+  "existing_chinese_count": 11286,
+  "queried_missing_city_count": 500,
+  "pending_city_count": 22370,
+  "supplemental_chinese_count": 288,
+  "ambiguous_ids": [
+    "132144",
+    "1253133"
+  ],
+  "failed_batches": [],
+  "rate_limited": true,
+  "retry_after_unix": 1792574300.0492659,
+  "complete": false,
+  "fallback": "original catalog name; no machine translation",
+  "languages": [
+    "zh-hans",
+    "zh-cn",
+    "zh",
+    "zh-hant",
+    "zh-tw",
+    "zh-hk",
+    "zh-sg",
+    "zh-mo"
+  ],
+  "batches": [
+    {
+      "query_sha256": "fb3ee6fa2edae38da3f6e40f2c509cd2eb06ac22bdd435d3ac1379344393e998",
+      "fetched_at": "2026-10-21T08:57:29.496552+00:00"
+    }
+  ],
+  "labels": {
+    "1684308": {
+      "label": "达义市",
+      "entity_id": "Q1643",
+      "language": "zh-hans"
+    },
+    "373303": {
+      "label": "朱巴",
+      "entity_id": "Q1947",
+      "language": "zh-hans"
+    },
+    "487846": {
+      "label": "斯塔夫罗波尔",
+      "entity_id": "Q5206",
+      "language": "zh-hans"
+    },
+    "571476": {
+      "label": "布良斯克",
+      "entity_id": "Q2801",
+      "language": "zh-hans"
+    },
+    "103630": {
+      "label": "奈季兰",
+      "entity_id": "Q27174",
+      "language": "zh-hans"
+    },
+    "1502026": {
+      "label": "克拉斯诺亚尔斯克",
+      "entity_id": "Q919",
+      "language": "zh-hans"
+    },
+    "1273800": {
+      "label": "卡达帕",
+      "entity_id": "Q30651",
+      "language": "zh-hans"
+    },
+    "98854": {
+      "label": "纳西里耶",
+      "entity_id": "Q38811",
+      "language": "zh"
+    },
+    "1133616": {
+      "label": "马扎里沙里夫",
+      "entity_id": "Q130469",
+      "language": "zh-hans"
+    },
+    "1268561": {
+      "label": "卡金纳达",
+      "entity_id": "Q59018",
+      "language": "zh-hans"
+    },
+    "1793703": {
+      "label": "太仓市",
+      "entity_id": "Q61985",
+      "language": "zh-hans"
+    },
+    "3836277": {
+      "label": "圣菲",
+      "entity_id": "Q44244",
+      "language": "zh-hans"
+    },
+    "581049": {
+      "label": "阿尔汉格尔斯克",
+      "entity_id": "Q1851",
+      "language": "zh"
+    },
+    "1700925": {
+      "label": "馬利金納",
+      "entity_id": "Q17175",
+      "language": "zh"
+    },
+    "1587923": {
+      "label": "边和市",
+      "entity_id": "Q19316",
+      "language": "zh"
+    },
+    "1526273": {
+      "label": "阿斯塔纳",
+      "entity_id": "Q1520",
+      "language": "zh-hans"
+    },
+    "1730501": {
+      "label": "安蒂波洛",
+      "entity_id": "Q1636",
+      "language": "zh-hans"
+    },
+    "359783": {
+      "label": "艾斯尤特",
+      "entity_id": "Q29962",
+      "language": "zh-cn"
+    },
+    "298333": {
+      "label": "尚勒乌尔法",
+      "entity_id": "Q133118",
+      "language": "zh-hans"
+    },
+    "304531": {
+      "label": "梅尔辛",
+      "entity_id": "Q134291",
+      "language": "zh-hans"
+    },
+    "532096": {
+      "label": "马哈奇卡拉",
+      "entity_id": "Q5168",
+      "language": "zh-hans"
+    },
+    "584923": {
+      "label": "苏姆盖特",
+      "entity_id": "Q179833",
+      "language": "zh-hans"
+    },
+    "163345": {
+      "label": "塔尔图斯",
+      "entity_id": "Q174916",
+      "language": "zh-hans"
+    },
+    "523750": {
+      "label": "卡马河畔切尔尼",
+      "entity_id": "Q95041",
+      "language": "zh"
+    },
+    "111453": {
+      "label": "赞詹",
+      "entity_id": "Q146699",
+      "language": "zh-hans"
+    },
+    "1269920": {
+      "label": "胡布利",
+      "entity_id": "Q33412",
+      "language": "zh"
+    },
+    "1573517": {
+      "label": "南定市",
+      "entity_id": "Q33682",
+      "language": "zh-hans"
+    },
+    "1642858": {
+      "label": "占碑",
+      "entity_id": "Q7578",
+      "language": "zh-hans"
+    },
+    "1258847": {
+      "label": "拉杰果德",
+      "entity_id": "Q11854",
+      "language": "zh-hans"
+    },
+    "57289": {
+      "label": "哈尔格萨",
+      "entity_id": "Q168652",
+      "language": "zh-hans"
+    },
+    "1267995": {
+      "label": "坎普尔",
+      "entity_id": "Q66568",
+      "language": "zh-hans"
+    },
+    "121801": {
+      "label": "乌尔米耶",
+      "entity_id": "Q179665",
+      "language": "zh-hans"
+    },
+    "170017": {
+      "label": "哈马",
+      "entity_id": "Q173545",
+      "language": "zh-hans"
+    },
+    "520555": {
+      "label": "下诺夫哥罗德",
+      "entity_id": "Q891",
+      "language": "zh-hans"
+    },
+    "1270396": {
+      "label": "豪拉",
+      "entity_id": "Q205697",
+      "language": "zh-hans"
+    },
+    "360761": {
+      "label": "曼苏拉",
+      "entity_id": "Q223587",
+      "language": "zh-hans"
+    },
+    "1257806": {
+      "label": "萨哈兰普尔",
+      "entity_id": "Q242895",
+      "language": "zh-hans"
+    },
+    "1703417": {
+      "label": "马卡蒂",
+      "entity_id": "Q1508",
+      "language": "zh-hans"
+    },
+    "1842485": {
+      "label": "高阳市",
+      "entity_id": "Q42061",
+      "language": "zh-hans"
+    },
+    "1264773": {
+      "label": "洛尼 (印度)",
+      "entity_id": "Q61436",
+      "language": "zh"
+    },
+    "1271439": {
+      "label": "格雅",
+      "entity_id": "Q251329",
+      "language": "zh-hans"
+    },
+    "1266285": {
+      "label": "戈尔哈布尔",
+      "entity_id": "Q209698",
+      "language": "zh-hans"
+    },
+    "1873757": {
+      "label": "南浦特别市",
+      "entity_id": "Q109386",
+      "language": "zh-hans"
+    },
+    "1271951": {
+      "label": "法里达巴德",
+      "entity_id": "Q200663",
+      "language": "zh-hans"
+    },
+    "1272979": {
+      "label": "丹巴德",
+      "entity_id": "Q244159",
+      "language": "zh-hans"
+    },
+    "3529612": {
+      "label": "埃卡特佩克莫雷洛斯",
+      "entity_id": "Q8972",
+      "language": "zh"
+    },
+    "107304": {
+      "label": "布赖代",
+      "entity_id": "Q259253",
+      "language": "zh-hans"
+    },
+    "1255783": {
+      "label": "拉杰普尔索纳尔普尔",
+      "entity_id": "Q261988",
+      "language": "zh-hans"
+    },
+    "143083": {
+      "label": "阿尔达比勒",
+      "entity_id": "Q180103",
+      "language": "zh-hans"
+    },
+    "1865387": {
+      "label": "尼崎市",
+      "entity_id": "Q213318",
+      "language": "zh-hans"
+    },
+    "1627549": {
+      "label": "西冷",
+      "entity_id": "Q10126",
+      "language": "zh-hans"
+    },
+    "8581443": {
+      "label": "南唐格朗",
+      "entity_id": "Q10128",
+      "language": "zh"
+    },
+    "1279228": {
+      "label": "艾哈迈德讷格尔",
+      "entity_id": "Q223517",
+      "language": "zh-hans"
+    },
+    "1256436": {
+      "label": "索拉布尔",
+      "entity_id": "Q237847",
+      "language": "zh-hans"
+    },
+    "143127": {
+      "label": "阿拉克",
+      "entity_id": "Q212628",
+      "language": "zh-hans"
+    },
+    "353802": {
+      "label": "考姆翁布",
+      "entity_id": "Q138833",
+      "language": "zh-hans"
+    },
+    "1279017": {
+      "label": "阿里格尔",
+      "entity_id": "Q201832",
+      "language": "zh-hans"
+    },
+    "379251": {
+      "label": "北喀土穆",
+      "entity_id": "Q310114",
+      "language": "zh-hans"
+    },
+    "78754": {
+      "label": "穆卡拉",
+      "entity_id": "Q310772",
+      "language": "zh-hans"
+    },
+    "347497": {
+      "label": "坦塔",
+      "entity_id": "Q271771",
+      "language": "zh-hans"
+    },
+    "379003": {
+      "label": "欧拜伊德",
+      "entity_id": "Q309475",
+      "language": "zh-hans"
+    },
+    "1270583": {
+      "label": "瓜廖尔",
+      "entity_id": "Q158467",
+      "language": "zh-hans"
+    },
+    "172955": {
+      "label": "拉卡",
+      "entity_id": "Q283368",
+      "language": "zh-hans"
+    },
+    "1260107": {
+      "label": "伯蒂亚拉",
+      "entity_id": "Q208162",
+      "language": "zh-hans"
+    },
+    "1850910": {
+      "label": "高槻市",
+      "entity_id": "Q335423",
+      "language": "zh-hans"
+    },
+    "353219": {
+      "label": "十月六日城",
+      "entity_id": "Q335708",
+      "language": "zh-hans"
+    },
+    "1179400": {
+      "label": "费萨拉巴德",
+      "entity_id": "Q173985",
+      "language": "zh-hans"
+    },
+    "1786546": {
+      "label": "钟祥市",
+      "entity_id": "Q197919",
+      "language": "zh-hans"
+    },
+    "1689395": {
+      "label": "圣何塞-德尔蒙特",
+      "entity_id": "Q2193",
+      "language": "zh-hans"
+    },
+    "472045": {
+      "label": "沃罗涅日",
+      "entity_id": "Q3426",
+      "language": "zh-hans"
+    },
+    "1275665": {
+      "label": "比卡内尔",
+      "entity_id": "Q200718",
+      "language": "zh-hans"
+    },
+    "6947640": {
+      "label": "贝伊利克迪聚",
+      "entity_id": "Q794356",
+      "language": "zh"
+    },
+    "3348078": {
+      "label": "奎托",
+      "entity_id": "Q843980",
+      "language": "zh-hans"
+    },
+    "2294877": {
+      "label": "塔马利",
+      "entity_id": "Q217040",
+      "language": "zh-hans"
+    },
+    "1729564": {
+      "label": "巴科洛德",
+      "entity_id": "Q5217",
+      "language": "zh-hans"
+    },
+    "1275817": {
+      "label": "布巴内什瓦尔",
+      "entity_id": "Q171771",
+      "language": "zh-hans"
+    },
+    "1262801": {
+      "label": "莫拉达巴德",
+      "entity_id": "Q330643",
+      "language": "zh-hans"
+    },
+    "330186": {
+      "label": "阿达马",
+      "entity_id": "Q351427",
+      "language": "zh-hans"
+    },
+    "98463": {
+      "label": "苏莱曼尼亚",
+      "entity_id": "Q191204",
+      "language": "zh-hans"
+    },
+    "1278718": {
+      "label": "阿姆劳蒂",
+      "entity_id": "Q269899",
+      "language": "zh-hans"
+    },
+    "1106542": {
+      "label": "奇通圭扎",
+      "entity_id": "Q399119",
+      "language": "zh"
+    },
+    "1257416": {
+      "label": "桑格利",
+      "entity_id": "Q429215",
+      "language": "zh-hans"
+    },
+    "747340": {
+      "label": "埃森莱尔",
+      "entity_id": "Q378714",
+      "language": "zh-hans"
+    },
+    "70225": {
+      "label": "塔伊兹",
+      "entity_id": "Q466216",
+      "language": "zh-hans"
+    },
+    "1278314": {
+      "label": "阿散索尔",
+      "entity_id": "Q202139",
+      "language": "zh-hans"
+    },
+    "361320": {
+      "label": "法尤姆",
+      "entity_id": "Q203299",
+      "language": "zh-hans"
+    },
+    "79415": {
+      "label": "荷台达",
+      "entity_id": "Q270041",
+      "language": "zh-hans"
+    },
+    "7290466": {
+      "label": "帕西格",
+      "entity_id": "Q1624",
+      "language": "zh-hans"
+    },
+    "2911285": {
+      "label": "汉堡-万德斯贝克",
+      "entity_id": "Q1833",
+      "language": "zh-hans"
+    },
+    "2558545": {
+      "label": "胡塞马",
+      "entity_id": "Q310350",
+      "language": "zh-hans"
+    },
+    "1586896": {
+      "label": "邦美蜀市",
+      "entity_id": "Q33469",
+      "language": "zh-hans"
+    },
+    "145531": {
+      "label": "绍里木",
+      "entity_id": "Q635017",
+      "language": "zh-hans"
+    },
+    "1272866": {
+      "label": "达拉维",
+      "entity_id": "Q649632",
+      "language": "zh"
+    },
+    "1269006": {
+      "label": "占西",
+      "entity_id": "Q242995",
+      "language": "zh-hans"
+    },
+    "5133273": {
+      "label": "皇后區",
+      "entity_id": "Q18424",
+      "language": "zh"
+    },
+    "1646511": {
+      "label": "芝勒贡",
+      "entity_id": "Q10124",
+      "language": "zh-hans"
+    },
+    "2111149": {
+      "label": "仙台市",
+      "entity_id": "Q46747",
+      "language": "zh-hans"
+    },
+    "1710914": {
+      "label": "伊穆斯",
+      "entity_id": "Q63145",
+      "language": "zh"
+    },
+    "1688749": {
+      "label": "圣佩德罗",
+      "entity_id": "Q75933",
+      "language": "zh-hans"
+    },
+    "360995": {
+      "label": "吉萨",
+      "entity_id": "Q81788",
+      "language": "zh-hans"
+    },
+    "1645133": {
+      "label": "杜迈",
+      "entity_id": "Q7782",
+      "language": "zh-hans"
+    },
+    "1682812": {
+      "label": "打拉",
+      "entity_id": "Q5285",
+      "language": "zh-hans"
+    },
+    "1017780": {
+      "label": "博克斯堡",
+      "entity_id": "Q891229",
+      "language": "zh"
+    },
+    "204405": {
+      "label": "乌维拉",
+      "entity_id": "Q923687",
+      "language": "zh-hans"
+    },
+    "1268295": {
+      "label": "卡延",
+      "entity_id": "Q366754",
+      "language": "zh-hans"
+    },
+    "292932": {
+      "label": "阿治曼",
+      "entity_id": "Q530171",
+      "language": "zh"
+    },
+    "2441291": {
+      "label": "马拉迪",
+      "entity_id": "Q664550",
+      "language": "zh-hans"
+    },
+    "3523466": {
+      "label": "马塔莫罗斯",
+      "entity_id": "Q738353",
+      "language": "zh-hans"
+    },
+    "1278840": {
+      "label": "安巴杜爾",
+      "entity_id": "Q456737",
+      "language": "zh"
+    },
+    "5139568": {
+      "label": "史泰登岛",
+      "entity_id": "Q18432",
+      "language": "zh-hans"
+    },
+    "1566319": {
+      "label": "太原市",
+      "entity_id": "Q26581",
+      "language": "zh"
+    },
+    "1172128": {
+      "label": "拉尔卡纳",
+      "entity_id": "Q696605",
+      "language": "zh-hans"
+    },
+    "1794140": {
+      "label": "泗水县",
+      "entity_id": "Q745725",
+      "language": "zh-hans"
+    },
+    "1278149": {
+      "label": "奥兰加巴德",
+      "entity_id": "Q200713",
+      "language": "zh-hans"
+    },
+    "3668605": {
+      "label": "圣玛尔塔",
+      "entity_id": "Q209016",
+      "language": "zh-hans"
+    },
+    "6611854": {
+      "label": "奈比多",
+      "entity_id": "Q37400",
+      "language": "zh-hans"
+    },
+    "700569": {
+      "label": "尼古拉耶夫",
+      "entity_id": "Q41572",
+      "language": "zh-hans"
+    },
+    "1846266": {
+      "label": "济州",
+      "entity_id": "Q42142",
+      "language": "zh-hans"
+    },
+    "173811": {
+      "label": "哈塞克",
+      "entity_id": "Q311321",
+      "language": "zh-hans"
+    },
+    "1183880": {
+      "label": "巴哈瓦尔布尔",
+      "entity_id": "Q318156",
+      "language": "zh-hans"
+    },
+    "2293521": {
+      "label": "阿波波",
+      "entity_id": "Q322624",
+      "language": "zh-hans"
+    },
+    "1785462": {
+      "label": "枣阳市",
+      "entity_id": "Q147171",
+      "language": "zh-hans"
+    },
+    "106281": {
+      "label": "哈伊勒",
+      "entity_id": "Q675568",
+      "language": "zh-hans"
+    },
+    "2548885": {
+      "label": "非斯",
+      "entity_id": "Q80985",
+      "language": "zh-hans"
+    },
+    "1278130": {
+      "label": "阿瓦迪",
+      "entity_id": "Q584494",
+      "language": "zh-hans"
+    },
+    "1792260": {
+      "label": "瓦房店市",
+      "entity_id": "Q616048",
+      "language": "zh-hans"
+    },
+    "1839071": {
+      "label": "浦项市",
+      "entity_id": "Q42157",
+      "language": "zh"
+    },
+    "3672486": {
+      "label": "佩雷拉",
+      "entity_id": "Q51111",
+      "language": "zh-hans"
+    },
+    "1838716": {
+      "label": "富川市",
+      "entity_id": "Q42099",
+      "language": "zh"
+    },
+    "1845604": {
+      "label": "清州市",
+      "entity_id": "Q42147",
+      "language": "zh"
+    },
+    "1169607": {
+      "label": "穆扎法拉巴德",
+      "entity_id": "Q461307",
+      "language": "zh"
+    },
+    "2537763": {
+      "label": "塞拉",
+      "entity_id": "Q466046",
+      "language": "zh-hans"
+    },
+    "1816858": {
+      "label": "东方市",
+      "entity_id": "Q174123",
+      "language": "zh-hans"
+    },
+    "1711005": {
+      "label": "伊洛伊洛市",
+      "entity_id": "Q459787",
+      "language": "zh-hans"
+    },
+    "343137": {
+      "label": "阿瓦萨",
+      "entity_id": "Q755765",
+      "language": "zh-hans"
+    },
+    "625665": {
+      "label": "莫吉廖夫",
+      "entity_id": "Q154835",
+      "language": "zh-hans"
+    },
+    "11048323": {
+      "label": "第6区",
+      "entity_id": "Q167280",
+      "language": "zh"
+    },
+    "1562820": {
+      "label": "越池市",
+      "entity_id": "Q36082",
+      "language": "zh-cn"
+    },
+    "751324": {
+      "label": "巴哲拉尔",
+      "entity_id": "Q746516",
+      "language": "zh-hans"
+    },
+    "1275960": {
+      "label": "皮尔瓦拉",
+      "entity_id": "Q760146",
+      "language": "zh-hans"
+    },
+    "2325200": {
+      "label": "奥约",
+      "entity_id": "Q1023703",
+      "language": "zh"
+    },
+    "353225": {
+      "label": "纳赛尔城",
+      "entity_id": "Q1309979",
+      "language": "zh-hans"
+    },
+    "1798900": {
+      "label": "彭泽县",
+      "entity_id": "Q1335508",
+      "language": "zh-hans"
+    },
+    "1798632": {
+      "label": "平阴县",
+      "entity_id": "Q1337083",
+      "language": "zh-hans"
+    },
+    "100077": {
+      "label": "阿布格莱布",
+      "entity_id": "Q335021",
+      "language": "zh-hans"
+    },
+    "4005492": {
+      "label": "瓜达卢佩",
+      "entity_id": "Q938835",
+      "language": "zh-hans"
+    },
+    "1273368": {
+      "label": "达凡基尔",
+      "entity_id": "Q519486",
+      "language": "zh-hans"
+    },
+    "360829": {
+      "label": "大迈哈莱",
+      "entity_id": "Q312723",
+      "language": "zh-hans"
+    },
+    "1185128": {
+      "label": "拉杰沙希市",
+      "entity_id": "Q322155",
+      "language": "zh-hans"
+    },
+    "12514556": {
+      "label": "哥打白沙罗",
+      "entity_id": "Q6433791",
+      "language": "zh-hans"
+    },
+    "5110266": {
+      "label": "布朗克斯",
+      "entity_id": "Q18426",
+      "language": "zh-hans"
+    },
+    "1812621": {
+      "label": "海阳市",
+      "entity_id": "Q1337641",
+      "language": "zh-hans"
+    },
+    "1794794": {
+      "label": "寿光市",
+      "entity_id": "Q1357984",
+      "language": "zh-hans"
+    },
+    "1183460": {
+      "label": "本努",
+      "entity_id": "Q806916",
+      "language": "zh-hans"
+    },
+    "1275637": {
+      "label": "比拉斯布尔",
+      "entity_id": "Q860452",
+      "language": "zh-hans"
+    },
+    "1275610": {
+      "label": "比利莫拉",
+      "entity_id": "Q862141",
+      "language": "zh-hans"
+    },
+    "1276300": {
+      "label": "帕格尔布尔",
+      "entity_id": "Q760714",
+      "language": "zh-hans"
+    },
+    "4005867": {
+      "label": "埃斯科韦多将军镇",
+      "entity_id": "Q778941",
+      "language": "zh-hans"
+    },
+    "1276058": {
+      "label": "帕德巴拉",
+      "entity_id": "Q854914",
+      "language": "zh"
+    },
+    "449504": {
+      "label": "埃斯兰夏尔",
+      "entity_id": "Q862519",
+      "language": "zh-hans"
+    },
+    "3566067": {
+      "label": "卡马圭",
+      "entity_id": "Q115329",
+      "language": "zh-hans"
+    },
+    "2036106": {
+      "label": "辽中区",
+      "entity_id": "Q142130",
+      "language": "zh-hans"
+    },
+    "1808981": {
+      "label": "韩城市",
+      "entity_id": "Q577415",
+      "language": "zh-hans"
+    },
+    "1264115": {
+      "label": "马莱冈",
+      "entity_id": "Q580965",
+      "language": "zh-hans"
+    },
+    "1849876": {
+      "label": "富山市",
+      "entity_id": "Q204266",
+      "language": "zh-hans"
+    },
+    "2325590": {
+      "label": "奥绍博",
+      "entity_id": "Q868203",
+      "language": "zh-hans"
+    },
+    "320857": {
+      "label": "波爾諾瓦",
+      "entity_id": "Q894012",
+      "language": "zh"
+    },
+    "1735498": {
+      "label": "双溪大年",
+      "entity_id": "Q939738",
+      "language": "zh"
+    },
+    "1168718": {
+      "label": "大田，巴基斯坦",
+      "entity_id": "Q968211",
+      "language": "zh-hans"
+    },
+    "285839": {
+      "label": "艾哈迈迪",
+      "entity_id": "Q980396",
+      "language": "zh-hans"
+    },
+    "1177654": {
+      "label": "古杰拉特",
+      "entity_id": "Q929062",
+      "language": "zh-hans"
+    },
+    "231165": {
+      "label": "基拉镇",
+      "entity_id": "Q966819",
+      "language": "zh-hans"
+    },
+    "2214846": {
+      "label": "米苏拉塔",
+      "entity_id": "Q131323",
+      "language": "zh-hans"
+    },
+    "2338900": {
+      "label": "伊费",
+      "entity_id": "Q180084",
+      "language": "zh-cn"
+    },
+    "3998655": {
+      "label": "莱昂",
+      "entity_id": "Q189128",
+      "language": "zh-hans"
+    },
+    "1854487": {
+      "label": "大分市",
+      "entity_id": "Q199609",
+      "language": "zh-hans"
+    },
+    "1813206": {
+      "label": "大冶市",
+      "entity_id": "Q1179105",
+      "language": "zh-hans"
+    },
+    "1180281": {
+      "label": "德拉·伊斯·梅尔汗",
+      "entity_id": "Q1249888",
+      "language": "zh-hans"
+    },
+    "1163965": {
+      "label": "坦杜阿拉亚",
+      "entity_id": "Q1250417",
+      "language": "zh-hans"
+    },
+    "2341374": {
+      "label": "吉博库",
+      "entity_id": "Q2425179",
+      "language": "zh-hans"
+    },
+    "2395914": {
+      "label": "阿波美卡拉维",
+      "entity_id": "Q2473939",
+      "language": "zh-hans"
+    },
+    "520494": {
+      "label": "下塔吉尔",
+      "entity_id": "Q98967",
+      "language": "zh"
+    },
+    "1275362": {
+      "label": "博卡罗",
+      "entity_id": "Q1926941",
+      "language": "zh-hans"
+    },
+    "2327220": {
+      "label": "奧科涅",
+      "entity_id": "Q2017187",
+      "language": "zh"
+    },
+    "2187404": {
+      "label": "曼努考",
+      "entity_id": "Q986198",
+      "language": "zh-hans"
+    },
+    "1174625": {
+      "label": "卡苏尔",
+      "entity_id": "Q989283",
+      "language": "zh-hans"
+    },
+    "1791351": {
+      "label": "武昌区",
+      "entity_id": "Q1014420",
+      "language": "zh-hans"
+    },
+    "3526617": {
+      "label": "哈拉帕",
+      "entity_id": "Q221051",
+      "language": "zh-hans"
+    },
+    "2255414": {
+      "label": "黑角",
+      "entity_id": "Q223920",
+      "language": "zh-hans"
+    },
+    "1183105": {
+      "label": "巴塔格兰",
+      "entity_id": "Q3248338",
+      "language": "zh-hans"
+    },
+    "268743": {
+      "label": "拉斯贝鲁特",
+      "entity_id": "Q7294643",
+      "language": "zh"
+    },
+    "371760": {
+      "label": "库斯提",
+      "entity_id": "Q587715",
+      "language": "zh-cn"
+    },
+    "2340451": {
+      "label": "貢貝",
+      "entity_id": "Q591598",
+      "language": "zh"
+    },
+    "1721906": {
+      "label": "甲万那端",
+      "entity_id": "Q55595",
+      "language": "zh-hans"
+    },
+    "355449": {
+      "label": "伊斯纳",
+      "entity_id": "Q626031",
+      "language": "zh-hans"
+    },
+    "288764": {
+      "label": "包舍爾",
+      "entity_id": "Q2892151",
+      "language": "zh"
+    },
+    "292261": {
+      "label": "代拉",
+      "entity_id": "Q3021334",
+      "language": "zh"
+    },
+    "1321218": {
+      "label": "卡莱",
+      "entity_id": "Q3129405",
+      "language": "zh-hans"
+    },
+    "1169116": {
+      "label": "讷瓦布沙阿",
+      "entity_id": "Q1017637",
+      "language": "zh-hans"
+    },
+    "949880": {
+      "label": "滕比萨",
+      "entity_id": "Q1580709",
+      "language": "zh"
+    },
+    "1258932": {
+      "label": "拉贾赫穆恩德尔伊",
+      "entity_id": "Q1639492",
+      "language": "zh-hans"
+    },
+    "1735162": {
+      "label": "文良港",
+      "entity_id": "Q7456354",
+      "language": "zh"
+    },
+    "349076": {
+      "label": "舒卜拉海迈",
+      "entity_id": "Q269960",
+      "language": "zh-hans"
+    },
+    "1806096": {
+      "label": "胶州市",
+      "entity_id": "Q289051",
+      "language": "zh-hans"
+    },
+    "2038365": {
+      "label": "北安市",
+      "entity_id": "Q814616",
+      "language": "zh-hans"
+    },
+    "2388873": {
+      "label": "賓博",
+      "entity_id": "Q863461",
+      "language": "zh"
+    },
+    "2591949": {
+      "label": "卡曾加",
+      "entity_id": "Q1005786",
+      "language": "zh-hans"
+    },
+    "1261162": {
+      "label": "纳巴朗格阿普尔",
+      "entity_id": "Q2085319",
+      "language": "zh-hans"
+    },
+    "109353": {
+      "label": "阿尔卡",
+      "entity_id": "Q2162128",
+      "language": "zh-hans"
+    },
+    "1904564": {
+      "label": "平盛郡",
+      "entity_id": "Q2552692",
+      "language": "zh"
+    },
+    "1184370": {
+      "label": "阿里卡拉",
+      "entity_id": "Q2984767",
+      "language": "zh-hans"
+    },
+    "3904906": {
+      "label": "圣克鲁斯-德拉谢拉",
+      "entity_id": "Q170688",
+      "language": "zh-hans"
+    },
+    "2326171": {
+      "label": "翁多",
+      "entity_id": "Q1853310",
+      "language": "zh-hans"
+    },
+    "1266122": {
+      "label": "科尔巴",
+      "entity_id": "Q2008189",
+      "language": "zh"
+    },
+    "2352379": {
+      "label": "阿多埃基蒂",
+      "entity_id": "Q359955",
+      "language": "zh"
+    },
+    "1804586": {
+      "label": "莱阳市",
+      "entity_id": "Q371640",
+      "language": "zh-hans"
+    },
+    "2243271": {
+      "label": "卡宾达",
+      "entity_id": "Q459360",
+      "language": "zh-hans"
+    },
+    "7628420": {
+      "label": "桑贾克泰佩",
+      "entity_id": "Q253182",
+      "language": "zh-hans"
+    },
+    "922773": {
+      "label": "科卢韦齐",
+      "entity_id": "Q271404",
+      "language": "zh-hans"
+    },
+    "1185186": {
+      "label": "库米拉",
+      "entity_id": "Q1006296",
+      "language": "zh-hans"
+    },
+    "1784055": {
+      "label": "庄河市",
+      "entity_id": "Q198159",
+      "language": "zh-hans"
+    },
+    "3514450": {
+      "label": "霍奇米尔科",
+      "entity_id": "Q643026",
+      "language": "zh-hans"
+    },
+    "1801455": {
+      "label": "枝江市",
+      "entity_id": "Q197789",
+      "language": "zh-hans"
+    },
+    "738329": {
+      "label": "于斯屈达尔",
+      "entity_id": "Q326339",
+      "language": "zh-hans"
+    },
+    "3530589": {
+      "label": "内萨瓦尔科约特尔城",
+      "entity_id": "Q210307",
+      "language": "zh-hans"
+    },
+    "1877030": {
+      "label": "兴南区域",
+      "entity_id": "Q224982",
+      "language": "zh-hans"
+    },
+    "1787031": {
+      "label": "兖州区",
+      "entity_id": "Q246791",
+      "language": "zh-hans"
+    },
+    "2319480": {
+      "label": "乌约",
+      "entity_id": "Q1999000",
+      "language": "zh-hans"
+    },
+    "3827406": {
+      "label": "贝尼托·胡亚雷斯区",
+      "entity_id": "Q2356998",
+      "language": "zh-hans"
+    },
+    "1585330": {
+      "label": "堤岸",
+      "entity_id": "Q2405555",
+      "language": "zh"
+    },
+    "11048319": {
+      "label": "布加勒斯特第3区",
+      "entity_id": "Q2455368",
+      "language": "zh"
+    },
+    "2327735": {
+      "label": "奥博莫绍",
+      "entity_id": "Q500366",
+      "language": "zh-hans"
+    },
+    "7033318": {
+      "label": "肯尼迪",
+      "entity_id": "Q605317",
+      "language": "zh"
+    },
+    "1784818": {
+      "label": "永济市",
+      "entity_id": "Q950944",
+      "language": "zh-hans"
+    },
+    "1789176": {
+      "label": "肥城市",
+      "entity_id": "Q1198379",
+      "language": "zh-hans"
+    },
+    "2050970": {
+      "label": "昆都仑区",
+      "entity_id": "Q1201692",
+      "language": "zh-hans"
+    },
+    "1806508": {
+      "label": "嘉定镇街道",
+      "entity_id": "Q6191420",
+      "language": "zh-hans"
+    },
+    "1647003": {
+      "label": "比农",
+      "entity_id": "Q24989809",
+      "language": "zh"
+    },
+    "2239862": {
+      "label": "马兰哲",
+      "entity_id": "Q621001",
+      "language": "zh-hans"
+    },
+    "2318123": {
+      "label": "耶诺亚",
+      "entity_id": "Q648749",
+      "language": "zh-hans"
+    },
+    "1810458": {
+      "label": "高密市",
+      "entity_id": "Q651101",
+      "language": "zh-hans"
+    },
+    "1808106": {
+      "label": "洪江市",
+      "entity_id": "Q762724",
+      "language": "zh-hans"
+    },
+    "10346824": {
+      "label": "尼呂弗",
+      "entity_id": "Q2183942",
+      "language": "zh"
+    },
+    "7498240": {
+      "label": "西耶路撒冷",
+      "entity_id": "Q2213440",
+      "language": "zh"
+    },
+    "2236500": {
+      "label": "維亞納",
+      "entity_id": "Q2304294",
+      "language": "zh"
+    },
+    "2344082": {
+      "label": "伊科罗杜",
+      "entity_id": "Q1658159",
+      "language": "zh-hans"
+    },
+    "2337181": {
+      "label": "伊塞因",
+      "entity_id": "Q1673881",
+      "language": "zh"
+    },
+    "738377": {
+      "label": "于姆拉尼耶",
+      "entity_id": "Q334924",
+      "language": "zh-hans"
+    },
+    "3515428": {
+      "label": "特拉尔潘",
+      "entity_id": "Q408187",
+      "language": "zh"
+    },
+    "609655": {
+      "label": "卡拉干达",
+      "entity_id": "Q484706",
+      "language": "zh-hans"
+    },
+    "971421": {
+      "label": "纽卡斯尔",
+      "entity_id": "Q1027294",
+      "language": "zh-hans"
+    },
+    "3827598": {
+      "label": "奧霍-德阿瓜莊園",
+      "entity_id": "Q1030019",
+      "language": "zh"
+    },
+    "1786455": {
+      "label": "沂水县",
+      "entity_id": "Q1198349",
+      "language": "zh-hans"
+    },
+    "2037643": {
+      "label": "东河区",
+      "entity_id": "Q1201657",
+      "language": "zh-hans"
+    },
+    "1812256": {
+      "label": "东胜区",
+      "entity_id": "Q1241464",
+      "language": "zh-hans"
+    },
+    "1786060": {
+      "label": "原平市",
+      "entity_id": "Q1331388",
+      "language": "zh-hans"
+    },
+    "3651297": {
+      "label": "圣多明各",
+      "entity_id": "Q1015654",
+      "language": "zh-hans"
+    },
+    "7802746": {
+      "label": "萨德尔城",
+      "entity_id": "Q1017715",
+      "language": "zh-hans"
+    },
+    "1258662": {
+      "label": "拉马古恩达姆",
+      "entity_id": "Q1780338",
+      "language": "zh-hans"
+    },
+    "1565019": {
+      "label": "守德郡",
+      "entity_id": "Q1884726",
+      "language": "zh"
+    },
+    "3514519": {
+      "label": "濟科",
+      "entity_id": "Q1932224",
+      "language": "zh"
+    },
+    "3532624": {
+      "label": "洛佩斯·马特奥斯城",
+      "entity_id": "Q1963483",
+      "language": "zh-hans"
+    },
+    "1806602": {
+      "label": "慈溪市",
+      "entity_id": "Q706161",
+      "language": "zh-hans"
+    },
+    "7627067": {
+      "label": "巴赫切利耶夫莱尔",
+      "entity_id": "Q788634",
+      "language": "zh-hans"
+    },
+    "1809152": {
+      "label": "固原市",
+      "entity_id": "Q604625",
+      "language": "zh-hans"
+    },
+    "2050971": {
+      "label": "青山区",
+      "entity_id": "Q608239",
+      "language": "zh-hans"
+    },
+    "1583518": {
+      "label": "以安市",
+      "entity_id": "Q1320364",
+      "language": "zh"
+    },
+    "1260482": {
+      "label": "帕尼哈蒂",
+      "entity_id": "Q1801463",
+      "language": "zh-hans"
+    },
+    "1348843": {
+      "label": "马赫斯赫塔拉",
+      "entity_id": "Q1807947",
+      "language": "zh-hans"
+    },
+    "1642548": {
+      "label": "杰柏拉",
+      "entity_id": "Q2662601",
+      "language": "zh-hans"
+    },
+    "2593460": {
+      "label": "马西纳",
+      "entity_id": "Q3297273",
+      "language": "zh-hans"
+    },
+    "1732747": {
+      "label": "避兰东",
+      "entity_id": "Q7204554",
+      "language": "zh-hans"
+    },
+    "954013": {
+      "label": "索尚古韦",
+      "entity_id": "Q7563836",
+      "language": "zh-hans"
+    },
+    "1855207": {
+      "label": "西宮濱",
+      "entity_id": "Q11627660",
+      "language": "zh"
+    },
+    "1809412": {
+      "label": "永康市",
+      "entity_id": "Q1285102",
+      "language": "zh-hans"
+    },
+    "3515807": {
+      "label": "库奥蒂特兰伊斯卡伊",
+      "entity_id": "Q1321216",
+      "language": "zh-hans"
+    },
+    "6955677": {
+      "label": "钱卡亚",
+      "entity_id": "Q1020646",
+      "language": "zh-hans"
+    },
+    "2338400": {
+      "label": "伊杰布奥德",
+      "entity_id": "Q1023726",
+      "language": "zh"
+    },
+    "7795834": {
+      "label": "士拉央新镇",
+      "entity_id": "Q2578179",
+      "language": "zh-hans"
+    },
+    "6324729": {
+      "label": "哈利法克斯",
+      "entity_id": "Q3246744",
+      "language": "zh"
+    },
+    "2338325": {
+      "label": "伊卡雷",
+      "entity_id": "Q3320803",
+      "language": "zh"
+    },
+    "1800519": {
+      "label": "明光市",
+      "entity_id": "Q1334907",
+      "language": "zh-hans"
+    },
+    "1785716": {
+      "label": "邳州市",
+      "entity_id": "Q1342853",
+      "language": "zh-hans"
+    },
+    "3514663": {
+      "label": "阿尔瓦罗·奥夫雷贡区",
+      "entity_id": "Q14906254",
+      "language": "zh"
+    },
+    "2036075": {
+      "label": "凌源市",
+      "entity_id": "Q1333417",
+      "language": "zh-hans"
+    },
+    "8074174": {
+      "label": "穆拉特帕夏",
+      "entity_id": "Q1503514",
+      "language": "zh"
+    },
+    "2033675": {
+      "label": "新民市",
+      "entity_id": "Q1362055",
+      "language": "zh-hans"
+    },
+    "4951305": {
+      "label": "南波士顿",
+      "entity_id": "Q1759693",
+      "language": "zh-hans"
+    }
+  }
+}

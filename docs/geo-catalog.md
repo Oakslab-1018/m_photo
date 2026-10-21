@@ -94,7 +94,7 @@ uv run --frozen python -m backend.app.services.geo_catalog_import --force
 
 ## 城市中文显示名
 
-`data/city-names.zh-CN.json` 是独立的展示词表，按现有城市 GeoNames ID 关联；不改目录 ID、原始模型名称、坐标、分数或目录版本。数据来自 GeoNames `alternateNamesV2` 的中文语言标签，排除历史、俗称和已结束使用的名字，优先简体中文及首选名称。当前覆盖 11286 / 34156 个城市；未收录者显示“中文名待补充”，不猜译。
+`data/city-names.zh-CN.json` 是独立的展示词表，按现有城市 GeoNames ID 关联；不改目录 ID、原始模型名称、坐标、分数或目录版本。数据来自 GeoNames `alternateNamesV2` 的中文语言标签，排除历史、俗称和已结束使用的名字，优先简体中文及首选名称。当前 GeoNames 词表覆盖 11286 / 34156 个城市；再读取 `data/city-names.wikidata.zh.json` 补充 Wikidata 中文标签，仍未收录时显示目录原名，不生成机器音译。
 
 来源指纹、日期和 CC BY 4.0 署名保存在同目录 `.sources.json`。更新时将官方压缩包下载到本地缓存，然后运行：
 
@@ -103,3 +103,14 @@ python scripts/import_city_names_zh.py --archive .cache/geo-catalog/alternateNam
 ```
 
 运行时只读取生成的词表，不下载、翻译或调用 LLM。
+
+
+Wikidata 补充通过 P1566 精确关联 GeoNames ID，按 `zh-hans`、`zh-cn`、`zh` 等中文标签顺序选取。一个 GeoNames ID 对应多个实体时不自动选择。补充词表的来源、实体 ID、标签语言、查询覆盖与完成状态保存在 `data/city-names.wikidata.zh.sources.json`，不会覆盖已有中文名。
+
+```powershell
+python scripts/import_wikidata_city_names.py
+# 只从成功查询缓存重建，不访问网络：
+python scripts/import_wikidata_city_names.py --offline
+```
+
+导入支持缓存续跑，收到 HTTP 429 后停止并遵守 `Retry-After`，不会让页面等待。2026-10-21 已成功查询 500 个缺失项、补充 288 个中文标签；查询服务故障限流后暂停，另有 22370 个尚未查询，`complete=false`。未查询不代表 Wiki 没有中文名，当前统一用目录原名显示。
