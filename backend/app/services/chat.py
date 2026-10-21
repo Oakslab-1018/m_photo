@@ -100,7 +100,9 @@ class ChatService(LegacyChatService):
             if prefix and not message.lstrip().startswith(prefix):
                 message = f"{prefix}\n{message}"
             result["action"] = {**action, "message": message}
-            self.session_service.replace_last_ai_message(session_id, message, result["action"])
+            self.session_service.replace_last_ai_message(
+                session_id, message, result["action"], provider="deepseek"
+            )
         self._prepared = None
         self._free_text_plan = None
         return result
@@ -173,7 +175,7 @@ class ChatService(LegacyChatService):
             action = result.get("action") or {}
             replace = getattr(self.session_service, "replace_last_ai_message", None)
             if callable(replace) and action.get("message"):
-                replace(session_id, str(action["message"]), action)
+                replace(session_id, str(action["message"]), action, provider=None)
         return result
 
     def initial_analysis(self, session_id):

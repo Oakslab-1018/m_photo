@@ -1,13 +1,14 @@
-"""Persisted country -> admin1 -> city guided dialogue.
+"""Persisted country -> city guided dialogue.
 
 The service is deliberately separate from ``services.chat``. Guided free text is
 parsed into proposals/reviewable clues only; it never calls the legacy feedback
 path and therefore cannot trigger that path's explicit country confirmation.
 
-All location identities are resolved against local catalogs. The optional city
-model ranking is an enrichment layered on top of the complete admin1-scoped
-catalog; it is never used before that scope filter and catalog-only rows never
-receive invented scores.
+All location identities are resolved against local catalogs. City retrieval is
+country-wide: model rankings are merged across the raw catalog scopes of the
+confirmed country, while catalog search can surface exact matches outside the
+model's bounded top rows. Persisted admin1 values remain readable as deprecated
+provenance, but they never gate or validate the country -> city path.
 """
 from __future__ import annotations
 
@@ -69,9 +70,11 @@ DIALOGUE_VERSION = 1
 COUNTRY_CANDIDATE_LIMIT = 20
 COUNTRY_CATALOG_FALLBACK_LIMIT = 50
 CITY_CANDIDATE_LIMIT = 20
+CITY_SEARCH_LIMIT = 50
 PROPOSAL_LIMIT = 20
 MAX_QUESTION_OPTIONS = 5
 MAX_COUNTRY_CLUE_QUESTIONS = 3
+_STREET_SUFFIXES = ("大道", "路", "街", "巷", "弄")
 
 _CITY_ID_RE = re.compile(r"^[1-9][0-9]*$")
 _ADMIN1_ID_RE = re.compile(r"^([A-Z]{2})\.(.+)$")
@@ -95,6 +98,11 @@ _VALUE_LABEL_OVERRIDES = {"generic": "普通 / 不明显"}
 def _value_label(value: object) -> str:
     raw = str(value or "").strip()
     return _VALUE_LABEL_OVERRIDES.get(raw) or VALUE_LABELS.get(raw) or raw
+
+
+def _looks_like_street_text(value: object) -> bool:
+    text = str(value or "").strip()
+    return bool(text) and any(suffix in text for suffix in _STREET_SUFFIXES)
 
 
 # Explicit, catalog-validated Chinese aliases for guided city proposals. The
@@ -136,6 +144,7 @@ def _empty_state() -> dict[str, Any]:
         "asked_clue_questions": [],
         "confidence_confirm_isos": [],
         "proposals": [],
+        "proposal_meta": {},
         "conflict": None,
         "pending_correction": None,
         "session_evidence_fingerprint": "",
@@ -159,6 +168,13 @@ def _normalise_state(value: object) -> dict[str, Any]:
         raw = value.get(key)
         if isinstance(raw, list):
             result[key] = [dict(item) if isinstance(item, Mapping) else item for item in raw]
+    proposal_meta = value.get("proposal_meta")
+    if isinstance(proposal_meta, Mapping):
+        result["proposal_meta"] = {
+            str(key): dict(item)
+            for key, item in proposal_meta.items()
+            if isinstance(item, Mapping)
+        }
     question = value.get("pending_question")
     result["pending_question"] = dict(question) if isinstance(question, Mapping) else None
     conflict = value.get("conflict")
@@ -260,6 +276,11 @@ def _reviewed_to_clue(record: Mapping[str, Any]) -> Clue | None:
 
 def _target_key(target: Mapping[str, Any]) -> tuple[str, str]:
     return (str(target.get("level") or ""), str(target.get("id") or ""))
+
+
+def _target_state_key(target: Mapping[str, Any]) -> str:
+    level, identifier = _target_key(target)
+    return f"{level}:{identifier}"
 
 
 def _question_model(question: Mapping[str, Any] | None) -> GuidedQuestionModel | None:
@@ -624,7 +645,6 @@ class GuidedDialogueService:
                 revisions = store.revisions()
                 required = (
                     revisions.get("countries"),
-                    revisions.get("admin1"),
                     revisions.get("cities"),
                     revisions.get("import_version"),
                 )
@@ -769,8 +789,12 @@ class GuidedDialogueService:
             else:
                 place = None
         except Exception as exc:
+            if level == "admin1":
+                return result
             raise self._unavailable(exc) from exc
         if place is None:
+            if level == "admin1":
+                return result
             raise GuidedUnavailable("地理目录条目缺失")
         fields = self._coordinate_fields(place)
         if result.get("lat") is None:
@@ -1033,7 +1057,7 @@ class GuidedDialogueService:
     @staticmethod
     def _candidate(target: Mapping[str, Any], **kwargs: Any) -> dict[str, Any]:
         result = {"target": dict(target)}
-        for key in ("score", "score_type", "reason"):
+        for key in ("score", "score_type", "reason", "selection_basis"):
             value = kwargs.get(key)
             if value is not None:
                 result[key] = value
@@ -1129,45 +1153,100 @@ class GuidedDialogueService:
             ))
         return self._merge_candidates(result, [])
 
-    def _admin1_candidates(
-        self,
-        state: Mapping[str, Any],
-        proposals: Sequence[Mapping[str, Any]],
-    ) -> list[dict[str, Any]]:
+    def _country_source_scopes(self, state: Mapping[str, Any]) -> tuple[str, ...]:
         confirmed = state.get("confirmed") or {}
         country = confirmed.get("country") if isinstance(confirmed, Mapping) else None
         if not isinstance(country, Mapping):
+            return ()
+        raw = normalize_iso(country.get("id"))
+        canonical = canonical_country_iso(raw)
+        if not canonical:
+            return ()
+        # Persisted raw TW/HK/MO keeps its narrow source identity. A newly
+        # confirmed country is canonical CN, which intentionally fans out to all
+        # available member scopes (CN/HK/MO/TW).
+        if raw and source_region_iso(raw):
+            return (raw,)
+        return country_members(canonical)
+
+    def _source_excluded(
+        self,
+        state: Mapping[str, Any],
+        session: GeoSession | None,
+        source_iso: str,
+    ) -> bool:
+        guided = [
+            str(target.get("id"))
+            for target in state.get("exclusions") or []
+            if isinstance(target, Mapping) and target.get("level") == "country"
+        ]
+        persisted = list(session.exclusions or []) if session is not None else []
+        return is_excluded([*persisted, *guided], source_iso)
+
+    def _city_rows_for_country(
+        self,
+        state: Mapping[str, Any],
+        session: GeoSession | None = None,
+    ) -> dict[int, CityRow]:
+        result: dict[int, CityRow] = {}
+        for source_iso in self._country_source_scopes(state):
+            if self._source_excluded(state, session, source_iso):
+                continue
+            for city_id, row in self._city_rows_for_source(source_iso).items():
+                result[city_id] = row
+        return result
+
+    def _catalog_city_search_targets(
+        self,
+        state: Mapping[str, Any],
+        session: GeoSession | None,
+        text: str,
+        *,
+        limit: int = CITY_SEARCH_LIMIT,
+    ) -> list[dict[str, Any]]:
+        term = str(text or "").strip()
+        scopes = self._country_source_scopes(state)
+        if not term or not scopes:
             return []
-        canonical = canonical_country_iso(country.get("id"))
-        candidates: list[dict[str, Any]] = []
-        for source_iso in country_members(canonical):
-            for row in self._admin_rows(source_iso):
-                target = self._admin1_target(row, canonical)
-                if self._excluded_by_state(state, target) is not None:
+        canonical = canonical_country_iso(scopes[0])
+        found: list[tuple[CityRow, dict[str, Any]]] = []
+        seen: set[tuple[str, str]] = set()
+        try:
+            store = self._store()
+            for source_iso in scopes:
+                if self._source_excluded(state, session, source_iso):
                     continue
-                candidates.append(self._candidate(target, reason="官方一级行政区目录"))
-        candidates.sort(key=lambda item: (
-            str(item["target"].get("source_iso") or ""),
-            str(item["target"].get("admin1_id") or ""),
+                page = store.query_places(
+                    "city",
+                    country=canonical,
+                    source_iso=source_iso,
+                    q=term,
+                    limit=limit,
+                    coordinates_only=True,
+                )
+                for place in page.get("rows") or []:
+                    try:
+                        row = self._city_row_from_place(place)
+                    except GuidedUnavailable:
+                        continue
+                    target = self._city_target(row, label=str(getattr(place, "label", "") or row.name))
+                    key = _target_key(target)
+                    if key in seen or self._excluded_by_state(state, target) is not None:
+                        continue
+                    seen.add(key)
+                    found.append((row, target))
+        except GuidedUnavailable:
+            raise
+        except Exception as exc:
+            raise self._unavailable(exc) from exc
+
+        normalized = normalize_place_text(term)
+        found.sort(key=lambda item: (
+            normalize_place_text(str(item[1].get("label") or "")) != normalized,
+            -item[0].population,
+            item[0].city_id,
         ))
-        proposed = [self._candidate(target, reason="自由文本提议") for target in proposals
-                    if isinstance(target, Mapping) and target.get("level") == "admin1"]
-        return self._merge_candidates(proposed, candidates)
-
-    def _selected_admin1(self, state: Mapping[str, Any]) -> dict[str, Any] | None:
-        confirmed = state.get("confirmed") or {}
-        target = confirmed.get("admin1") if isinstance(confirmed, Mapping) else None
-        return dict(target) if isinstance(target, Mapping) else None
-
-    def _city_rows_scoped(self, state: Mapping[str, Any]) -> list[CityRow]:
-        admin1 = self._selected_admin1(state)
-        if admin1 is None:
-            return []
-        source_iso = normalize_iso(admin1.get("source_iso")) or normalize_iso(str(admin1.get("admin1_id") or "").split(".", 1)[0])
-        admin1_id = str(admin1.get("admin1_id") or admin1.get("id") or "")
-        if not source_iso or not admin1_id:
-            return []
-        return list(self._city_rows_for_scope(source_iso, admin1_id).values())
+        return [target for _row, target in found]
 
     def _ranked_city_rows(
         self,
@@ -1175,30 +1254,61 @@ class GuidedDialogueService:
         session: GeoSession,
         clues: Sequence[Clue],
     ) -> dict[str, Mapping[str, Any]]:
-        admin1 = self._selected_admin1(state)
-        if admin1 is None:
-            return {}
-        source_iso = normalize_iso(admin1.get("source_iso"))
         image_path = Path(session.image_path)
-        if not source_iso or not image_path.exists():
+        if not image_path.exists():
             return {}
-        try:
-            result = self.gateway.rank_cities(image_path, source_iso)
-        except Exception:
-            result = None
-        if not result:
-            return {}
-        rows = [dict(row) for row in result.get("city_scores") or [] if isinstance(row, Mapping)]
-        scoped_rows = self._city_rows_for_scope(source_iso, str(admin1.get("id") or admin1.get("admin1_id") or ""))
-        catalog = {source_iso: scoped_rows}
-        if scoped_rows and clues:
+        merged: dict[str, Mapping[str, Any]] = {}
+        for source_iso in self._country_source_scopes(state):
+            if self._source_excluded(state, session, source_iso):
+                continue
             try:
-                reranked = CityClueReasoner(catalog).rerank(rows, clues, iso=source_iso)
-                if reranked is not None:
-                    rows = list(reranked.city_scores)
-            except (KeyError, TypeError, ValueError):
-                pass
-        return {str(row.get("city_id")): row for row in rows if row.get("city_id") is not None}
+                result = self.gateway.rank_cities(image_path, source_iso)
+            except Exception:
+                result = None
+            if not result:
+                continue
+            rows = [
+                dict(row)
+                for row in result.get("city_scores") or []
+                if isinstance(row, Mapping)
+            ]
+            scoped_rows = self._city_rows_for_source(source_iso)
+            if scoped_rows and clues and rows:
+                try:
+                    reranked = CityClueReasoner({source_iso: scoped_rows}).rerank(
+                        rows,
+                        clues,
+                        iso=source_iso,
+                    )
+                    if reranked is not None:
+                        rows = list(reranked.city_scores)
+                except (KeyError, TypeError, ValueError):
+                    pass
+            for row in rows:
+                city_id = str(row.get("city_id") or "")
+                try:
+                    city_key = int(city_id)
+                except (TypeError, ValueError):
+                    continue
+                if city_key not in scoped_rows:
+                    continue
+                if normalize_iso(row.get("iso")) != source_iso:
+                    continue
+                current = merged.get(city_id)
+                if current is None:
+                    merged[city_id] = row
+                    continue
+                try:
+                    current_score = float(current.get("score"))
+                except (TypeError, ValueError):
+                    current_score = -1.0
+                try:
+                    row_score = float(row.get("score"))
+                except (TypeError, ValueError):
+                    row_score = -1.0
+                if row_score > current_score:
+                    merged[city_id] = row
+        return merged
 
     def _city_candidates(
         self,
@@ -1209,64 +1319,94 @@ class GuidedDialogueService:
         query: str | None,
         proposals: Sequence[Mapping[str, Any]],
     ) -> list[dict[str, Any]]:
-        rows = self._city_rows_scoped(state)
+        rows = self._city_rows_for_country(state, session)
         if not rows:
             return []
         ranks = self._ranked_city_rows(state, session, clues)
         query_key = normalize_place_text(query or "")
-        alias_row_ids: set[int] = set()
-        if query_key:
-            for alias, city_id in _GUIDED_CITY_ALIAS_IDS.items():
-                alias_key = normalize_place_text(alias)
-                if alias_key and (alias_key == query_key or alias_key in query_key or query_key in alias_key):
-                    alias_row_ids.add(int(city_id))
-        scoped_rows: list[tuple[CityRow, Mapping[str, Any] | None]] = []
-        for row in rows:
-            if self._excluded_by_state(state, self._city_target(row)) is not None:
-                continue
-            if query_key and row.city_id not in alias_row_ids and query_key not in normalize_place_text(row.name):
-                continue
-            scoped_rows.append((row, ranks.get(str(row.city_id))))
+        country_scopes = set(self._country_source_scopes(state))
+        canonical = canonical_country_iso(next(iter(country_scopes), ""))
+        candidates: dict[tuple[str, str], dict[str, Any]] = {}
 
-        proposed = []
-        selected_admin1_id = str((self._selected_admin1(state) or {}).get("id") or "")
-        for target in proposals:
-            if not isinstance(target, Mapping) or target.get("level") != "city":
-                continue
-            if selected_admin1_id and str(target.get("admin1_id") or "") != selected_admin1_id:
-                continue
+        def add(target: Mapping[str, Any], **kwargs: Any) -> None:
+            if normalize_iso(target.get("source_iso")) not in country_scopes:
+                return
+            if canonical_country_iso(target.get("country_iso")) != canonical:
+                return
             if self._excluded_by_state(state, target) is not None:
-                continue
-            proposed.append(self._candidate(target, reason="自由文本提议"))
+                return
+            key = _target_key(target)
+            existing = candidates.get(key)
+            if existing is None:
+                candidates[key] = self._candidate(target, **kwargs)
+                return
+            for field in ("score", "score_type", "reason", "selection_basis"):
+                value = kwargs.get(field)
+                if value is not None and existing.get(field) is None:
+                    existing[field] = value
 
-        candidates: list[dict[str, Any]] = []
-        for row, ranked in scoped_rows:
-            payload = self._candidate(
-                self._city_target(row),
-                score=ranked.get("score") if isinstance(ranked, Mapping) else None,
-                score_type=ranked.get("score_type") if isinstance(ranked, Mapping) else None,
-                reason=(
-                    "图片城市排序"
-                    if isinstance(ranked, Mapping)
-                    else ("目录检索匹配" if query_key else "城市目录")
-                ),
+        # User-verified proposal targets are kept ahead of model scores by the
+        # frontend via selection_basis, even when the model has ten scored rows.
+        for raw in proposals:
+            if not isinstance(raw, Mapping) or raw.get("level") != "city":
+                continue
+            row = self._city_row_by_id(str(raw.get("id") or ""))
+            if row is None or row.iso not in country_scopes:
+                continue
+            add(
+                self._city_target(row, label=str(raw.get("label") or row.name)),
+                reason=self._proposal_reason(state, row),
+                selection_basis="user_text",
             )
-            candidates.append(payload)
+
+        if query_key:
+            for target in self._catalog_city_search_targets(state, session, query or ""):
+                add(
+                    target,
+                    reason="全国城市目录检索",
+                    selection_basis="catalog_search",
+                )
+
+        for city_id, ranked in ranks.items():
+            try:
+                row = rows[int(city_id)]
+            except (KeyError, TypeError, ValueError):
+                continue
+            add(
+                self._city_target(row),
+                score=ranked.get("score"),
+                score_type=ranked.get("score_type"),
+                reason="图片城市排序",
+            )
+
+        fallback = sorted(
+            rows.values(),
+            key=lambda row: (-row.population, row.city_id),
+        )[: CITY_CANDIDATE_LIMIT * 2]
+        for row in fallback:
+            add(self._city_target(row), reason="城市目录")
 
         def sort_key(item: Mapping[str, Any]) -> tuple[Any, ...]:
             target = item.get("target") or {}
-            row = next((r for r in rows if str(r.city_id) == str(target.get("id"))), None)
             label_key = normalize_place_text(str(target.get("label") or ""))
-            exact = 0 if query_key and (label_key == query_key or (row is not None and row.city_id in alias_row_ids)) else 1
+            basis = str(item.get("selection_basis") or "")
+            basis_rank = 0 if basis == "user_text" else 1 if basis == "catalog_search" else 2
+            if item.get("score") is None and basis_rank == 2:
+                basis_rank = 3
+            exact = 0 if query_key and label_key == query_key else 1
             try:
                 score = -float(item.get("score"))
             except (TypeError, ValueError):
                 score = 1.0
-            population = -(row.population if row is not None else 0)
-            return (exact, score, population, str(target.get("id") or ""))
+            try:
+                row = rows[int(str(target.get("id") or ""))]
+                population = -row.population
+            except (KeyError, TypeError, ValueError):
+                population = 0
+            return (basis_rank, exact, score, population, str(target.get("id") or ""))
 
-        candidates.sort(key=sort_key)
-        return self._merge_candidates(proposed, candidates)[:CITY_CANDIDATE_LIMIT]
+        ordered = sorted(candidates.values(), key=sort_key)
+        return ordered[:CITY_CANDIDATE_LIMIT]
 
     # --------------------------------------------------------------- target
     def _resolve_target(self, raw: GuidedEventTarget | Mapping[str, Any]) -> dict[str, Any]:
@@ -1274,9 +1414,10 @@ class GuidedDialogueService:
         identifier = str(getattr(raw, "id", None) or (raw.get("id") if isinstance(raw, Mapping) else "") or "").strip()
         if level == "country":
             iso = normalize_iso(identifier)
-            if not iso or canonical_country_iso(iso) != iso or not self._country_exists(iso):
+            canonical = canonical_country_iso(iso)
+            if not canonical or not self._country_exists(canonical):
                 raise GuidedValidationError("未知国家 ID")
-            return self._country_target(iso)
+            return self._country_target(canonical)
         if level == "admin1":
             admin1_id = identifier.upper()
             match = _ADMIN1_ID_RE.fullmatch(admin1_id)
@@ -1299,51 +1440,36 @@ class GuidedDialogueService:
         level = str(target.get("level") or "")
         confirmed = state.get("confirmed") or {}
         country = confirmed.get("country") if isinstance(confirmed, Mapping) else None
-        admin1 = confirmed.get("admin1") if isinstance(confirmed, Mapping) else None
         if level == "country":
-            if isinstance(country, Mapping) and str(country.get("id")) != str(target.get("id")):
+            current = canonical_country_iso(country.get("id")) if isinstance(country, Mapping) else ""
+            if current and current != canonical_country_iso(target.get("id")):
                 raise GuidedValidationError("确认其他国家前请先回退")
             return
-        if not isinstance(country, Mapping):
-            raise GuidedValidationError("请先确认国家，再确认一级行政区或城市")
-        if str(target.get("country_iso")) != str(country.get("id")):
-            raise GuidedValidationError("目标国家与已确认国家不一致")
         if level == "admin1":
-            if isinstance(admin1, Mapping) and str(admin1.get("id")) != str(target.get("id")):
-                raise GuidedValidationError("确认其他一级行政区前请先回退")
-            return
-        if level == "city":
-            if not isinstance(admin1, Mapping):
-                raise GuidedValidationError("请先确认一级行政区，再确认城市")
-            if str(target.get("admin1_id")) != str(admin1.get("id")):
-                raise GuidedValidationError("城市不属于已确认的一级行政区")
-            if str(target.get("country_iso")) != str(admin1.get("country_iso")):
-                raise GuidedValidationError("城市的国家归属不一致")
-            return
-        raise GuidedValidationError("未知地点层级")
+            raise GuidedValidationError("已取消一级行政区确认，请直接确认城市")
+        if not isinstance(country, Mapping):
+            raise GuidedValidationError("请先确认国家，再确认城市")
+        country_iso = canonical_country_iso(country.get("id"))
+        target_country = canonical_country_iso(target.get("country_iso"))
+        if not country_iso or target_country != country_iso:
+            raise GuidedValidationError("目标国家与已确认国家不一致")
+        if level != "city":
+            raise GuidedValidationError("未知地点层级")
 
     def _validate_active_scope(self, state: Mapping[str, Any], target: Mapping[str, Any]) -> None:
-        """Reject exclusions whose ancestry is outside the active guided path."""
+        """Reject exclusions from outside the confirmed canonical country."""
 
         level = str(target.get("level") or "")
         confirmed = state.get("confirmed") or {}
         country = confirmed.get("country") if isinstance(confirmed, Mapping) else None
-        admin1 = confirmed.get("admin1") if isinstance(confirmed, Mapping) else None
         if not isinstance(country, Mapping):
             if level != "country":
                 raise GuidedValidationError("尚未确认国家，不能排除下级地点")
             return
-        if canonical_country_iso(target.get("country_iso")) != str(country.get("id")):
+        country_iso = canonical_country_iso(country.get("id"))
+        target_country = canonical_country_iso(target.get("country_iso"))
+        if not country_iso or target_country != country_iso:
             raise GuidedValidationError("排除地点不属于当前已确认国家")
-        if isinstance(admin1, Mapping):
-            if level == "admin1" and str(target.get("id")) != str(admin1.get("id")):
-                raise GuidedValidationError("排除的行政区不属于当前已确认行政区")
-            if level == "city" and str(target.get("admin1_id")) != str(admin1.get("id")):
-                raise GuidedValidationError("排除的城市不属于当前已确认行政区")
-        if level == "city":
-            admin1_id = target.get("admin1_id")
-            if not admin1_id or self._admin_by_id(str(admin1_id)) is None:
-                raise GuidedValidationError("城市缺少官方一级行政区归属，不能执行排除")
 
     @staticmethod
     def _excluded_by_state(
@@ -1354,8 +1480,12 @@ class GuidedDialogueService:
             if not isinstance(exclusion, Mapping):
                 continue
             level = str(exclusion.get("level") or "")
-            if level == "country" and target.get("country_iso") == exclusion.get("id"):
-                return dict(exclusion)
+            if level == "country":
+                excluded_iso = normalize_iso(exclusion.get("id"))
+                if excluded_iso == canonical_country_iso(target.get("country_iso")):
+                    return dict(exclusion)
+                if source_region_iso(excluded_iso) and normalize_iso(target.get("source_iso")) == excluded_iso:
+                    return dict(exclusion)
             if level == "admin1":
                 if target.get("level") == "admin1" and target.get("id") == exclusion.get("id"):
                     return dict(exclusion)
@@ -1370,10 +1500,8 @@ class GuidedDialogueService:
         confirmed = state.get("confirmed") or {}
         if isinstance(confirmed, Mapping) and isinstance(confirmed.get("city"), Mapping):
             return "resolved"
-        if isinstance(confirmed, Mapping) and isinstance(confirmed.get("admin1"), Mapping):
-            return "city"
         if isinstance(confirmed, Mapping) and isinstance(confirmed.get("country"), Mapping):
-            return "admin1"
+            return "city"
         return "country"
 
     @staticmethod
@@ -1692,7 +1820,6 @@ class GuidedDialogueService:
                 and self._excluded_by_state(state, target) is None
             ]
             country_candidates = self._merge_candidates(proposed_countries, country_candidates)
-        admin1_candidates = self._admin1_candidates(state, proposals) if stage in {"admin1", "city", "resolved"} else []
         city_candidates = (
             self._city_candidates(state, session, clues, query=query, proposals=proposals)
             if stage in {"city", "resolved"}
@@ -1799,10 +1926,16 @@ class GuidedDialogueService:
                         action = self._action_for_state(state, question)
 
         if action is None:
+            pending = state.get("pending_question")
+            legacy_pending = (
+                isinstance(pending, Mapping)
+                and isinstance(pending.get("target"), Mapping)
+                and pending["target"].get("level") == "admin1"
+            )
             question = (
-                self._ensure_question(state, country_candidates, admin1_candidates, city_candidates)
-                if ensure_question
-                else state.get("pending_question")
+                self._ensure_question(state, country_candidates, city_candidates)
+                if ensure_question or legacy_pending
+                else pending
             )
             action = self._action_for_state(state, question)
 
@@ -1829,11 +1962,7 @@ class GuidedDialogueService:
         return _Prepared(
             state=state,
             stage=stage,
-            candidates=(
-                country_candidates if stage == "country"
-                else admin1_candidates if stage == "admin1"
-                else city_candidates
-            ),
+            candidates=country_candidates if stage == "country" else city_candidates,
             scores=scores,
             action=action,
             confidence=confidence,
@@ -1920,7 +2049,6 @@ class GuidedDialogueService:
         self,
         state: dict[str, Any],
         country_candidates: Sequence[Mapping[str, Any]],
-        admin1_candidates: Sequence[Mapping[str, Any]],
         city_candidates: Sequence[Mapping[str, Any]],
     ) -> dict[str, Any] | None:
         stage = self._stage_for_state(state)
@@ -1973,7 +2101,6 @@ class GuidedDialogueService:
 
         candidate_sets = {
             "country": list(country_candidates),
-            "admin1": list(admin1_candidates),
             "city": list(city_candidates),
         }
         candidates = candidate_sets.get(stage, [])
@@ -2142,6 +2269,7 @@ class GuidedDialogueService:
                 updated if isinstance(item, Mapping) and str(item.get("id")) == str(clue_id) else item
                 for item in state["clues"]
             ]
+            self._refresh_derived_proposals(state)
             state["pending_question"] = None
             self._refresh_conflict(state)
             label = "已确认" if status == "confirmed" else "已否定"
@@ -2178,6 +2306,8 @@ class GuidedDialogueService:
             )
             if event.target.level != "country" or not confirm_iso or confirm_iso not in routed_isos or pinned_review:
                 raise GuidedConflict("请先完成当前线索核对，再确认地点。")
+        if event.target.level == "admin1":
+            raise GuidedValidationError("已取消一级行政区确认，请直接确认城市")
         target = self._resolve_target(event.target)
         self._validate_confirmation(state, target)
         excluded = self._excluded_by_state(state, target)
@@ -2197,15 +2327,32 @@ class GuidedDialogueService:
             new_confirmed["country"] = dict(target)
             new_confirmed["admin1"] = None
             new_confirmed["city"] = None
-        elif level == "admin1":
-            new_confirmed["admin1"] = dict(target)
-            new_confirmed["city"] = None
-        else:
+        elif level == "city":
+            # Deprecated admin1 provenance is retained, never used as a parent
+            # gate. A city outside that old metadata remains confirmable.
             new_confirmed["city"] = dict(target)
+        else:
+            raise GuidedValidationError("已取消一级行政区确认，请直接确认城市")
         state["confirmed"] = new_confirmed
         state["pending_question"] = None
         state["confidence_confirm_isos"] = []
-        state["proposals"] = []
+        if level == "country":
+            retained = []
+            for item in state.get("proposals") or []:
+                if not isinstance(item, Mapping) or item.get("level") != "city":
+                    continue
+                if canonical_country_iso(item.get("country_iso")) == canonical_country_iso(target.get("id")):
+                    retained.append(dict(item))
+            retained_keys = {_target_state_key(item) for item in retained}
+            state["proposals"] = retained
+            state["proposal_meta"] = {
+                str(key): dict(value)
+                for key, value in (state.get("proposal_meta") or {}).items()
+                if str(key) in retained_keys and isinstance(value, Mapping)
+            }
+        else:
+            state["proposals"] = []
+            state["proposal_meta"] = {}
         state["pending_correction"] = None
         self._refresh_conflict(state)
         return self._outcome(state, True, "applied", f"已确认「{target.get('label')}」。")
@@ -2259,6 +2406,7 @@ class GuidedDialogueService:
                     updated if isinstance(item, Mapping) and str(item.get("id")) == str(event.clue_id) else item
                     for item in state["clues"]
                 ]
+                self._refresh_derived_proposals(state)
                 review_question_id = f"review:{event.clue_id}"
                 state["asked_question_ids"] = [
                     item
@@ -2293,20 +2441,16 @@ class GuidedDialogueService:
         state: dict[str, Any],
         event: GuidedEventRequest,
     ) -> dict[str, Any]:
-        level = event.level
-        if level not in {"country", "admin1", "city"}:
+        requested = event.level
+        if requested not in {"country", "admin1", "city"}:
             raise GuidedValidationError("缺少回退层级")
+        # admin1 was the old city-stage parent. It now aliases the two-step
+        # country stage instead of leaving an invalid country+admin1-only path.
+        level = "country" if requested == "admin1" else requested
         confirmed = state.get("confirmed") or {}
         if level == "country":
             changed = any(isinstance(confirmed.get(key), Mapping) for key in ("country", "admin1", "city"))
             new_confirmed = {"country": None, "admin1": None, "city": None}
-        elif level == "admin1":
-            changed = any(isinstance(confirmed.get(key), Mapping) for key in ("admin1", "city"))
-            new_confirmed = {
-                "country": confirmed.get("country") if isinstance(confirmed, Mapping) else None,
-                "admin1": None,
-                "city": None,
-            }
         else:
             changed = isinstance(confirmed.get("city"), Mapping)
             new_confirmed = {
@@ -2320,6 +2464,8 @@ class GuidedDialogueService:
         state["pending_question"] = None
         state["asked_question_ids"] = []
         state["pending_correction"] = None
+        state["proposals"] = []
+        state["proposal_meta"] = {}
         self._refresh_conflict(state)
         return self._outcome(state, True, "applied", f"已回退到{_LEVEL_LABELS[level]}阶段。")
 
@@ -2373,6 +2519,18 @@ class GuidedDialogueService:
             str(record.get("id")) for record in state.get("clues") or []
             if isinstance(record, Mapping) and record.get("id")
         }
+        existing_evidence = {
+            (
+                str(record.get("dimension") or ""),
+                str(record.get("value") or ""),
+                str(record.get("source") or ""),
+            )
+            for record in state.get("clues") or []
+            if isinstance(record, Mapping)
+            and str(record.get("_origin") or "") == "guided_user"
+        }
+        duplicate_evidence = False
+        previous_text = str(state.get("last_text") or "")
         for raw in parsed.clues:
             if not isinstance(raw, Mapping):
                 continue
@@ -2380,15 +2538,35 @@ class GuidedDialogueService:
             if str(record["id"]) in existing_ids:
                 continue
             record["source"] = "user"
+            evidence_key = (
+                str(record.get("dimension") or ""),
+                str(record.get("value") or ""),
+                str(record.get("source") or ""),
+            )
+            if evidence_key in existing_evidence:
+                duplicate_evidence = True
+                continue
             extra = dict(record.get("_extra") or {})
             extra["parser"] = str(extra.get("parser") or "guided_rules")
+            if str(record.get("dimension") or "") in {"place_name", "signage"}:
+                literal = str(extra.get("literal") or record.get("value") or "")
+                clue_alias = self._validated_curated_alias_entry(literal)
+                if clue_alias is not None:
+                    extra["place_alias"] = self._curated_alias_diagnostic(clue_alias)
             record["_extra"] = extra
             record["_origin"] = "guided_user"
             state.setdefault("clues", []).append(record)
             existing_ids.add(str(record["id"]))
+            existing_evidence.add(evidence_key)
             added.append(str(record.get("id")))
 
-        proposals = self._propose_targets(state, text, parsed.clues)
+        curated_proposals, curated_meta = self._curated_proposals_from_clues(state)
+        proposed = self._propose_targets(state, text, parsed.clues)
+        merged: dict[str, dict[str, Any]] = {}
+        for target in [*curated_proposals, *proposed]:
+            if isinstance(target, Mapping):
+                merged.setdefault(_target_state_key(target), dict(target))
+        proposals = list(merged.values())
         conflict = self._detect_conflict(state, proposals)
         correction = self._correction_plan(text, parsed, added)
         old_proposals = [dict(item) for item in state.get("proposals") or [] if isinstance(item, Mapping)]
@@ -2411,8 +2589,23 @@ class GuidedDialogueService:
             state["pending_question"] = None
             effective = True
         if not effective:
+            if duplicate_evidence or (previous_text and text == previous_text):
+                return self._outcome(
+                    state,
+                    False,
+                    "unchanged",
+                    "该文字线索已存在，无需重复记录。",
+                )
+            if bool(getattr(parsed, "question", False)):
+                return self._outcome(
+                    state,
+                    False,
+                    "unchanged",
+                    "这是询问，未据此新增地点线索。",
+                )
             return self._outcome(state, False, "unrecognized", "没有识别到新的目录证据、地点提议或修正计划。")
         state["proposals"] = proposals
+        state["proposal_meta"] = curated_meta
         state["conflict"] = conflict
         state["pending_correction"] = correction
         state["last_text"] = text
@@ -2422,9 +2615,22 @@ class GuidedDialogueService:
         elif conflict is not None:
             summary = str(conflict.get("message") or "线索与已确认路径冲突，未自动改变路径。")
         elif proposals:
-            summary = "已记录自由文本提议；必须明确确认地点后才会推进。"
+            city_labels = [
+                str(item.get("label") or item.get("id") or "")
+                for item in proposals
+                if isinstance(item, Mapping) and item.get("level") == "city"
+            ]
+            if city_labels and _looks_like_street_text(text):
+                summary = (
+                    f"已记录招牌文字{text}，关联到{'、'.join(city_labels)}候选，需确认"
+                )
+            else:
+                summary = "已记录自由文本提议；必须明确确认地点后才会推进。"
         elif added:
-            summary = "已记录待复核的自由文本线索；没有确认任何地点。"
+            if _looks_like_street_text(text):
+                summary = "已记录文字线索，暂未匹配城市，可补充附近地名"
+            else:
+                summary = "已记录待复核的自由文本线索；没有确认任何地点。"
         else:
             summary = "没有识别到新的目录证据或地点提议。"
         return self._outcome(state, True, "applied", summary)
@@ -2481,16 +2687,43 @@ class GuidedDialogueService:
         state["pending_question"] = None
         return self._outcome(state, True, "applied", "已记录为待复核线索；没有确认任何地点。")
 
+    def _source_region_target(self, raw_iso: str) -> dict[str, Any]:
+        raw = normalize_iso(raw_iso)
+        canonical = canonical_country_iso(raw)
+        if not source_region_iso(raw) or not canonical:
+            raise GuidedValidationError("未知地区范围")
+        record = next(
+            (
+                item for item in self._country_records()
+                if normalize_iso(item.get("iso")) == raw
+            ),
+            {},
+        )
+        try:
+            place = self._store().get_place("country", raw)
+        except Exception as exc:
+            raise self._unavailable(exc) from exc
+        coordinate = self._coordinate_fields(place)
+        return {
+            "level": "country",
+            "id": raw,
+            "label": str(record.get("name_zh") or record.get("name") or raw),
+            "country_iso": canonical,
+            "source_iso": raw,
+            "admin1_id": None,
+            "city_id": None,
+            "lat": coordinate["lat"],
+            "lng": coordinate["lng"],
+            **coordinate["provenance"],
+        }
+
     def _correction_targets_for_iso(self, value: object) -> list[dict[str, Any]]:
         raw = normalize_iso(value)
         canonical = canonical_country_iso(raw)
         if not raw or not canonical or not self._country_exists(canonical):
             raise GuidedValidationError("修正计划包含未知国家或地区")
         if raw != canonical:
-            rows = self._admin_rows(raw)
-            if not rows:
-                raise GuidedValidationError("该地区没有可用的官方一级行政区，不能应用排除修正")
-            return [self._admin1_target(row, canonical) for row in rows]
+            return [self._source_region_target(raw)]
         return [self._country_target(canonical)]
 
     def _apply_correction_decision(
@@ -2565,6 +2798,7 @@ class GuidedDialogueService:
                 remaining.append(record)
             state["clues"] = remaining
 
+        self._refresh_derived_proposals(state)
         state["pending_correction"] = None
         state["pending_question"] = None
         self._refresh_conflict(state)
@@ -2592,6 +2826,7 @@ class GuidedDialogueService:
                             updated if isinstance(item, Mapping) and str(item.get("id")) == clue_id else item
                             for item in state["clues"]
                         ]
+                        self._refresh_derived_proposals(state)
                         effective = True
                     break
         history_before = len(self._asked_clue_history(state))
@@ -2609,6 +2844,7 @@ class GuidedDialogueService:
         if question.get("kind") == "ask":
             state["conflict"] = None
             state["proposals"] = []
+            state["proposal_meta"] = {}
         return self._outcome(
             state,
             effective,
@@ -2686,12 +2922,38 @@ class GuidedDialogueService:
     def _clear_path_invalidated_by_exclusion(self, state: dict[str, Any], exclusion: Mapping[str, Any]) -> None:
         confirmed = state.get("confirmed") or {}
         level = str(exclusion.get("level") or "")
-        if level == "country" and isinstance(confirmed.get("country"), Mapping) and confirmed["country"].get("id") == exclusion.get("id"):
-            state["confirmed"] = {"country": None, "admin1": None, "city": None}
-        elif level == "admin1" and isinstance(confirmed.get("admin1"), Mapping) and confirmed["admin1"].get("id") == exclusion.get("id"):
-            state["confirmed"] = {"country": confirmed.get("country"), "admin1": None, "city": None}
-        elif level == "city" and isinstance(confirmed.get("city"), Mapping) and confirmed["city"].get("id") == exclusion.get("id"):
-            state["confirmed"] = {"country": confirmed.get("country"), "admin1": confirmed.get("admin1"), "city": None}
+        country = confirmed.get("country") if isinstance(confirmed, Mapping) else None
+        city = confirmed.get("city") if isinstance(confirmed, Mapping) else None
+        if level == "country":
+            excluded_iso = normalize_iso(exclusion.get("id"))
+            country_iso = canonical_country_iso(country.get("id")) if isinstance(country, Mapping) else ""
+            if excluded_iso == country_iso:
+                state["confirmed"] = {"country": None, "admin1": None, "city": None}
+            elif (
+                isinstance(city, Mapping)
+                and source_region_iso(excluded_iso)
+                and normalize_iso(city.get("source_iso")) == excluded_iso
+            ):
+                state["confirmed"] = {
+                    "country": country,
+                    "admin1": confirmed.get("admin1"),
+                    "city": None,
+                }
+        elif level == "admin1":
+            if isinstance(city, Mapping) and city.get("admin1_id") == exclusion.get("admin1_id"):
+                state["confirmed"] = {
+                    "country": country,
+                    "admin1": confirmed.get("admin1"),
+                    "city": None,
+                }
+            if isinstance(confirmed.get("admin1"), Mapping) and confirmed["admin1"].get("id") == exclusion.get("id"):
+                state["confirmed"] = {"country": country, "admin1": None, "city": None}
+        elif level == "city" and isinstance(city, Mapping) and city.get("id") == exclusion.get("id"):
+            state["confirmed"] = {
+                "country": country,
+                "admin1": confirmed.get("admin1"),
+                "city": None,
+            }
         state["pending_question"] = None
 
     @staticmethod
@@ -2735,118 +2997,246 @@ class GuidedDialogueService:
             seen.add(key)
             proposals.append(dict(target))
 
+        # Proposals come only from accepted parsed evidence. Never reinterpret a
+        # question, instruction, or other raw message text as a place assertion.
         for raw in parsed_clues:
-            if not isinstance(raw, Mapping) or raw.get("dimension") != "place_name":
+            if not isinstance(raw, Mapping):
+                continue
+            dimension = str(raw.get("dimension") or "")
+            if dimension not in {"place_name", "signage"}:
                 continue
             value = str(raw.get("value") or "").strip()
             if not value:
                 continue
-            iso = normalize_iso(value) if value.isascii() and value.isalpha() and value == value.upper() else ""
-            if iso and iso == canonical_country_iso(iso) and self._country_exists(iso):
+            extra = raw.get("extra") if isinstance(raw.get("extra"), Mapping) else {}
+            literal = str(extra.get("literal") or raw.get("literal") or "").strip()
+            iso = (
+                normalize_iso(value)
+                if value.isascii() and value.isalpha() and value == value.upper()
+                else ""
+            )
+            if iso and self._country_exists(iso):
                 add(self._country_target(iso))
-            for target in self._match_admin1_text(state, value):
-                add(target)
-            for target in self._match_city_text(state, value):
-                add(target)
-                parent = target.get("admin1_id")
-                if parent:
-                    row = self._admin_by_id(str(parent))
-                    if row is not None:
-                        add(self._admin1_target(row, target.get("country_iso")))
-
-        normalized = normalize_place_text(text)
-        if normalized:
-            for token in _UPPER_ISO_RE.findall(text):
-                iso = normalize_iso(token)
-                if iso and iso == canonical_country_iso(iso) and self._country_exists(iso):
-                    add(self._country_target(iso))
-            for country in self._country_records():
-                iso = canonical_country_iso(country.get("iso"))
-                if not iso or not self._country_exists(iso):
-                    continue
-                for label in (country.get("name"), country.get("name_zh")):
-                    if label and find_exact_phrase(normalized, normalize_place_text(str(label))):
-                        add(self._country_target(iso))
-                        break
-            for target in self._match_admin1_text(state, text):
-                add(target)
-            for target in self._match_city_text(state, text):
-                add(target)
-                parent = target.get("admin1_id")
-                if parent:
-                    row = self._admin_by_id(str(parent))
-                    if row is not None:
-                        add(self._admin1_target(row, target.get("country_iso")))
+            for candidate in dict.fromkeys(
+                item for item in (literal, value) if item and item != iso
+            ):
+                for target in self._match_city_text(state, candidate):
+                    add(target)
         return proposals[:PROPOSAL_LIMIT]
 
-    def _all_admin1_rows(self) -> list[Any]:
+    @staticmethod
+    def _curated_alias_entry(text: str) -> Any | None:
         try:
-            store = self._store()
-            rows: list[Any] = []
-            offset = 0
-            page_size = 2000
-            while True:
-                page = store.query_places(
-                    "admin1",
-                    limit=page_size,
-                    offset=offset,
-                    coordinates_only=False,
-                )
-                batch = list(page.get("rows") or [])
-                rows.extend(batch)
-                total = int(page.get("total") or 0)
-                offset += len(batch)
-                if not batch or offset >= total:
-                    return rows
-        except Exception as exc:
-            raise self._unavailable(exc) from exc
+            from ..domain.geolocation.place_aliases import match_curated_place_alias
+        except ImportError:
+            return None
+        try:
+            return match_curated_place_alias(text)
+        except Exception:
+            return None
 
-    def _match_admin1_text(self, state: Mapping[str, Any], text: str) -> list[dict[str, Any]]:
-        normalized = normalize_place_text(text)
-        if not normalized:
-            return []
-        confirmed = state.get("confirmed") or {}
-        country = confirmed.get("country") if isinstance(confirmed, Mapping) else None
-        country_iso = canonical_country_iso(country.get("id")) if isinstance(country, Mapping) else ""
-        source_isos = country_members(country_iso) if country_iso else sorted({
-            self._admin_iso(row) for row in self._all_admin1_rows() if self._admin_iso(row)
-        })
-        result: list[dict[str, Any]] = []
-        for source_iso in source_isos:
-            for row in self._admin_rows(source_iso):
-                for label in self._admin_aliases(row):
-                    if label and find_exact_phrase(normalized, normalize_place_text(label)):
-                        result.append(self._admin1_target(row, country_iso or source_iso))
-                        break
-        return result
+    def _validated_curated_alias_entry(self, text: str) -> Any | None:
+        entry = self._curated_alias_entry(text)
+        if entry is None:
+            return None
+        try:
+            from ..domain.geolocation.place_aliases import validate_curated_place_alias
+        except ImportError:
+            return None
+        source_iso = normalize_iso(getattr(entry, "country_iso", ""))
+        if not source_iso:
+            return None
+        city_index = {source_iso: self._city_rows_for_source(source_iso)}
+        return entry if validate_curated_place_alias(entry, city_index) else None
+
+    @staticmethod
+    def _curated_alias_diagnostic(entry: Any) -> dict[str, Any]:
+        return {
+            "kind": str(getattr(entry, "kind", "") or ""),
+            "version": str(getattr(entry, "version", "") or ""),
+            "city_id": str(getattr(entry, "city_id", "") or ""),
+            "country_iso": normalize_iso(getattr(entry, "country_iso", "")),
+            "sources": [
+                {
+                    "publisher": str(getattr(source, "publisher", "") or ""),
+                    "title": str(getattr(source, "title", "") or ""),
+                    "url": str(getattr(source, "url", "") or ""),
+                    "verified_on": str(getattr(source, "verified_on", "") or ""),
+                }
+                for source in (getattr(entry, "sources", ()) or ())
+            ],
+        }
+
+    @staticmethod
+    def _curated_alias_reason(entry: Any, literal: str, display: str) -> str:
+        kind = str(getattr(entry, "kind", "") or "")
+        if kind == "street_label":
+            alias = next(
+                (
+                    str(item)
+                    for item in getattr(entry, "aliases", ()) or ()
+                    if normalize_place_text(item) == normalize_place_text(literal)
+                ),
+                literal,
+            )
+            return f"街区名称关联：{alias} → {display}（待确认，可能存在同名道路）"
+        if kind == "city_name":
+            return f"用户提供城市名：{display}"
+        return "自由文本提议"
+
+    def _curated_proposals_from_clues(
+        self,
+        state: Mapping[str, Any],
+    ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+        proposals: list[dict[str, Any]] = []
+        meta: dict[str, dict[str, Any]] = {}
+        for record in state.get("clues") or []:
+            if not isinstance(record, Mapping):
+                continue
+            if str(record.get("_origin") or "") != "guided_user":
+                continue
+            if str(record.get("status") or "pending") == "rejected":
+                continue
+            dimension = str(record.get("dimension") or "")
+            if dimension not in {"place_name", "signage"}:
+                continue
+            extra = record.get("_extra") if isinstance(record.get("_extra"), Mapping) else {}
+            values = [str(record.get("value") or "").strip()]
+            literal = str(extra.get("literal") or "").strip()
+            if literal and literal not in values:
+                values.append(literal)
+            entry = next(
+                (
+                    matched
+                    for matched in (
+                        self._validated_curated_alias_entry(item)
+                        for item in values
+                        if item
+                    )
+                    if matched is not None
+                ),
+                None,
+            )
+            if entry is None:
+                continue
+            row = self._city_row_by_id(str(getattr(entry, "city_id", "") or ""))
+            if row is None:
+                continue
+            display = str(getattr(entry, "display_label", "") or getattr(entry, "city_name", "") or row.name)
+            target = self._city_target(row, label=display)
+            key = _target_state_key(target)
+            if key not in meta:
+                reason_literal = next(
+                    (
+                        item for item in values
+                        if self._validated_curated_alias_entry(item) is entry
+                    ),
+                    values[0],
+                )
+                proposals.append(target)
+                meta[key] = {
+                    "reason": self._curated_alias_reason(entry, reason_literal, display),
+                    "clue_ids": [],
+                    "selection_basis": "user_text",
+                }
+            clue_id = str(record.get("id") or "")
+            if clue_id and clue_id not in meta[key]["clue_ids"]:
+                meta[key]["clue_ids"].append(clue_id)
+        return proposals, meta
+
+    def _refresh_derived_proposals(self, state: dict[str, Any]) -> None:
+        previous_meta = {
+            str(key): dict(item)
+            for key, item in (state.get("proposal_meta") or {}).items()
+            if isinstance(item, Mapping)
+        }
+        curated, meta = self._curated_proposals_from_clues(state)
+        previous_keys = set(previous_meta)
+        current_keys = set(meta)
+        if previous_keys - current_keys:
+            state["proposals"] = [
+                item for item in state.get("proposals") or []
+                if not (
+                    isinstance(item, Mapping)
+                    and _target_state_key(item) in previous_keys - current_keys
+                )
+            ]
+        existing = {
+            _target_state_key(item)
+            for item in state.get("proposals") or []
+            if isinstance(item, Mapping)
+        }
+        for target in curated:
+            key = _target_state_key(target)
+            if key not in existing:
+                state.setdefault("proposals", []).append(dict(target))
+                existing.add(key)
+        state["proposal_meta"] = meta
+
+    def _proposal_reason(self, state: Mapping[str, Any], row: CityRow) -> str:
+        key = f"city:{row.city_id}"
+        meta = (state.get("proposal_meta") or {}).get(key)
+        if isinstance(meta, Mapping) and meta.get("reason"):
+            return str(meta["reason"])
+        return "自由文本提议"
 
     def _match_city_text(self, state: Mapping[str, Any], text: str) -> list[dict[str, Any]]:
         normalized = normalize_place_text(text)
         if not normalized:
             return []
-        confirmed = state.get("confirmed") or {}
-        country = confirmed.get("country") if isinstance(confirmed, Mapping) else None
-        if not isinstance(country, Mapping):
+        scopes = self._country_source_scopes(state)
+        if not scopes:
             return []
-        selected = self._selected_admin1(state)
-        selected_source = normalize_iso(selected.get("source_iso")) if isinstance(selected, Mapping) else ""
-        selected_id = str(selected.get("id") or selected.get("admin1_id") or "") if isinstance(selected, Mapping) else ""
         result: list[dict[str, Any]] = []
-        for source_iso in country_members(canonical_country_iso(country.get("id"))):
-            if not source_iso:
-                continue
-            if selected_source == source_iso and selected_id:
-                scope = self._city_rows_for_scope(source_iso, selected_id)
-            else:
-                scope = self._city_rows_for_source(source_iso)
+        seen: set[tuple[str, str]] = set()
+
+        def add(target: Mapping[str, Any] | None) -> None:
+            if not isinstance(target, Mapping):
+                return
+            key = _target_key(target)
+            if key in seen or self._excluded_by_state(state, target) is not None:
+                return
+            seen.add(key)
+            result.append(dict(target))
+
+        # Curated street aliases are proposals only. Validation is closed over
+        # the authoritative city index, and a known cross-country alias remains
+        # in proposals so the existing conflict flow can ask to return to the
+        # country stage. It is never emitted as a candidate for the wrong country.
+        entry = self._validated_curated_alias_entry(text)
+        if entry is not None:
+            row = self._city_row_by_id(str(getattr(entry, "city_id", "") or ""))
+            entry_country = canonical_country_iso(getattr(entry, "country_iso", ""))
+            if (
+                row is not None
+                and canonical_country_iso(row.iso) == entry_country
+                and normalize_iso(row.iso) == normalize_iso(getattr(entry, "country_iso", ""))
+            ):
+                add(self._city_target(
+                    row,
+                    label=str(
+                        getattr(entry, "display_label", "")
+                        or getattr(entry, "city_name", "")
+                        or row.name
+                    ),
+                ))
+
+        # The catalog search covers name/ascii_name/name_zh/aliases. This is the
+        # hook for parser-provided street aliases; an alias must resolve to a
+        # real city row before it can become a proposal.
+        for target in self._catalog_city_search_targets(state, None, text):
+            add(target)
+
+        for source_iso in scopes:
+            scope = self._city_rows_for_source(source_iso)
             for alias, city_id in _GUIDED_CITY_ALIAS_IDS.items():
                 if find_exact_phrase(normalized, normalize_place_text(alias)):
                     row = scope.get(int(city_id))
                     if row is not None:
-                        result.append(self._city_target(row))
+                        add(self._city_target(row))
             for row in scope.values():
                 if find_exact_phrase(normalized, normalize_place_text(row.name)):
-                    result.append(self._city_target(row))
+                    add(self._city_target(row))
         return result
 
     def _refresh_conflict(self, state: dict[str, Any]) -> None:
@@ -2868,7 +3258,6 @@ class GuidedDialogueService:
     ) -> dict[str, Any] | None:
         confirmed = state.get("confirmed") or {}
         country = confirmed.get("country") if isinstance(confirmed, Mapping) else None
-        admin1 = confirmed.get("admin1") if isinstance(confirmed, Mapping) else None
         city = confirmed.get("city") if isinstance(confirmed, Mapping) else None
         conflicts: list[dict[str, Any]] = []
         proposal_countries = {
@@ -2881,25 +3270,28 @@ class GuidedDialogueService:
         for item in proposals:
             if not isinstance(item, Mapping):
                 continue
-            if isinstance(country, Mapping) and canonical_country_iso(item.get("country_iso")) != str(country.get("id")):
+            if isinstance(country, Mapping) and canonical_country_iso(item.get("country_iso")) != canonical_country_iso(country.get("id")):
                 conflicts.append({"reason": "different country proposed", "proposed": dict(item)})
                 continue
-            if isinstance(admin1, Mapping):
-                if item.get("level") == "admin1" and item.get("id") != admin1.get("id"):
-                    conflicts.append({"reason": "different admin1 proposed", "proposed": dict(item)})
-                if item.get("level") == "city" and item.get("admin1_id") != admin1.get("id"):
-                    conflicts.append({"reason": "city outside confirmed admin1 proposed", "proposed": dict(item)})
             if isinstance(city, Mapping) and item.get("level") == "city" and item.get("id") != city.get("id"):
                 conflicts.append({"reason": "different city proposed", "proposed": dict(item)})
         if not conflicts:
             return None
+        reasons = [str(item["reason"]) for item in conflicts]
         conflict_id = _json_hash("conflict", conflicts)
+        if any(reason in {"multiple countries proposed", "different country proposed"} for reason in reasons):
+            message = (
+                "文本指向与当前国家不一致的地点，已保持当前路径不变；"
+                "如需选择该国家，请先回退到国家阶段。"
+            )
+        else:
+            message = "文本与已确认路径冲突，请先澄清；已确认路径不会自动改变。"
         return {
             "id": conflict_id,
-            "message": "文本与已确认路径冲突，请先澄清；已确认路径不会自动改变。",
+            "message": message,
             "proposed": [dict(item) for item in proposals],
             "confirmed": dict(confirmed),
-            "reasons": [item["reason"] for item in conflicts],
+            "reasons": reasons,
         }
 
     # -------------------------------------------------------------- response

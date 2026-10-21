@@ -1,6 +1,7 @@
 import type {
   ConfidenceRoute,
   GuidedDialogue,
+  GuidedEventReceipt,
   GuidedLocationLevel,
   GuidedQuestion,
   GuidedStage,
@@ -21,7 +22,6 @@ export interface GuidedStep {
 
 export const GUIDED_STEPS: GuidedStep[] = [
   { level: 'country', label: '国家 / 地区' },
-  { level: 'admin1', label: '省份 / 地区' },
   { level: 'city', label: '城市' },
 ]
 
@@ -30,13 +30,13 @@ export const GUIDED_CANDIDATE_LIMIT = 5
 
 const LEVEL_LABELS: Record<GuidedLocationLevel, string> = {
   country: '国家 / 地区',
-  admin1: '省份 / 地区',
+  // Deprecated internal level: retained for payload typing, never rendered.
+  admin1: '地点',
   city: '城市',
 }
 
 const STAGE_TITLES: Record<GuidedStage, string> = {
   country: '先确认国家 / 地区',
-  admin1: '确认省份 / 地区',
   city: '确认城市',
   resolved: '已确认城市',
 }
@@ -71,7 +71,9 @@ export function guidedStageTitle(stage: GuidedStage): string {
 
 function levelText(level: string): string {
   const normalized = level.toLowerCase()
-  if (normalized === 'admin1') return '省份 / 地区'
+  // Old persisted receipts may still mention admin1. The public path no longer
+  // has that step, so render it as the city step rather than exposing it.
+  if (normalized === 'admin1') return '城市'
   if (normalized === 'city') return '城市'
   return '国家 / 地区'
 }
@@ -100,12 +102,41 @@ export function safeGuidedText(text: string | null | undefined): string {
 export function safeGuidedReceipt(text: string | null | undefined): string {
   const value = safeGuidedText(text).trim()
   if (/^(admin1|country|city)$/i.test(value)) return levelText(value)
-  // admin1 is never a legitimate user-facing location label in this catalog.
-  return value.replace(/\badmin1\b/gi, '省份 / 地区').replace(/\brevision\b/gi, '版本')
+  return value.replace(/\badmin1\b/gi, '地点').replace(/\brevision\b/gi, '版本')
 }
 
 export function locationLevelLabel(level: GuidedLocationLevel): string {
   return LEVEL_LABELS[level]
+}
+
+export type GuidedFreeTextReceiptStatus = 'applied' | 'unchanged' | 'unconfirmed' | 'failed'
+
+export interface GuidedFreeTextReceiptOutcome {
+  status: GuidedFreeTextReceiptStatus
+  error?: string | null
+}
+
+/**
+ * Map a free-text receipt without conflating an already-saved clue with an
+ * applied mutation or a failed submission. `unchanged` is an acknowledged
+ * pre-existing clue, not an application failure and not a fabricated success.
+ */
+export function guidedFreeTextReceiptOutcome(
+  receipt: GuidedEventReceipt | null | undefined,
+): GuidedFreeTextReceiptOutcome {
+  const status = receipt?.status?.trim().toLowerCase() ?? ''
+  if (status === 'unrecognized') {
+    return {
+      status: 'failed',
+      error: receipt?.summary ?? '没有识别到新的线索，请修改后重试。',
+    }
+  }
+  if (status === 'unchanged') return { status: 'unchanged' }
+  if (status === 'applied') return { status: 'applied' }
+  return {
+    status: 'unconfirmed',
+    error: '服务器未返回可识别的回执，请核对最新状态后重试。',
+  }
 }
 
 /** Stable key shared by candidate cards, App selection state, and map markers. */
@@ -314,10 +345,8 @@ export function guidedPreviousLevel(
   stage: GuidedStage | null | undefined,
 ): GuidedLocationLevel | null {
   switch (stage) {
-    case 'admin1':
-      return 'country'
     case 'city':
-      return 'admin1'
+      return 'country'
     case 'resolved':
       return 'city'
     default:
@@ -348,9 +377,9 @@ export function canUnlockReviewedRankings(dialogue: GuidedDialogue | null | unde
   if (!pending.length) return true
   const pendingOnlyUser = pending.every(isUserReviewedClue)
   const hasHandledObservation = dialogue.clues.some((clue) => clue.status !== 'pending')
-  const hasConfirmedPath = Boolean(
-    dialogue.confirmed.country || dialogue.confirmed.admin1 || dialogue.confirmed.city,
-  )
+  // Legacy admin1 metadata is deliberately ignored: only the public
+  // country -> city path can prove that a review round was completed.
+  const hasConfirmedPath = Boolean(dialogue.confirmed.country || dialogue.confirmed.city)
   return pendingOnlyUser && (hasHandledObservation || hasConfirmedPath)
 }
 
@@ -384,15 +413,62 @@ export function guidedQuestionMessage(
   return `我们初步判断这是‘${value}’的${dimensionLabel(dimension)}，您觉得准确吗？`
 }
 
+/** Explicit server provenance outranks every model score. */
+function selectionBasisRank(candidate: LocationCandidate): 0 | 1 | 2 {
+  if (candidate.selection_basis === 'user_text') return 0
+  if (candidate.selection_basis === 'catalog_search') return 1
+  return 2
+}
+
+interface RankedGuidedCandidate {
+  candidate: LocationCandidate
+  index: number
+  score: number | null
+  basisRank: 0 | 1 | 2
+}
+
+function mergeGuidedCandidate(
+  left: RankedGuidedCandidate,
+  right: RankedGuidedCandidate,
+): RankedGuidedCandidate {
+  const leftScore = left.score
+  const rightScore = right.score
+  const scored =
+    rightScore !== null && (leftScore === null || rightScore > leftScore) ? right : left
+  const basis = right.basisRank < left.basisRank ? right : left
+  const merged: LocationCandidate = {
+    ...scored.candidate,
+    ...(basis.candidate.selection_basis
+      ? { selection_basis: basis.candidate.selection_basis }
+      : {}),
+  }
+  if (scored.score !== null) {
+    merged.score = scored.score
+    merged.score_type = scored.candidate.score_type ?? null
+  } else {
+    delete merged.score
+    delete merged.score_type
+  }
+  const reason = left.candidate.reason ?? right.candidate.reason
+  if (reason) merged.reason = reason
+  return {
+    candidate: merged,
+    index: Math.min(left.index, right.index),
+    score: scored.score,
+    basisRank: basis.basisRank,
+  }
+}
+
 /**
- * Deduplicate and rank guided candidates by a real finite score. Catalog-only
- * rows never receive a synthetic score; they only fill remaining Top-5 slots.
+ * Deduplicate and rank guided candidates without inventing confidence:
+ * authorized user/catalog matches first, then real finite model scores, then
+ * unscored catalog rows. Legacy admin1 candidates never enter a public stage.
  */
 export function selectTopGuidedCandidates(
   candidates: readonly LocationCandidate[],
   stage?: GuidedStage | null,
 ): LocationCandidate[] {
-  const uniqueByKey = new Map<string, { candidate: LocationCandidate; index: number; score: number | null }>()
+  const uniqueByKey = new Map<string, RankedGuidedCandidate>()
   for (const [index, candidate] of candidates.entries()) {
     if (!candidate || (stage && candidate.target.level !== stage)) continue
     const key = guidedTargetKey(candidate.target)
@@ -401,31 +477,65 @@ export function selectTopGuidedCandidates(
       typeof candidate.score === 'number' && Number.isFinite(candidate.score)
         ? candidate.score
         : null
+    const entry: RankedGuidedCandidate = {
+      candidate,
+      index,
+      score,
+      basisRank: selectionBasisRank(candidate),
+    }
     const current = uniqueByKey.get(key)
-    if (!current) {
-      uniqueByKey.set(key, { candidate, index, score })
-      continue
-    }
-    if (score !== null && (current.score === null || score > current.score)) {
-      uniqueByKey.set(key, {
-        candidate,
-        index: Math.min(index, current.index),
-        score,
-      })
-    }
+    uniqueByKey.set(key, current ? mergeGuidedCandidate(current, entry) : entry)
   }
-  const unique = [...uniqueByKey.values()].sort((left, right) => left.index - right.index)
 
+  const unique = [...uniqueByKey.values()]
+  const explicit = unique
+    .filter((entry) => entry.basisRank < 2)
+    .sort(
+      (left, right) =>
+        left.basisRank - right.basisRank ||
+        (right.score ?? Number.NEGATIVE_INFINITY) - (left.score ?? Number.NEGATIVE_INFINITY) ||
+        left.index - right.index,
+    )
   const scored = unique
-    .filter((entry): entry is { candidate: LocationCandidate; index: number; score: number } => entry.score !== null)
-    .sort((left, right) => right.score - left.score || left.index - right.index)
-  const catalogOnly = unique.filter((entry) => entry.score === null)
-  const slots = Math.max(0, GUIDED_CANDIDATE_LIMIT - scored.length)
+    .filter((entry) => entry.basisRank === 2 && entry.score !== null)
+    .sort(
+      (left, right) =>
+        (right.score as number) - (left.score as number) || left.index - right.index,
+    )
+  const catalogOnly = unique.filter((entry) => entry.basisRank === 2 && entry.score === null)
 
-  return [
-    ...scored.slice(0, GUIDED_CANDIDATE_LIMIT).map(({ candidate }) => candidate),
-    ...catalogOnly.slice(0, slots).map(({ candidate }) => candidate),
-  ]
+  return [...explicit, ...scored, ...catalogOnly]
+    .slice(0, GUIDED_CANDIDATE_LIMIT)
+    .map(({ candidate }) => candidate)
+}
+
+export interface GuidedCandidateComposition {
+  hasUserText: boolean
+  hasCatalogSearch: boolean
+  hasExplicitSelectionBasis: boolean
+  hasModelScores: boolean
+  mixed: boolean
+}
+
+/** Shared ranking-label input for candidate panels and the guided dialogue. */
+export function guidedCandidateComposition(
+  candidates: readonly LocationCandidate[],
+): GuidedCandidateComposition {
+  const hasUserText = candidates.some((candidate) => candidate.selection_basis === 'user_text')
+  const hasCatalogSearch = candidates.some(
+    (candidate) => candidate.selection_basis === 'catalog_search',
+  )
+  const hasExplicitSelectionBasis = hasUserText || hasCatalogSearch
+  const hasModelScores = candidates.some(
+    (candidate) => typeof candidate.score === 'number' && Number.isFinite(candidate.score),
+  )
+  return {
+    hasUserText,
+    hasCatalogSearch,
+    hasExplicitSelectionBasis,
+    hasModelScores,
+    mixed: hasExplicitSelectionBasis && hasModelScores,
+  }
 }
 
 function scoreTypeLabel(scoreType: string | null | undefined): string {
@@ -441,13 +551,24 @@ function scoreTypeLabel(scoreType: string | null | undefined): string {
   }
 }
 
-/** Never turn a missing score into a fabricated probability. */
+/** Never turn missing provenance or a missing score into a fabricated probability. */
 export function candidateScoreLabel(candidate: LocationCandidate): string {
   const score = candidate.score
-  if (typeof score === 'number' && Number.isFinite(score)) {
-    return `${scoreTypeLabel(candidate.score_type)} ${score.toFixed(3)}（排序分，非概率）`
+  const scoreText =
+    typeof score === 'number' && Number.isFinite(score)
+      ? `${scoreTypeLabel(candidate.score_type)} ${score.toFixed(3)}（排序分，非概率）`
+      : ''
+  if (candidate.selection_basis === 'user_text') {
+    return scoreText
+      ? `线索匹配候选 · 来自你提供的文字线索；${scoreText}`
+      : '线索匹配候选 · 来自你提供的文字线索（非模型概率）'
   }
-  return '目录候选（无模型评分）'
+  if (candidate.selection_basis === 'catalog_search') {
+    return scoreText
+      ? `目录检索匹配 · 来自目录名称查询；${scoreText}`
+      : '目录检索匹配 · 来自目录名称查询（非模型概率）'
+  }
+  return scoreText || '目录候选（无模型评分）'
 }
 
 export function candidatePointLabel(target: LocationTarget): string {
@@ -464,14 +585,6 @@ export function candidatePointLabel(target: LocationTarget): string {
     lng <= 180 &&
     !(Math.abs(lat) < 1e-9 && Math.abs(lng) < 1e-9)
   if (!hasPoint) return ''
-  if (target.level === 'admin1') {
-    const derived =
-      target.coordinate_source === 'admin1-largest-city-v1' ||
-      target.coordinate_quality === 'derived'
-    return derived
-      ? '省级代表点由目录最大城市坐标派生，非行政区多边形，非照片 GPS'
-      : '省级目录代表点，非行政区多边形，非照片 GPS'
-  }
   return '坐标为代表点，非照片 GPS'
 }
 

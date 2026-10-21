@@ -193,7 +193,7 @@ class FeedbackResponse(BaseModel):
 
 
 GuidedLocationLevel = Literal["country", "admin1", "city"]
-GuidedStage = Literal["country", "admin1", "city", "resolved"]
+GuidedStage = Literal["country", "city", "resolved"]
 ReviewedClueStatus = Literal["pending", "confirmed", "rejected", "uncertain"]
 GuidedEventType = Literal[
     "confirm_clue",
@@ -234,13 +234,14 @@ class GuidedCandidateModel(BaseModel):
     score: float | None = Field(default=None, allow_inf_nan=False)
     score_type: str | None = None
     reason: str | None = None
+    selection_basis: Literal["user_text", "catalog_search"] | None = None
 
     model_config = {"extra": "forbid"}
 
     @model_serializer(mode="wrap")
     def _drop_absent_optional_fields(self, handler):
         data = handler(self)
-        for key in ("score", "score_type", "reason"):
+        for key in ("score", "score_type", "reason", "selection_basis"):
             if data.get(key) is None:
                 data.pop(key, None)
         return data

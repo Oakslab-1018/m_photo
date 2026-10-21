@@ -1,5 +1,6 @@
 import { createSSRApp } from 'vue'
 import { renderToString } from '@vue/server-renderer'
+import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 import GuidedDialoguePanel from '@/components/GuidedDialoguePanel.vue'
 import type {
@@ -9,7 +10,7 @@ import type {
   LocationTarget,
   ReviewedClue,
 } from '@/types'
-import { safeGuidedReceipt, safeGuidedText } from '@/utils/guided'
+import { guidedFreeTextReceiptOutcome, safeGuidedReceipt, safeGuidedText } from '@/utils/guided'
 
 const japan: LocationTarget = { level: 'country', id: 'JP', label: '日本', country_iso: 'JP' }
 const hokkaido: LocationTarget = {
@@ -98,7 +99,8 @@ function render(
 }
 
 describe('GuidedDialoguePanel review box', () => {
-  it('renders the Chinese three-step path without internal stage names or revisions', async () => {
+  it('renders the two-step path and ignores deprecated admin1 metadata', async () => {
+    const countryHtml = await render(dialogue())
     const html = await render(
       dialogue({
         stage: 'city',
@@ -106,11 +108,13 @@ describe('GuidedDialoguePanel review box', () => {
       }),
     )
 
+    expect(countryHtml).toContain('1 / 2 · 当前步骤')
     expect(html).toContain('国家 / 地区')
-    expect(html).toContain('省份 / 地区')
     expect(html).toContain('城市')
     expect(html).toContain('日本')
-    expect(html).toContain('北海道')
+    expect(html).toContain('2 / 2 · 当前步骤')
+    expect(html).not.toContain('省份')
+    expect(html).not.toContain('北海道')
     expect(html).not.toContain('admin1')
     expect(html).not.toContain('revision')
     expect(html).not.toContain('JP.01')
@@ -321,7 +325,7 @@ describe('GuidedDialoguePanel review box', () => {
     expect(html).toContain('这段文字是什么？')
   })
 
-  it('uses the current stage level in the next-step label', async () => {
+  it('uses country and city in the next-step labels', async () => {
     const reviewedClue = {
       id: 'reviewed-clue',
       dimension: 'language',
@@ -331,13 +335,12 @@ describe('GuidedDialoguePanel review box', () => {
       confidence: 0.8,
       status: 'confirmed' as const,
     }
-    const adminHtml = await render(
+    const countryHtml = await render(
       dialogue({
-        stage: 'admin1',
-        confirmed: { country: japan, admin1: null, city: null },
+        stage: 'country',
         clues: [reviewedClue],
       }),
-      [{ target: hokkaido }],
+      [{ target: japan }],
       { candidatesUnlocked: true },
     )
     const cityHtml = await render(
@@ -350,17 +353,18 @@ describe('GuidedDialoguePanel review box', () => {
       { candidatesUnlocked: true },
     )
 
-    expect(adminHtml).toContain('下一步：查看省份 / 地区候选')
-    expect(adminHtml).not.toContain('下一步：查看国家 / 地区候选')
-    expect(adminHtml).not.toContain('北海道')
+    expect(countryHtml).toContain('下一步：查看国家 / 地区候选')
+    expect(countryHtml).not.toContain('下一步：查看城市候选')
+    expect(countryHtml).not.toContain('日本')
     expect(cityHtml).toContain('下一步：查看城市候选')
-    expect(cityHtml).not.toContain('下一步：查看省份 / 地区候选')
+    expect(cityHtml).not.toContain('省份')
+    expect(cityHtml).not.toContain('北海道')
     expect(cityHtml).not.toContain('札幌')
   })
 
-  it('renders a prominent backend back button for admin1/city/resolved stages', async () => {
-    const adminHtml = await render(
-      dialogue({ stage: 'admin1', confirmed: { country: japan, admin1: null, city: null } }),
+  it('backtracks directly from city to country and resolved to city', async () => {
+    const cityHtml = await render(
+      dialogue({ stage: 'city', confirmed: { country: japan, admin1: hokkaido, city: null } }),
       [],
       { phase: 'candidates' },
     )
@@ -371,9 +375,12 @@ describe('GuidedDialoguePanel review box', () => {
       }),
     )
 
-    expect(adminHtml).toContain('返回上一步：国家 / 地区')
+    expect(cityHtml).toContain('返回上一步：国家 / 地区')
+    expect(cityHtml).not.toContain('返回上一步：城市')
     expect(resolvedHtml).toContain('返回上一步：城市')
     expect(resolvedHtml).toContain('最终结果')
+    expect(resolvedHtml).toContain('2 / 2 · 已完成')
+    expect(resolvedHtml).not.toContain('省份')
   })
 })
 
@@ -465,7 +472,7 @@ describe('GuidedDialoguePanel candidate phase', () => {
       locationConfirmationReady: false,
     })
 
-    expect(html).toContain('新增观察待核对，候选排名仍可查看，但暂不能确认或排除地点。')
+    expect(html).toContain('新增观察待核对，排名仍可查看，但暂不能确认或排除地点。')
     expect(html).toMatch(/class="mini-btn confirm"[^>]*disabled/)
     expect(html).toMatch(/class="mini-btn reject"[^>]*disabled/)
   })
@@ -477,15 +484,168 @@ describe('GuidedDialoguePanel candidate phase', () => {
     expect(html).toContain('补充照片中可见的招牌、地名或文字')
     expect(html).not.toContain('guided-candidate-card')
   })
+
+  it('labels catalog-only city candidates by directory order instead of confidence rank', async () => {
+    const candidates: LocationCandidate[] = Array.from({ length: 5 }, (_, index) => ({
+      target: {
+        level: 'city',
+        id: `${1000 + index}`,
+        label: `目录城市 ${index + 1}`,
+        country_iso: 'JP',
+        city_id: `${1000 + index}`,
+      },
+      score: null,
+    }))
+    const html = await render(
+      dialogue({
+        stage: 'city',
+        confirmed: { country: japan, admin1: null, city: null },
+      }),
+      candidates,
+      { phase: 'candidates' },
+    )
+
+    expect(html).toContain('目录候选（当前显示 5 项）')
+    expect(html).toContain(
+      '按目录顺序展示，可输入城市名称查找更多；尚无图像评分，不代表最可能的五个',
+    )
+    expect(html).toContain('目录候选（无模型评分）')
+    expect(html).not.toContain('候选可信度前五')
+    expect(html).not.toContain('排序分仅供参考')
+  })
+
+  it('keeps a user-text city proposal visible ahead of scored model rows', async () => {
+    const html = await render(
+      dialogue({
+        stage: 'city',
+        confirmed: { country: japan, admin1: hokkaido, city: null },
+      }),
+      [
+        {
+          target: {
+            level: 'city',
+            id: '1815286',
+            label: '成都',
+            country_iso: 'CN',
+            admin1_id: 'CN.32',
+            city_id: '1815286',
+          },
+          reason: '自由文本提议',
+          selection_basis: 'user_text',
+        },
+        ...Array.from({ length: 5 }, (_, index) => ({
+          target: {
+            level: 'city' as const,
+            id: `${2000 + index}`,
+            label: `模型城市 ${index + 1}`,
+            country_iso: 'JP',
+            city_id: `${2000 + index}`,
+          },
+          score: 0.9 - index * 0.1,
+          score_type: 'city_text_cosine',
+        })),
+      ],
+      { phase: 'candidates' },
+    )
+
+    expect(html.indexOf('成都')).toBeLessThan(html.indexOf('模型城市 1'))
+    expect(html).toContain('线索匹配候选')
+    expect(html).toContain('来自你提供的文字线索（非模型概率）')
+    expect(html).toContain('线索匹配优先 · 其余按排序分')
+    expect(html).toContain('城市文本余弦排序 0.900（排序分，非概率）')
+    expect(html).not.toContain('候选可信度前五')
+  })
 })
 
 describe('GuidedDialoguePanel utilities', () => {
-  it('keeps free-text catalog search as a non-confirming action', async () => {
-    const html = await render(dialogue({ stage: 'admin1' }))
+  it('keeps guided map labels on the public country and city path', () => {
+    const source = readFileSync(new URL('../components/GeoMap.vue', import.meta.url), 'utf8')
 
-    expect(html).toContain('输入省份 / 地区名称进行目录检索')
-    expect(html).toContain('搜索 / 提交文字')
-    expect(html).toContain('不会自动确认地点或进入下一级')
+    expect(source).toContain('国家与城市引导候选代表点交互地图')
+    expect(source).not.toContain('省份代表点')
+    expect(source).not.toContain("case 'admin1'")
+  })
+
+  it('renders one conversation composer outside the scroll panel with clue and catalog-name support', async () => {
+    const html = await render(dialogue({ stage: 'city' }))
+
+    expect(html).toContain('补充线索，与定位助手对话')
+    expect(html).toContain('例如：路牌上是日文，车辆靠左行驶；也可直接输入地名')
+    expect(html).toContain('发送线索')
+    expect(html).toContain('可直接输入城市名称检索目录')
+    expect(html).toContain('提交不会自动确认地点')
+    expect(html).toContain('id="guided-conversation-input"')
+    expect(html.match(/id="guided-conversation-input"/g)).toHaveLength(1)
+    expect(html).not.toContain('搜索 / 提交文字')
+    expect(html).toMatch(
+      /<div[^>]*class="guided-panel"[^>]*>[\s\S]*<\/div>\s*<form[^>]*class="guided-composer"/,
+    )
+  })
+
+  it('keeps the composer outside the scroll region before long candidate content', async () => {
+    const candidates: LocationCandidate[] = Array.from({ length: 5 }, (_, index) => ({
+      target: {
+        level: 'city',
+        id: `${1000 + index}`,
+        label: `长候选城市 ${index + 1}`,
+        country_iso: 'JP',
+        city_id: `${1000 + index}`,
+      },
+      score: null,
+      reason: '很长的候选说明'.repeat(40),
+    }))
+    const html = await render(
+      dialogue({
+        stage: 'city',
+        confirmed: { country: japan, admin1: null, city: null },
+      }),
+      candidates,
+      { phase: 'candidates' },
+    )
+    const css = readFileSync(new URL('../style.css', import.meta.url), 'utf8')
+
+    expect(html).toMatch(
+      /<section class="guided-dialogue-shell">\s*<div[^>]*class="guided-panel"[^>]*>[\s\S]*<\/div>\s*<form[^>]*class="guided-composer"/,
+    )
+    expect(css).toMatch(
+      /\.guided-dialogue-shell\s*\{[^}]*overflow:\s*hidden;[^}]*display:\s*flex;[^}]*flex-direction:\s*column;/s,
+    )
+    expect(css).toMatch(/\.guided-panel\s*\{[^}]*overflow-y:\s*auto;/s)
+    expect(css).toMatch(/\.guided-composer\s*\{[^}]*flex:\s*0 0 auto;/s)
+
+    const longReview = await render(
+      dialogue({
+        clues: [clue('long-review', 'ja', 'pending')],
+        pending_question: {
+          id: 'long-review-question',
+          kind: 'review_clue',
+          clue_id: 'long-review',
+          message: `请核对这条观察：${'很长的观察说明'.repeat(80)}`,
+        },
+      }),
+    )
+    expect(longReview).toMatch(
+      /<div[^>]*class="guided-panel"[^>]*>[\s\S]*<\/div>\s*<form[^>]*class="guided-composer"/,
+    )
+  })
+
+  it('shows the current assistant explanation near the lower-stage composer', async () => {
+    const html = await render(
+      dialogue({
+        stage: 'city',
+        confirmed: { country: japan, admin1: null, city: null },
+      }),
+      [],
+      {
+        action: {
+          kind: 'ask',
+          message: '请结合照片中的道路方向和地名，确认城市候选。',
+        },
+      },
+    )
+
+    expect(html).toContain('guided-composer-assistant')
+    expect(html).toContain('请结合照片中的道路方向和地名，确认城市候选。')
   })
 
   it('builds a natural review question from the localized clue instead of raw enums', async () => {
@@ -530,12 +690,90 @@ describe('GuidedDialoguePanel utilities', () => {
     expect(html).toContain('最终结果')
     expect(html).toContain('札幌')
     expect(html).toContain('城市坐标仅为代表点')
+    expect(html).toContain('补充线索，与定位助手对话')
+    expect(html).toContain('新线索会交回助手重新核对')
+  })
+
+  it('shows the last submitted user context and readable server feedback', async () => {
+    const applied = await render(dialogue(), [], {
+      freeTextSubmission: {
+        text: '路牌上是日文，车辆靠左行驶',
+        status: 'applied',
+      },
+      receipt: {
+        event_id: 'event-1',
+        status: 'applied',
+        summary: '已识别到新的文字线索',
+      },
+    })
+    const failed = await render(dialogue(), [], {
+      freeTextSubmission: {
+        text: '路牌上是日文，车辆靠左行驶',
+        status: 'failed',
+        error: '服务端状态已更新',
+      },
+    })
+    const unchanged = await render(dialogue(), [], {
+      freeTextSubmission: {
+        text: '玉林路',
+        status: 'unchanged',
+      },
+      receipt: {
+        event_id: 'event-2',
+        status: 'unchanged',
+        summary: '该线索此前已保存。',
+      },
+    })
+
+    expect(applied).toContain('你说')
+    expect(applied).toContain('路牌上是日文，车辆靠左行驶')
+    expect(applied).toContain('助手反馈：已识别到新的文字线索')
+    expect(failed).toContain('服务端状态已更新')
+    expect(failed).toContain('草稿已保留')
+    expect(unchanged).toContain('玉林路')
+    expect(unchanged).toContain('这条线索已记录，无需重复添加。')
+    expect(unchanged).toContain('该线索此前已保存')
+    expect(unchanged).not.toContain('提交失败')
+  })
+})
+
+describe('guided free-text receipt mapping', () => {
+  it('distinguishes saved-unchanged from unrecognized failure without faking applied', () => {
+    expect(guidedFreeTextReceiptOutcome({
+      event_id: 'saved',
+      status: 'unchanged',
+      summary: '该线索此前已保存。',
+    })).toEqual({ status: 'unchanged' })
+    expect(guidedFreeTextReceiptOutcome({
+      event_id: 'new',
+      status: 'applied',
+      summary: '已记录。',
+    })).toEqual({ status: 'applied' })
+    expect(guidedFreeTextReceiptOutcome({
+      event_id: 'unknown',
+      status: 'unrecognized',
+      summary: '没有识别到新的线索。',
+    })).toEqual({ status: 'failed', error: '没有识别到新的线索。' })
+    expect(guidedFreeTextReceiptOutcome({
+      event_id: 'mystery',
+      status: 'something_else',
+      summary: '未定义状态。',
+    })).toEqual({
+      status: 'unconfirmed',
+      error: '服务器未返回可识别的回执，请核对最新状态后重试。',
+    })
+    expect(guidedFreeTextReceiptOutcome(null)).toEqual({
+      status: 'unconfirmed',
+      error: '服务器未返回可识别的回执，请核对最新状态后重试。',
+    })
   })
 })
 
 describe('guided audit text', () => {
   it('does not expose backend stage identifiers or rewrite location labels', () => {
-    expect(safeGuidedReceipt('已回退到admin1阶段。')).toContain('省份 / 地区')
+    expect(safeGuidedReceipt('已回退到admin1阶段。')).toContain('城市')
+    expect(safeGuidedReceipt('已回退到admin1阶段。')).not.toContain('admin1')
+    expect(safeGuidedReceipt('已回退到admin1阶段。')).not.toContain('省份')
     expect(safeGuidedText('已确认城市：Mexico City。')).toBe('已确认城市：Mexico City。')
     expect(safeGuidedText('已回退到city阶段。')).toContain('城市')
     expect(safeGuidedText('请复核线索：building=generic。')).toContain('普通 / 不明显')
@@ -571,12 +809,12 @@ describe('GuidedDialoguePanel country confidence tiers', () => {
 
     expect(html).toContain('推荐国家 / 地区')
     expect(html).toContain('服务器说明：首选日本，请结合照片确认。')
-    expect(html).toContain('可继续细化省市')
+    expect(html).toContain('可继续深化城市')
     expect(html).toContain('日本')
     expect(html).toContain('国家模型排序第一')
     expect(html).toContain('补充线索细化')
     expect(html).toContain('确认国家 / 地区')
-    expect(html).toContain('这是当前国家预测；如需继续定位省市，可确认该国家后进入下一步。')
+    expect(html).toContain('这是当前国家预测；如需继续深化城市，可确认该国家后进入下一步。')
     expect(html).not.toContain('仍需要您明确确认')
     expect(html).not.toContain('这条常规观察准确吗')
     expect(html).not.toContain('下一步：查看国家 / 地区候选')
@@ -664,7 +902,8 @@ describe('GuidedDialoguePanel country confidence tiers', () => {
     expect(html).toContain('有清晰招牌文字')
     expect(html).toContain('没有清晰文字')
     expect(html).toContain('提交后会重新比较国家候选')
-    expect(html).toContain('搜索 / 提交文字')
+    expect(html).toContain('补充线索，与定位助手对话')
+    expect(html).toContain('发送线索')
     expect(html).toContain('type="text"')
     expect(html).not.toContain('guided-confidence-card')
     expect(html).not.toContain('class="mini-btn confirm"')
@@ -677,10 +916,10 @@ describe('GuidedDialoguePanel country confidence tiers', () => {
       dimension: 'signage',
       message: '画面中是否有清晰的招牌文字？',
     }
-    const staleId = await render(dialogue({ pending_question: pending }), [], {
+    const staleId = await render(dialogue({ pending_question: pending }), [{ target: japan, score: 0.9 }], {
       action: {
         kind: 'ask',
-        message: '这条来自旧问题的 LLM 说明不应显示。',
+        message: '旧候选包括日本和中国，这条旧说明不应显示。',
         payload: {
           question_id: 'stale-question',
           question_kind: 'ask',
@@ -714,7 +953,8 @@ describe('GuidedDialoguePanel country confidence tiers', () => {
       confidence: confidence('medium', 'confirm_candidates', ['JP', 'CN', 'US']),
     })
 
-    expect(staleId).not.toContain('这条来自旧问题的 LLM 说明不应显示。')
+    expect(staleId).not.toContain('旧候选包括日本和中国，这条旧说明不应显示。')
+    expect(staleId).not.toContain('日本')
     expect(staleId).toContain('画面中是否有清晰的招牌文字？')
     expect(mismatchedKind).not.toContain('这条类型不匹配的 LLM 说明不应显示。')
     expect(mismatchedKind).toContain('画面中是否有清晰的招牌文字？')
@@ -750,7 +990,7 @@ describe('GuidedDialoguePanel country confidence tiers', () => {
   it('does not inherit a country confidence shortcut below country stage', async () => {
     const html = await render(
       dialogue({
-        stage: 'admin1',
+        stage: 'city',
         confirmed: { country: japan, admin1: null, city: null },
       }),
       [],

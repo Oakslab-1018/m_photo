@@ -61,7 +61,14 @@ class GeoSessionService:
         row.model_evidence = evidence
         self.session.flush()
 
-    def replace_last_ai_message(self, session_id: int, content: str, action: dict[str, Any]) -> None:
+    def replace_last_ai_message(
+        self,
+        session_id: int,
+        content: str,
+        action: dict[str, Any],
+        *,
+        provider: str | None = None,
+    ) -> None:
         row = self.session.scalars(
             select(ChatMessage).where(ChatMessage.session_id == session_id, ChatMessage.role == "ai")
             .order_by(ChatMessage.id.desc()).limit(1)
@@ -69,7 +76,12 @@ class GeoSessionService:
         if row is None:
             return
         row.content = content
-        row.meta = {**row.meta, "action": action, "conversation_provider": "deepseek"}
+        meta = {**row.meta, "action": action}
+        if provider is None:
+            meta.pop("conversation_provider", None)
+        else:
+            meta["conversation_provider"] = provider
+        row.meta = meta
         self.session.flush()
 
     # ---- sessions ----

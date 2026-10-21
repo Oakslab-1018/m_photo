@@ -411,7 +411,7 @@ describe('useGuidedDialogue', () => {
     await guided.unknown()
     await guided.retractTarget(japan)
     await guided.retractClue('clue-1')
-    await guided.backtrack('admin1')
+    await guided.backtrack('city')
     await guided.freeText('  浙江  ')
 
     expect(api.dialogueEvent.mock.calls.map((call) => call[1])).toEqual([
@@ -444,7 +444,7 @@ describe('useGuidedDialogue', () => {
         type: 'backtrack',
         event_id: 'event-5',
         expected_revision: 5,
-        level: 'admin1',
+        level: 'city',
       },
       {
         type: 'free_text',
@@ -453,6 +453,73 @@ describe('useGuidedDialogue', () => {
         text: '浙江',
       },
     ])
+  })
+
+  it('confirms country directly into country-wide city candidates without admin1 confirmation', async () => {
+    const sessionId = ref<number | null>(7)
+    const api = apiMock()
+    api.dialogueStart.mockResolvedValue(snapshot(
+      dialogue({ revision: 2 }),
+      [{ target: japan, score: 0.9 }],
+    ))
+    const guided = useGuidedDialogue(sessionId, { api, eventIdFactory: () => 'country-to-city' })
+
+    await guided.start()
+    expect(guided.nextPhase()).toBe(true)
+
+    api.dialogueEvent.mockResolvedValueOnce(snapshot(
+      dialogue({
+        revision: 3,
+        stage: 'city',
+        confirmed: { country: japan, admin1: null, city: null },
+      }),
+      [{ target: sapporo, score: 0.7 }, { target: sapporo, selection_basis: 'user_text' }],
+    ))
+
+    expect(await guided.confirmLocation(japan)).toBe(true)
+    expect(api.dialogueEvent.mock.calls[0]?.[1]).toMatchObject({
+      type: 'confirm_location',
+      target: { level: 'country', id: 'JP' },
+    })
+    expect(guided.dialogue.value?.stage).toBe('city')
+    expect(guided.phase.value).toBe('candidates')
+    expect(guided.previousLevel.value).toBe('country')
+    expect(guided.topCandidates.value.map((item) => item.target.level)).toEqual(['city'])
+    expect(guided.topCandidates.value[0]?.selection_basis).toBe('user_text')
+    expect(guided.topCandidates.value[0]?.score).toBe(0.7)
+    expect(guided.actionableCandidates.value.some((item) => item.target.level === 'admin1')).toBe(false)
+  })
+
+  it('confirms a matching-country city directly to resolved without admin1 metadata', async () => {
+    const sessionId = ref<number | null>(7)
+    const api = apiMock()
+    api.dialogueStart.mockResolvedValue(snapshot(
+      dialogue({
+        revision: 4,
+        stage: 'city',
+        confirmed: { country: japan, admin1: null, city: null },
+      }),
+      [{ target: sapporo, score: 0.7 }],
+    ))
+    const guided = useGuidedDialogue(sessionId, { api, eventIdFactory: () => 'city-to-resolved' })
+
+    await guided.start()
+    expect(guided.nextPhase()).toBe(true)
+
+    api.dialogueEvent.mockResolvedValueOnce(snapshot(dialogue({
+      revision: 5,
+      stage: 'resolved',
+      confirmed: { country: japan, admin1: null, city: sapporo },
+    })))
+
+    expect(await guided.confirmLocation(sapporo)).toBe(true)
+    expect(api.dialogueEvent.mock.calls[0]?.[1]).toMatchObject({
+      type: 'confirm_location',
+      target: { level: 'city', id: '1001' },
+    })
+    expect(guided.dialogue.value?.stage).toBe('resolved')
+    expect(guided.previousLevel.value).toBe('city')
+    expect(guided.dialogue.value?.confirmed.admin1).toBeNull()
   })
 
   it('clears all guided state when the session changes', async () => {
@@ -1080,30 +1147,29 @@ describe('useGuidedDialogue', () => {
     const guided = useGuidedDialogue(sessionId, { api, eventIdFactory: () => 'back' })
 
     await guided.start()
-    expect(guided.previousLevel.value).toBe('admin1')
+    expect(guided.previousLevel.value).toBe('country')
     expect(guided.nextPhase()).toBe(true)
 
     api.dialogueEvent.mockResolvedValueOnce(snapshot(
       dialogue({
         revision: 6,
-        stage: 'admin1',
-        confirmed: { country: japan, admin1: null, city: null },
+        stage: 'country',
         clues: [reviewed],
       }),
-      [{ target: hokkaido, score: 0.66 }],
+      [{ target: japan, score: 0.9 }],
     ))
     expect(await guided.backtrackPrevious()).toBe(true)
-    expect(api.dialogueEvent.mock.calls[0]?.[1]).toMatchObject({ type: 'backtrack', level: 'admin1' })
+    expect(api.dialogueEvent.mock.calls[0]?.[1]).toMatchObject({ type: 'backtrack', level: 'country' })
     expect(guided.phase.value).toBe('candidates')
     expect(guided.candidatesVisible.value).toBe(true)
-    expect(guided.topCandidates.value.map((item) => item.target.id)).toEqual(['JP.01'])
-    expect(guided.previousLevel.value).toBe('country')
-    expect(guided.dialogue.value?.confirmed.country?.id).toBe('JP')
+    expect(guided.topCandidates.value.map((item) => item.target.id)).toEqual(['JP'])
+    expect(guided.previousLevel.value).toBeNull()
+    expect(guided.dialogue.value?.confirmed.country).toBeNull()
 
     api.dialogueEvent.mockResolvedValueOnce(snapshot(
       dialogue({
         revision: 7,
-        stage: 'country',
+        stage: 'city',
         clues: [{ ...reviewed, status: 'pending' }],
         pending_question: {
           id: 'review-back',
@@ -1114,10 +1180,43 @@ describe('useGuidedDialogue', () => {
       }),
       [{ target: japan, score: 0.9 }],
     ))
-    expect(await guided.backtrackPrevious()).toBe(true)
+    expect(await guided.backtrack('city')).toBe(true)
     expect(guided.phase.value).toBe('review')
     expect(guided.candidatesVisible.value).toBe(false)
     expect(guided.topCandidates.value).toEqual([])
+  })
+
+  it('backtracks resolved directly to city without requiring admin1 metadata', async () => {
+    const sessionId = ref<number | null>(7)
+    const api = apiMock()
+    api.dialogueStart.mockResolvedValue(snapshot(
+      dialogue({
+        revision: 8,
+        stage: 'resolved',
+        confirmed: { country: japan, admin1: hokkaido, city: sapporo },
+      }),
+      [{ target: sapporo, score: 0.7 }],
+    ))
+    const guided = useGuidedDialogue(sessionId, { api, eventIdFactory: () => 'resolved-back' })
+
+    await guided.start()
+    expect(guided.previousLevel.value).toBe('city')
+
+    api.dialogueEvent.mockResolvedValueOnce(snapshot(
+      dialogue({
+        revision: 9,
+        stage: 'city',
+        confirmed: { country: japan, admin1: hokkaido, city: null },
+      }),
+      [{ target: sapporo, score: 0.7 }],
+    ))
+    expect(await guided.backtrackPrevious()).toBe(true)
+    expect(api.dialogueEvent.mock.calls[0]?.[1]).toMatchObject({
+      type: 'backtrack',
+      level: 'city',
+    })
+    expect(guided.phase.value).toBe('candidates')
+    expect(guided.dialogue.value?.confirmed.city).toBeNull()
   })
 
   it('clears the phase and review history when the session switches', async () => {
@@ -1225,10 +1324,10 @@ describe('useGuidedDialogue', () => {
     api.dialogueEvent.mockResolvedValue(snapshot(
       dialogue({
         revision: 3,
-        stage: 'admin1',
+        stage: 'city',
         confirmed: { country: japan, admin1: null, city: null },
       }),
-      [{ target: hokkaido, score: 0.7 }],
+      [{ target: sapporo, score: 0.7 }],
     ))
 
     expect(await guided.confirmLocation(japan)).toBe(true)
@@ -1238,7 +1337,7 @@ describe('useGuidedDialogue', () => {
       expected_revision: 2,
       target: { level: 'country', id: 'JP' },
     })
-    expect(guided.dialogue.value?.stage).toBe('admin1')
+    expect(guided.dialogue.value?.stage).toBe('city')
     expect(guided.confidenceShortcut.value).toBeNull()
   })
 
@@ -1290,7 +1389,7 @@ describe('useGuidedDialogue', () => {
 
     api.dialogueEvent.mockResolvedValue(snapshot(dialogue({
       revision: 5,
-      stage: 'admin1',
+      stage: 'city',
       confirmed: { country: japan, admin1: null, city: null },
     })))
 
@@ -1479,9 +1578,9 @@ describe('useGuidedDialogue', () => {
     api.dialogue.mockResolvedValueOnce({
       ...snapshot(dialogue({
         revision: 4,
-        stage: 'admin1',
+        stage: 'city',
         confirmed: { country: japan, admin1: null, city: null },
-      }), [{ target: hokkaido, score: 0.7 }]),
+      }), [{ target: sapporo, score: 0.7 }]),
       action: countryAction('result', '不应继承的高置信国家结果。'),
       confidence: countryConfidence('high', 'direct_top1', ['JP', 'CN', 'US']),
     })

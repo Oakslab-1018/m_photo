@@ -424,8 +424,10 @@ export interface RegionAnalysisRecord {
 /* Guided dialogue contract (see docs/guided-dialogue.md)             */
 /* ------------------------------------------------------------------ */
 
-export type GuidedStage = 'country' | 'admin1' | 'city' | 'resolved'
-export type GuidedLocationLevel = Exclude<GuidedStage, 'resolved'>
+/** Public guided path is country -> city -> resolved. */
+export type GuidedStage = 'country' | 'city' | 'resolved'
+/** Retained for deprecated persisted admin1 metadata; never a public UI step. */
+export type GuidedLocationLevel = Exclude<GuidedStage, 'resolved'> | 'admin1'
 
 /**
  * UI phase inside one guided stage.
@@ -460,6 +462,8 @@ export interface LocationCandidate {
   score?: number | null
   score_type?: string | null
   reason?: string | null
+  /** Server-authorized provenance; explicit matches outrank model score rows. */
+  selection_basis?: 'user_text' | 'catalog_search'
 }
 
 export type ReviewedClueStatus = 'pending' | 'confirmed' | 'rejected' | 'uncertain'
@@ -495,7 +499,8 @@ export interface GuidedQuestion {
 
 export interface GuidedConfirmedPath {
   country: LocationTarget | null
-  admin1: LocationTarget | null
+  /** Deprecated legacy metadata; preserved but ignored by path/markers. */
+  admin1?: LocationTarget | null
   city: LocationTarget | null
 }
 

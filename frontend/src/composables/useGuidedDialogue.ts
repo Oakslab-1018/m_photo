@@ -225,7 +225,7 @@ export function useGuidedDialogue(
     }
     return [...byKey.values()]
   })
-  /** Level targeted by the prominent admin1/city/resolved 返回上一步 button. */
+  /** Level targeted by the prominent city/resolved 返回上一步 button. */
   const previousLevel = computed<GuidedLocationLevel | null>(() =>
     guidedPreviousLevel(dialogue.value?.stage),
   )
@@ -267,15 +267,8 @@ export function useGuidedDialogue(
   function unlockCompletedStages(value: GuidedDialogue): void {
     if (!canUnlockReviewedRankings(value)) return
     const next = new Set(unlockedStages.value)
-    if (value.stage === 'resolved') {
-      next.add('country')
-      next.add('admin1')
-      next.add('city')
-    } else {
-      next.add('country')
-      if (value.stage === 'admin1' || value.stage === 'city') next.add('admin1')
-      if (value.stage === 'city') next.add('city')
-    }
+    next.add('country')
+    if (value.stage === 'resolved' || value.stage === 'city') next.add('city')
     unlockedStages.value = next
   }
 
@@ -403,7 +396,7 @@ export function useGuidedDialogue(
     return retractClue(clueId)
   }
 
-  /** Prominent admin1/city/resolved 返回上一步 → backend backtrack one level. */
+  /** Prominent city/resolved 返回上一步 → backend backtrack one level. */
   function backtrackPrevious(): Promise<boolean> {
     const level = previousLevel.value
     if (!level) {

@@ -32,6 +32,19 @@ function legacyScore(iso: string, name: string): CountryScore {
   return { iso, name, name_zh: name, score: 0.8, lat: 35, lng: 135 }
 }
 
+function cityTarget(id: string, label: string, admin1Id = 'CN.32'): LocationTarget {
+  return {
+    level: 'city',
+    id,
+    label,
+    country_iso: 'CN',
+    city_id: id,
+    admin1_id: admin1Id,
+    lat: 30.67,
+    lng: 104.07,
+  }
+}
+
 function renderPanel(overrides: Record<string, unknown> = {}): Promise<string> {
   return renderToString(
     createSSRApp(CandidatePanel, {
@@ -66,6 +79,68 @@ describe('guided candidate Top-5', () => {
     expect(top).toHaveLength(5)
   })
 
+  it('keeps user-text and catalog matches ahead of five scored model rows without inventing scores', () => {
+    const models = Array.from({ length: 5 }, (_, index) => ({
+      target: cityTarget(String(2000 + index), `模型城市 ${index + 1}`),
+      score: 0.9 - index * 0.1,
+      score_type: 'city_text_cosine',
+    }))
+    const chengdu: LocationCandidate = {
+      target: cityTarget('1815286', '成都'),
+      reason: '自由文本提议',
+      selection_basis: 'user_text',
+    }
+    const searched: LocationCandidate = {
+      target: cityTarget('1816670', '重庆', 'CN.33'),
+      reason: '全国城市目录检索',
+      selection_basis: 'catalog_search',
+    }
+
+    const top = selectTopGuidedCandidates([...models, chengdu, searched], 'city')
+
+    expect(top.map((item) => item.target.id)).toEqual([
+      '1815286',
+      '1816670',
+      '2000',
+      '2001',
+      '2002',
+    ])
+    expect(top[0]).toMatchObject({ selection_basis: 'user_text', reason: '自由文本提议' })
+    expect(top[0]?.score).toBeUndefined()
+    expect(top[1]).toMatchObject({ selection_basis: 'catalog_search' })
+    expect(top[1]?.score).toBeUndefined()
+    expect(top.slice(2).map((item) => Number(item.score?.toFixed(1)))).toEqual([0.9, 0.8, 0.7])
+    expect(top.slice(2).every((item) => item.score_type === 'city_text_cosine')).toBe(true)
+  })
+
+  it('labels a mixed user-text proposal without claiming a top-confidence ranking', async () => {
+    const html = await renderPanel({
+      guidedMode: true,
+      guidedDataReady: true,
+      guidedStage: 'city',
+      guidedCandidatesUnlocked: true,
+      guidedConfirmationReady: true,
+      guidedCandidates: [
+        {
+          target: cityTarget('1815286', '成都'),
+          reason: '自由文本提议',
+          selection_basis: 'user_text',
+        },
+        {
+          target: cityTarget('2000', '模型城市'),
+          score: 0.9,
+          score_type: 'city_text_cosine',
+        },
+      ],
+    })
+
+    expect(html.indexOf('成都')).toBeLessThan(html.indexOf('模型城市'))
+    expect(html).toContain('线索匹配候选')
+    expect(html).toContain('来自你提供的文字线索（非模型概率）')
+    expect(html).toContain('线索匹配优先 · 其余按排序分')
+    expect(html).not.toContain('候选可信度前五')
+  })
+
   it('renders the ranked Top-5 in the country tab and labels scores as non-probability', async () => {
     const candidates = [
       candidate('AA', 'Alpha', 0.4),
@@ -95,26 +170,51 @@ describe('guided candidate Top-5', () => {
     expect(html).toContain('目录候选（无模型评分）')
   })
 
+  it('describes catalog-only rows as directory order without inventing a ranking', async () => {
+    const candidates: LocationCandidate[] = Array.from({ length: 5 }, (_, index) => ({
+      target: cityTarget(`city-${index + 1}`, `目录城市 ${index + 1}`),
+      score: null,
+      score_type: null,
+    }))
+    const html = await renderPanel({
+      guidedMode: true,
+      guidedDataReady: true,
+      guidedStage: 'city',
+      guidedCandidatesUnlocked: true,
+      guidedConfirmationReady: true,
+      guidedCandidates: candidates,
+    })
+
+    expect(html).toContain('目录候选（当前显示 5 项）')
+    expect(html).toContain(
+      '按目录顺序展示，可输入城市名称查找更多；尚无图像评分，不代表最可能的五个',
+    )
+    expect(html).toContain('目录候选（无模型评分）')
+    expect(html).not.toContain('候选可信度前五')
+    expect(html).not.toContain('排序分仅供参考')
+  })
+
   it('labels the current guided level and removes the legacy city directory tab', async () => {
-    const adminTarget: LocationTarget = {
-      level: 'admin1',
-      id: 'JP.01',
-      label: '北海道',
+    const city: LocationTarget = {
+      level: 'city',
+      id: '1001',
+      label: '札幌',
       country_iso: 'JP',
-      admin1_id: '01',
+      city_id: '1001',
+      admin1_id: 'JP.01',
     }
     const html = await renderPanel({
       guidedMode: true,
       guidedDataReady: true,
-      guidedStage: 'admin1',
+      guidedStage: 'city',
       guidedCandidatesUnlocked: true,
       guidedConfirmationReady: true,
-      guidedCandidates: [{ target: adminTarget, score: 0.66 }],
+      guidedCandidates: [{ target: city, score: 0.66 }],
       scores: [legacyScore('JP', '日本')],
     })
 
-    expect(html).toContain('省份 / 地区')
-    expect(html).toContain('北海道')
+    expect(html).toContain('城市候选')
+    expect(html).toContain('札幌')
     expect(html).toContain('>1<')
     expect(html).not.toContain('查询城市候选')
   })
@@ -238,7 +338,7 @@ describe('country confidence routing', () => {
     expect(countryConfidenceShortcut(countryDialogue(), action, medium)).toBe('candidates')
     expect(countryConfidenceShortcut(countryDialogue(), action, exhaustedLow)).toBe('candidates')
     expect(countryConfidenceShortcut(
-      countryDialogue({ stage: 'admin1', confirmed: { country: target('JP', '日本'), admin1: null, city: null } }),
+      countryDialogue({ stage: 'city', confirmed: { country: target('JP', '日本'), admin1: null, city: null } }),
       action,
       medium,
     )).toBeNull()

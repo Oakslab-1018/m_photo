@@ -10,11 +10,15 @@ import type {
   LocationCandidate,
   LocationTarget,
 } from '@/types'
-import { normalizeIsoCode } from '@/utils/geo'
+import {
+  useGuidedComposer,
+  type GuidedFreeTextSubmission,
+} from '@/composables/useGuidedComposer'
 import {
   GUIDED_STEPS,
   candidatePointLabel,
   candidateScoreLabel,
+  guidedCandidateComposition,
   guidedCurrentReviewClue,
   guidedPreviousLevel,
   guidedQuestionMessage,
@@ -57,6 +61,8 @@ const props = withDefaults(
     receipt?: GuidedEventReceipt | null
     selectedGuidedTargetKey?: string | null
     suggestedFreeText?: string | null
+    /** Parent acknowledgement for the last guided free-text submission. */
+    freeTextSubmission?: GuidedFreeTextSubmission | null
     /**
      * UI phase: `review` renders exactly one server-pinned observation/question
      * and never any candidate; `candidates` unlocks the explicit Top-5 step.
@@ -85,6 +91,7 @@ const props = withDefaults(
     receipt: null,
     selectedGuidedTargetKey: null,
     suggestedFreeText: null,
+    freeTextSubmission: null,
     phase: 'review',
     candidatesUnlocked: true,
     canReviewBack: false,
@@ -111,9 +118,7 @@ const emit = defineEmits<{
   'review-back': []
 }>()
 
-const searchText = ref('')
 const backtrackPrompt = ref<GuidedLocationLevel | null>(null)
-const composing = ref(false)
 const panelRef = ref<HTMLElement | null>(null)
 const searchInputRef = ref<HTMLInputElement | null>(null)
 const questionSectionRef = ref<HTMLElement | null>(null)
@@ -121,6 +126,18 @@ const candidateSectionRef = ref<HTMLElement | null>(null)
 
 const stage = computed(() => props.dialogue?.stage ?? 'country')
 const busy = computed(() => props.loading || props.applying || props.externalBusy)
+const {
+  text: composerText,
+  composing,
+  canSend: canSendComposer,
+  submit: submitComposer,
+  onEnter: onComposerEnter,
+} = useGuidedComposer({
+  suggestedText: () => props.suggestedFreeText,
+  submission: () => props.freeTextSubmission,
+  isBusy: () => busy.value,
+  onSend: (text) => emit('free-text', text),
+})
 const isResolved = computed(() => props.dialogue?.stage === 'resolved')
 const stageTitle = computed(() => guidedStageTitle(stage.value))
 const pendingQuestion = computed(() => props.dialogue?.pending_question ?? null)
@@ -162,13 +179,13 @@ const shortcutTitle = computed(() => {
   return '国家 / 地区候选待确认'
 })
 const shortcutNote = computed(() => {
-  if (countryShortcut.value === 'high') return '可继续细化省市'
+  if (countryShortcut.value === 'high') return '可继续深化城市'
   if (props.confidence?.tier === 'low') return '仅在能够确认时选择'
   return '请确认最符合照片的候选'
 })
 const shortcutFooter = computed(() => {
   if (countryShortcut.value === 'high') {
-    return '这是当前国家预测；如需继续定位省市，可确认该国家后进入下一步。'
+    return '这是当前国家预测；如需继续深化城市，可确认该国家后进入下一步。'
   }
   if (props.confidence?.tier === 'low') {
     return '这些只是线索不足时的可选候选；仅在能够确认时选择，未确认前不会推进。'
@@ -203,14 +220,14 @@ const narratedLowQuestion = computed(() => {
   const message = safeGuidedText(action.message).trim()
   return message && message !== questionMessage.value ? message : ''
 })
-/** Prominent backend backtrack target for admin1/city/resolved. */
+/** Prominent backend backtrack target for city/resolved. */
 const previousLevel = computed(() => guidedPreviousLevel(props.dialogue?.stage))
 const nextStepLabel = computed(() =>
   stage.value === 'resolved' ? '' : `下一步：查看${locationLevelLabel(stage.value)}候选`,
 )
 
 const progressText = computed(() => {
-  if (isResolved.value) return '3 / 3 · 已完成'
+  if (isResolved.value) return '2 / 2 · 已完成'
   const current = GUIDED_STEPS.findIndex((step) => step.level === stage.value)
   return `${Math.max(1, current + 1)} / ${GUIDED_STEPS.length} · 当前步骤`
 })
@@ -253,30 +270,44 @@ function isRecentClue(clueId: string): boolean {
 
 const candidateTitle = computed(() => {
   if (stage.value === 'country') return '国家 / 地区候选'
-  if (stage.value === 'admin1') return '省份 / 地区候选'
   if (stage.value === 'city') return '城市候选'
   return '候选地点'
 })
 
-const searchLabel = computed(() => {
-  if (countryShortcut.value) return '补充可见线索以细化判断（可选）'
-  if (!props.candidatesUnlocked) return '补充可观察线索'
-  if (stage.value === 'country') return '输入国家 / 地区名称进行目录检索'
-  if (stage.value === 'admin1') return '输入省份 / 地区名称进行目录检索'
-  return '输入城市名称进行目录检索'
-})
-
-const searchPlaceholder = computed(() => {
-  if (countryShortcut.value) return '例如：招牌文字、道路方向、语言或地名'
-  if (!props.candidatesUnlocked) return '描述照片中可见的招牌、地名或文字'
-  if (stage.value === 'country') return '例如：日本 / Japan'
-  if (stage.value === 'admin1') {
-    const countryIso = normalizeIsoCode(props.dialogue?.confirmed.country?.id)
-    return countryIso === 'CN'
-      ? '例如：浙江 / Zhejiang'
-      : '例如：Tokyo（使用目录中的英文名或别名）'
+const candidateComposition = computed(() => guidedCandidateComposition(topCandidates.value))
+const candidateLevelName = computed(() => (stage.value === 'city' ? '城市' : '国家 / 地区'))
+const candidateSectionNote = computed(() => {
+  const composition = candidateComposition.value
+  if (composition.hasUserText) {
+    return composition.mixed ? '线索匹配优先 · 其余按排序分' : '线索匹配候选'
   }
-  return '例如：Hangzhou、Tokyo'
+  if (composition.hasCatalogSearch) {
+    return composition.mixed ? '目录检索优先 · 其余按排序分' : '目录检索候选'
+  }
+  if (composition.hasModelScores) return '候选可信度前五'
+  return `目录候选（当前显示 ${topCandidates.value.length} 项）`
+})
+const candidateSectionHint = computed(() => {
+  const composition = candidateComposition.value
+  if (!props.locationConfirmationReady) {
+    return composition.hasModelScores && !composition.hasExplicitSelectionBasis
+      ? '新增观察待核对，排名仍可查看，但暂不能确认或排除地点。'
+      : '新增观察待核对，候选仍可查看，但暂不能确认或排除地点。'
+  }
+  if (composition.hasUserText) {
+    return composition.mixed
+      ? '带“线索匹配候选”的条目来自你提供的文字线索，优先展示且不是模型概率；其余条目保留真实排序分。'
+      : '带“线索匹配候选”的条目来自你提供的文字线索，优先展示且不是模型概率。'
+  }
+  if (composition.hasCatalogSearch) {
+    return composition.mixed
+      ? '目录检索命中优先展示且不是模型概率；其余条目保留真实排序分。'
+      : '目录检索命中优先展示，不是模型概率。'
+  }
+  if (composition.hasModelScores) {
+    return '候选可信度前五 · 排序分仅供参考，不代表概率'
+  }
+  return `按目录顺序展示，可输入${candidateLevelName.value}名称查找更多；尚无图像评分，不代表最可能的五个`
 })
 
 const displayError = computed(() => props.conflict ?? props.error)
@@ -288,6 +319,61 @@ const questionMessage = computed(() => {
 const questionReason = computed(() => {
   const question = pendingQuestion.value
   return question ? guidedQuestionReason(question) : ''
+})
+const composerAssistantMessage = computed(() => {
+  if (isResolved.value) {
+    return safeGuidedText(props.action?.message).trim()
+      || '定位已完成；如发现新线索，仍可继续补充。'
+  }
+  if (countryShortcut.value) return shortcutExplanation.value
+  // In the low-confidence country route, only the validated question may be
+  // repeated near the composer. Never surface a stale action that could name
+  // candidates from an earlier hidden ranking.
+  if (stage.value === 'country' && props.confidence?.tier === 'low') {
+    return narratedLowQuestion.value || questionMessage.value
+  }
+  // A country confidence object is country-only. Below country it is treated
+  // as stale and never reused as composer narration; otherwise the current
+  // server action explanation is useful conversational context.
+  if (props.confidence) return questionMessage.value
+  return safeGuidedText(props.action?.message).trim() || questionMessage.value
+})
+const composerHint = computed(() => {
+  if (isResolved.value) {
+    return '定位已完成；新线索会交回助手重新核对，不会自动改动已确认结果。'
+  }
+  if (!props.candidatesUnlocked) {
+    return '请描述照片中可见的招牌、道路方向、语言或地名；提交不会自动确认地点。'
+  }
+  return `可描述照片中可见的线索，也可直接输入${candidateLevelName.value}名称检索目录；提交不会自动确认地点。`
+})
+const composerReceiptText = computed(() => safeGuidedReceipt(props.receipt?.summary))
+const receiptStatusText = computed(() => {
+  const summary = composerReceiptText.value
+  if (summary) return summary
+  const status = props.receipt?.status?.trim().toLowerCase()
+  if (status === 'unchanged') return '这条线索此前已保存，无需重复提交。'
+  if (status === 'unrecognized') return '没有识别到新的线索。'
+  return '操作已应用'
+})
+const composerStatusText = computed(() => {
+  const submission = props.freeTextSubmission
+  if (!submission) return ''
+  if (submission.status === 'pending') return '正在发送这条线索，等待服务器确认…'
+  if (submission.status === 'failed') {
+    const reason = safeGuidedText(submission.error).trim()
+    return `${reason || '提交失败'} · 草稿已保留，可修改后再次发送。`
+  }
+  if (submission.status === 'unconfirmed') {
+    const reason = safeGuidedText(submission.error).trim()
+    return `${reason || '服务器未确认此次提交'} · 草稿已保留，请核对最新状态后重试。`
+  }
+  if (submission.status === 'unchanged') {
+    return '这条线索已记录，无需重复添加。'
+  }
+  return composerReceiptText.value
+    ? `助手反馈：${composerReceiptText.value}`
+    : '已发送，助手会结合这条线索更新判断。'
 })
 
 /** Scroll only the guided panel; never scroll the document or a candidate card. */
@@ -329,19 +415,6 @@ function confirmBacktrack(): void {
   emit('backtrack', level)
 }
 
-function submitFreeText(): void {
-  if (busy.value || composing.value) return
-  const text = searchText.value.trim()
-  if (!text) return
-  emit('free-text', text)
-}
-
-function onSearchEnter(event: KeyboardEvent): void {
-  if (event.isComposing || composing.value) return
-  event.preventDefault()
-  submitFreeText()
-}
-
 function requestRetry(): void {
   if (busy.value) return
   emit('retry')
@@ -368,20 +441,8 @@ function candidateTargetKey(target: LocationTarget): string {
 watch(
   () => props.dialogue?.revision,
   () => {
-    searchText.value = props.suggestedFreeText?.trim() ?? ''
     backtrackPrompt.value = null
   },
-)
-
-watch(
-  () => props.suggestedFreeText,
-  (value, previous) => {
-    const suggested = value?.trim() ?? ''
-    const previousSuggested = previous?.trim() ?? ''
-    if (suggested) searchText.value = suggested
-    else if (previousSuggested && searchText.value === previousSuggested) searchText.value = ''
-  },
-  { immediate: true },
 )
 
 // Only an explicit phase flip (下一步 / 返回核对 / 显式返回) moves the panel
@@ -403,7 +464,8 @@ watch(stage, (nextStage, previousStage) => {
 </script>
 
 <template>
-  <section ref="panelRef" class="guided-panel" aria-live="polite">
+  <section class="guided-dialogue-shell">
+    <div ref="panelRef" class="guided-panel" aria-live="polite">
     <div class="guided-panel-head">
       <div>
         <span class="guided-kicker">引导定位</span>
@@ -437,7 +499,7 @@ watch(stage, (nextStage, previousStage) => {
 
     <template v-else-if="dialogue">
       <div v-if="receipt?.summary || receipt?.status" class="guided-receipt" role="status">
-        {{ safeGuidedReceipt(receipt.summary) || '操作已应用' }}
+        {{ receiptStatusText }}
       </div>
 
       <div v-if="isResolved" class="guided-resolved">
@@ -683,7 +745,7 @@ watch(stage, (nextStage, previousStage) => {
       >
         <div class="guided-section-head">
           <span class="guided-section-title">{{ candidateTitle }}</span>
-          <span class="guided-section-note">候选可信度前五</span>
+          <span class="guided-section-note">{{ candidateSectionNote }}</span>
         </div>
 
         <div class="guided-candidates-toolbar">
@@ -705,11 +767,7 @@ watch(stage, (nextStage, previousStage) => {
           请在下方候选中明确确认当前层级；不会根据排序第一名自动确认。
         </div>
 
-        <p class="guided-section-hint">
-          {{ locationConfirmationReady
-            ? '候选可信度前五 · 排序分仅供参考，不代表概率'
-            : '新增观察待核对，候选排名仍可查看，但暂不能确认或排除地点。' }}
-        </p>
+        <p class="guided-section-hint">{{ candidateSectionHint }}</p>
         <div v-if="!topCandidates.length" class="guided-empty">
           当前层级暂无候选。请在下方补充照片中可见的招牌、地名或文字；补充线索不会自动确认地点。
         </div>
@@ -770,30 +828,71 @@ watch(stage, (nextStage, previousStage) => {
         </div>
       </section>
 
-      <section v-if="!isResolved" class="guided-search">
-        <label for="guided-catalog-search">{{ searchLabel }}</label>
-        <div class="guided-search-row">
-          <input
-            id="guided-catalog-search"
-            ref="searchInputRef"
-            v-model="searchText"
-            type="text"
-            :placeholder="searchPlaceholder"
-            :disabled="busy"
-            @compositionstart="composing = true"
-            @compositionend="composing = false"
-            @keydown.enter="onSearchEnter"
-          />
-          <button type="button" class="primary-btn" :disabled="busy || !searchText.trim()" @click="submitFreeText">
-            {{ applying ? '提交中…' : '搜索 / 提交文字' }}
-          </button>
-        </div>
-        <p>自由文本只用于目录检索或提出线索，不会自动确认地点或进入下一级。</p>
-      </section>
     </template>
 
     <div v-else-if="!loading" class="guided-loading">
       引导状态尚未就绪，请重试。
     </div>
+    </div>
+
+    <form
+      v-if="dialogue"
+      class="guided-composer"
+      aria-labelledby="guided-composer-label"
+      @submit.prevent="submitComposer"
+    >
+      <div class="guided-composer-head">
+        <label id="guided-composer-label" for="guided-conversation-input">
+          补充线索，与定位助手对话
+        </label>
+        <span>对话输入 · 也支持地名检索</span>
+      </div>
+
+      <p
+        v-if="composerAssistantMessage"
+        class="guided-composer-assistant"
+        :title="composerAssistantMessage"
+      >
+        <strong>助手</strong>
+        <span>{{ composerAssistantMessage }}</span>
+      </p>
+
+      <p
+        v-if="freeTextSubmission"
+        class="guided-composer-submission"
+        :class="`is-${freeTextSubmission.status}`"
+        :role="freeTextSubmission.status === 'failed' ? 'alert' : 'status'"
+        aria-live="polite"
+      >
+        <strong>你说</strong>
+        <span class="guided-composer-submitted-text" :title="freeTextSubmission.text">
+          “{{ freeTextSubmission.text }}”
+        </span>
+        <span class="guided-composer-status" :title="composerStatusText">
+          {{ composerStatusText }}
+        </span>
+      </p>
+
+      <div class="guided-composer-row">
+        <input
+          id="guided-conversation-input"
+          ref="searchInputRef"
+          v-model="composerText"
+          type="text"
+          autocomplete="off"
+          placeholder="例如：路牌上是日文，车辆靠左行驶；也可直接输入地名"
+          :disabled="busy"
+          aria-describedby="guided-composer-hint"
+          @compositionstart="composing = true"
+          @compositionend="composing = false"
+          @keydown.enter="onComposerEnter"
+        />
+        <button type="submit" class="primary-btn" :disabled="!canSendComposer">
+          {{ applying ? '发送中…' : busy ? '处理中…' : '发送线索' }}
+        </button>
+      </div>
+
+      <p id="guided-composer-hint" class="guided-composer-hint">{{ composerHint }}</p>
+    </form>
   </section>
 </template>

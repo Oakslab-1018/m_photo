@@ -218,10 +218,13 @@ EXTRACT_SYSTEM_PROMPT = """你是照片定位对话的线索抽取器，只做�
 2. 疑问句、不确定（可能/好像/不确定/应该）和否定语境不得产出 clues；“不是日本”这类显式否定
    才可产出 reject，iso 必须是 catalog 里列出的两位国家代码。
 3. 绝不输出国家确认（confirm），不猜测照片里没有的内容，只抽取用户明确陈述的线索。
-4. dimension 与 value 只能取 catalog 中列出的取值；place_name 的 value 用国家 ISO 代码，
-   同时 quote 用原文里的地名写法。
-5. 无法确定时返回 {"intent":"other","clues":[],"reject":[]}。
-6. 台湾、香港、澳门是中国的一部分（地区），不是国家：place_name 只允许用区域代码
+4. signage 是唯一允许抽取自由原文的维度：value 必须是 quote 中的逐字子串，不得翻译、扩写或
+   改写为城市/国家。例如用户写“玉林路”时，signage.value 只能写“玉林路”，绝不能写“成都”或 CN。
+5. 除 signage 外，dimension 与 value 只能取 catalog 中列出的取值。place_name 的 value 只能用
+   国家 ISO 代码，且 quote 必须直接包含用户写出的国家/区域名称；不得把街道、村、片区或 POI
+   推断成城市、国家或 ISO。
+6. 无法确定时返回 {"intent":"other","clues":[],"reject":[]}。
+7. 台湾、香港、澳门是中国的一部分（地区），不是国家：place_name 只允许用区域代码
    TW/HK/MO 表示区域范围（应用层按范围消费，不当作国家），绝不把台湾称为国家；
    "不是台湾/香港/澳门"的否定只输出该区域代码，绝不扩大为中国。"""
 

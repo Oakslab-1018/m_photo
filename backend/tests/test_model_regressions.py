@@ -13,11 +13,23 @@ from backend.app.domain.geolocation.engine import CountryScore
 from backend.app.domain.geolocation.model_ranking import ModelAwareEngine
 from backend.app.main import create_app
 from backend.app.services.deepseek import DeepSeekClient
+from backend.app.services.geo_session import GeoSessionService
 from backend.app.services.model_gateway import (
     MODEL_ID, MODEL_REVISION, StreetClipGateway, catalog_revision,
 )
 from backend.app.services.catalog_access import catalog_for_settings
+from backend.app.services.pipeline import PipelineService
 from backend.tests.support import make_settings, make_test_image_bytes
+
+
+TRUSTED_OCR_CLUE = {
+    "dimension": "language",
+    "value": "ja",
+    "confidence": 0.9,
+    "evidence": "recognized kana",
+    "source": "ocr",
+    "extra": {"origin_source": "ocr", "reliable": True},
+}
 
 
 def evidence(settings):
@@ -35,6 +47,21 @@ def evidence(settings):
     }
 
 
+def high_evidence(settings):
+    data = evidence(settings)
+    for row in data["rankings"]:
+        if row["iso"] == "AU":
+            row["raw_cosine"] = 0.40
+        elif row["iso"] == "FR":
+            row["raw_cosine"] = 0.37
+    data["rankings"].sort(key=lambda row: (-row["raw_cosine"], row["iso"]))
+    data["margin"] = round(
+        data["rankings"][0]["raw_cosine"] - data["rankings"][1]["raw_cosine"], 6
+    )
+    data["uncertain"] = data["margin"] < 0.015
+    return data
+
+
 def _upload(client: TestClient) -> dict:
     response = client.post(
         "/api/geo/upload",
@@ -42,6 +69,33 @@ def _upload(client: TestClient) -> dict:
     )
     assert response.status_code == 201, response.text
     return response.json()
+
+
+def _replace_persisted_message(settings, *, provider: str | None) -> dict:
+    app = create_app(settings)
+    with TestClient(app):
+        with app.state.session_factory() as db:
+            service = GeoSessionService(db)
+            session = service.create("unused.png", "unused.png")
+            service.add_message(
+                session.id,
+                "ai",
+                "old template",
+                meta={
+                    "action": {"kind": "ask", "message": "old template"},
+                    "scores": [{"iso": "JP"}],
+                    "custom": {"keep": True},
+                    "conversation_provider": "deepseek",
+                },
+            )
+            service.replace_last_ai_message(
+                session.id,
+                "new template",
+                {"kind": "result", "message": "new template"},
+                provider=provider,
+            )
+            db.commit()
+            return service.list_messages(session.id)[-1]
 
 
 @pytest.fixture
@@ -56,9 +110,55 @@ def settings(tmp_path):
         yield config
 
 
+def test_replace_last_ai_message_clears_stale_provider_and_preserves_meta(settings):
+    message = _replace_persisted_message(settings, provider=None)
+
+    assert message["content"] == "new template"
+    assert "conversation_provider" not in message["meta"]
+    assert message["meta"]["action"] == {"kind": "result", "message": "new template"}
+    assert message["meta"]["scores"] == [{"iso": "JP"}]
+    assert message["meta"]["custom"] == {"keep": True}
+
+
+def test_replace_last_ai_message_sets_explicit_provider_and_preserves_meta(settings):
+    message = _replace_persisted_message(settings, provider="deepseek")
+
+    assert message["content"] == "new template"
+    assert message["meta"]["conversation_provider"] == "deepseek"
+    assert message["meta"]["action"] == {"kind": "result", "message": "new template"}
+    assert message["meta"]["scores"] == [{"iso": "JP"}]
+    assert message["meta"]["custom"] == {"keep": True}
+
+
+def test_model_only_high_template_without_key_has_no_provider_or_llm_call(settings, monkeypatch):
+    cfg = replace(settings, deepseek_api_key="")
+    calls = []
+
+    def narrate(_client, context):
+        calls.append(context)
+        return "unexpected narration"
+
+    monkeypatch.setattr(StreetClipGateway, "rank_image", lambda self, path: high_evidence(cfg))
+    monkeypatch.setattr(DeepSeekClient, "narrate", narrate)
+    app = create_app(cfg)
+    with TestClient(app) as client:
+        payload = _upload(client)
+        assert payload["confidence"]["tier"] == "high"
+        assert calls == []
+        message = payload["messages"][-1]
+        assert "conversation_provider" not in message["meta"]
+
+        with app.state.session_factory() as db:
+            persisted = GeoSessionService(db).list_messages(payload["session_id"])[-1]
+        assert persisted["content"] == message["content"]
+        assert "conversation_provider" not in persisted["meta"]
+    assert calls == []
+
+
 @pytest.mark.parametrize("shape", ["incomplete", "nan", "corrupt"])
 def test_corrupt_persisted_prior_falls_back_to_rules_across_restart(settings, shape, monkeypatch):
     monkeypatch.setattr(StreetClipGateway, "rank_image", lambda self, path: evidence(settings))
+    monkeypatch.setattr(PipelineService, "analyze", lambda self, path: [dict(TRUSTED_OCR_CLUE)])
     app = create_app(settings)
     with TestClient(app) as client:
         payload = _upload(client)
@@ -93,6 +193,42 @@ def test_corrupt_persisted_prior_falls_back_to_rules_across_restart(settings, sh
         assert all(score["score_type"] == "rule_weight" for score in response.json()["scores"])
 
 
+def test_accepted_llm_provider_persists_across_api_db_and_restart(settings, monkeypatch):
+    cfg = replace(settings, deepseek_api_key="unit-test-key")
+    narrated = []
+    prefix = "\u89c4\u5219\u89e3\u91ca\uff1a"
+
+    def narrate(_client, context):
+        action_message = str((context.get("action") or {}).get("message") or "")
+        message = f"{prefix}{action_message}"
+        narrated.append(message)
+        return message
+
+    monkeypatch.setattr(StreetClipGateway, "rank_image", lambda self, path: evidence(cfg))
+    monkeypatch.setattr(DeepSeekClient, "narrate", narrate)
+    app = create_app(cfg)
+    with TestClient(app) as client:
+        payload = _upload(client)
+        session_id = payload["session_id"]
+        message = payload["messages"][-1]
+        assert message["content"] == payload["action"]["message"] == narrated[-1]
+        assert message["meta"]["conversation_provider"] == "deepseek"
+        assert message["meta"]["scores"]
+
+        with app.state.session_factory() as db:
+            persisted = GeoSessionService(db).list_messages(session_id)[-1]
+        assert persisted["content"] == message["content"]
+        assert persisted["meta"]["conversation_provider"] == "deepseek"
+
+    with TestClient(create_app(cfg)) as restarted:
+        restarted_message = restarted.get(
+            f"/api/geo/{session_id}/messages"
+        ).json()["messages"][-1]
+    assert restarted_message["content"] == narrated[-1]
+    assert restarted_message["meta"]["conversation_provider"] == "deepseek"
+    assert len(narrated) == 1
+
+
 def test_preview_mismatch_discards_llm_text_and_persists_deterministic_reply(settings, monkeypatch):
     cfg = replace(settings, deepseek_api_key="unit-test-key")
     calls = []
@@ -111,7 +247,8 @@ def test_preview_mismatch_discards_llm_text_and_persists_deterministic_reply(set
     monkeypatch.setattr(DeepSeekClient, "narrate", narrate)
     monkeypatch.setattr(ModelAwareEngine, "infer", infer)
 
-    with TestClient(create_app(cfg)) as client:
+    app = create_app(cfg)
+    with TestClient(app) as client:
         payload = _upload(client)
         session_id = payload["session_id"]
         assert len(calls) >= 2
@@ -121,6 +258,17 @@ def test_preview_mismatch_discards_llm_text_and_persists_deterministic_reply(set
         stored = client.get(f"/api/geo/{session_id}/messages").json()["messages"][-1]
         assert stored["content"] == message["content"]
         assert stored["meta"].get("conversation_provider") is None
+        with app.state.session_factory() as db:
+            persisted = GeoSessionService(db).list_messages(session_id)[-1]
+        assert persisted["content"] == message["content"]
+        assert persisted["meta"].get("conversation_provider") is None
+
+    with TestClient(create_app(cfg)) as restarted:
+        restarted_message = restarted.get(
+            f"/api/geo/{session_id}/messages"
+        ).json()["messages"][-1]
+    assert restarted_message["content"] == message["content"]
+    assert restarted_message["meta"].get("conversation_provider") is None
 
 
 def test_deepseek_redacts_ocr_user_and_history_secrets(settings):

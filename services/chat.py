@@ -165,12 +165,98 @@ _CITY_ALIASES_EN = {
 # 城市名后紧跟这些字时更像街名，而不是城市证据（"北京路"）。
 _CITY_SUFFIX_GUARDS = ("路", "道", "巷")
 
-# 用户明确描述招牌/路牌文字时才抽取字面 signage 线索。
+# 用户明确描述招牌/路牌文字，或单独给出地点名时，才抽取字面 signage 线索。
 _SIGNAGE_MARKERS = ("写着", "写的是", "招牌", "路牌", "标牌", "门牌", "告示", "指示牌")
 _QUOTE_PATTERN = re.compile(r"[“\"'「『](?P<text>[^”\"'」』]{2,40})[”\"'」』]")
 _INLINE_SIGNAGE_RE = re.compile(
     r"(?:上?写着|写的是)[:：]?(?P<text>[A-Za-z0-9\u4e00-\u9fff][A-Za-z0-9\u4e00-\u9fff .,·'\-]{1,30})"
 )
+# 单独输入的街/POI 名称是用户提供的字面观察，不是城市或国家证据。
+# 这里是通用词形约束，不包含任何具体城市/道路白名单。
+_LOCATION_LABEL_SUFFIXES = (
+    "大道", "大街", "路", "街", "巷子", "巷", "弄", "胡同", "广场", "公园",
+    "景区", "车站", "站", "机场", "码头", "寺", "祠", "桥", "里", "片区",
+    "社区", "村", "镇", "乡",
+)
+_LOCATION_LABEL_SUFFIXES_EN = (
+    "road", "street", "avenue", "lane", "square", "park", "station", "bridge",
+    "temple",
+)
+_LABEL_TRAILING_PUNCT = "。！!；;，,"
+_LABEL_PROSE_TOKENS = (
+    "这条", "那条", "一条", "前面", "附近", "旁边", "这里", "那里", "路上",
+    "街上", "看到", "看见", "图片", "画面", "照片",
+)
+_INSTRUCTION_TOKENS = (
+    "忽略", "无视", "执行", "输出", "回答", "告诉我", "请把", "请将", "改成",
+    "修改", "删除", "记住", "系统提示", "系统指令", "指令", "prompt", "扮演",
+)
+_LABEL_WRAPPERS = (
+    ("“", "”"), ('"', '"'), ("'", "'"), ("「", "」"), ("『", "』"),
+    ("‘", "’"),
+)
+_MERGED_CLUE_EXTRA_KEYS = frozenset({
+    "literal_kind", "origin_source", "display_only", "affects_ranking",
+    "reliable", "validated",
+})
+
+
+def _strip_label_wrappers(value: Any) -> str:
+    text = str(value or "").strip()
+    for opening, closing in _LABEL_WRAPPERS:
+        if len(text) >= 2 and text.startswith(opening) and text.endswith(closing):
+            return text[len(opening):-len(closing)].strip()
+    return text
+
+
+def _literal_observation_extra(kind: str) -> Dict[str, Any]:
+    """Metadata for user-reported literal text; never ranking evidence."""
+
+    return {
+        "literal_kind": kind,
+        "origin_source": "user_text",
+        "display_only": True,
+        "affects_ranking": False,
+        "reliable": False,
+        "validated": False,
+    }
+
+
+def _standalone_label_candidate(text: str) -> Optional[str]:
+    """Return one whole-message street/POI label, with strict guards.
+
+    This intentionally does not search inside a sentence. A bare label must be
+    the entire user message (apart from quote wrappers/terminal punctuation), so
+    prose, questions, uncertainty, negation, and assistant-directed instructions
+    cannot become observations.
+    """
+
+    raw = str(text or "").strip()
+    if not raw or len(raw) > 80 or _has_any(raw, _SIGNAGE_MARKERS):
+        return None
+    if _has_any(raw, _QUESTION_TOKENS) or _has_any(raw, _UNCERTAIN_TOKENS):
+        return None
+    if _has_any(raw, _NEGATION_TOKENS) or _has_any(raw, _INSTRUCTION_TOKENS):
+        return None
+    if _has_any(raw, _NON_EVIDENCE_TOKENS):
+        return None
+    candidate = raw.rstrip(_LABEL_TRAILING_PUNCT).strip()
+    literal = _strip_label_wrappers(candidate)
+    if _has_any(literal, _LABEL_PROSE_TOKENS):
+        return None
+    if not (2 <= len(literal) <= 40):
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9\u3400-\u9fff·'\- ]+", literal):
+        return None
+    lowered = literal.casefold()
+    has_cjk_suffix = any(lowered.endswith(suffix) for suffix in _LOCATION_LABEL_SUFFIXES)
+    has_ascii_suffix = any(
+        re.search(rf"(?<![a-z]){re.escape(suffix)}$", lowered)
+        for suffix in _LOCATION_LABEL_SUFFIXES_EN
+    )
+    if not (has_cjk_suffix or has_ascii_suffix):
+        return None
+    return literal
 
 
 def _has_any(text: str, tokens: Sequence[str]) -> bool:
@@ -595,20 +681,35 @@ class ParsedFeedback:
         value = str(value or "").strip()
         if not dimension or not value:
             return
-        for existing in self.clues:
-            if existing["dimension"] == dimension and existing["value"] == value:
-                if confidence > existing["confidence"]:
-                    existing["confidence"] = round(float(confidence), 3)
-                    if evidence:
-                        existing["evidence"] = _truncate(evidence, 200)
-                return
         entry_extra: Dict[str, Any] = {"literal": _truncate(literal or value, 60), "parser": parser}
         if isinstance(extra, dict):
             entry_extra.update(extra)
+        rounded_confidence = round(float(confidence), 3)
+        for existing in self.clues:
+            same_value = existing["dimension"] == dimension and existing["value"] == value
+            if dimension == "signage" and existing["dimension"] == dimension:
+                # Quoted/unquoted/inline forms converge on the same literal.
+                same_value = _normalize(existing["value"]) == _normalize(value)
+            if not same_value:
+                continue
+            existing_extra = dict(existing.get("extra") or {})
+            stronger = rounded_confidence > float(existing.get("confidence", 0.0))
+            for key, item in entry_extra.items():
+                if key in {"literal", "parser"} and not stronger:
+                    continue
+                existing_extra[key] = item
+            existing["extra"] = existing_extra
+            if dimension == "signage":
+                existing["value"] = value[:64]
+            if stronger:
+                existing["confidence"] = rounded_confidence
+                if evidence:
+                    existing["evidence"] = _truncate(evidence, 200)
+            return
         self.clues.append({
             "dimension": dimension,
             "value": value[:64],
-            "confidence": round(float(confidence), 3),
+            "confidence": rounded_confidence,
             "evidence": _truncate(evidence or literal, 200),
             "source": "user",
             "extra": entry_extra,
@@ -654,9 +755,14 @@ class ParsedFeedback:
             return result
         for clue in other.clues:
             extra = clue.get("extra") if isinstance(clue.get("extra"), dict) else {}
+            merged_extra = {
+                key: value for key, value in extra.items()
+                if key in _MERGED_CLUE_EXTRA_KEYS
+            }
             result.add_clue(clue.get("dimension"), clue.get("value"),
                             clue.get("confidence", 0.0), clue.get("evidence", ""),
-                            extra.get("literal", ""), extra.get("parser", "rules"))
+                            extra.get("literal", ""), extra.get("parser", "rules"),
+                            extra=merged_extra)
         for iso in other.reject_isos:
             result.add_reject(iso)
         for iso in other.clear_exclusions:
@@ -836,6 +942,7 @@ class ChineseFreeTextParser:
             return parsed
         evidence = _truncate(raw, 200)
         clauses = _split_clauses(raw)
+        standalone_label = _standalone_label_candidate(raw)
         saw_question = False
         processed = False
         for clause in clauses:
@@ -844,9 +951,11 @@ class ChineseFreeTextParser:
                 saw_question = True
                 continue
             processed = True
-            self._parse_place_mentions(clause, evidence, pending, parsed)
-            self._parse_phrase_mentions(clause, evidence, parsed)
-            self._parse_signage_mentions(clause, evidence, parsed)
+            if standalone_label is None:
+                self._parse_place_mentions(clause, evidence, pending, parsed)
+                self._parse_phrase_mentions(clause, evidence, parsed)
+                self._parse_signage_mentions(clause, evidence, parsed)
+        self._parse_standalone_label(raw, evidence, parsed)
         if _has_any(raw, _SELF_CORRECTION_TOKENS):
             # "刚才说错了，其实是X"：同批新线索覆盖对应维度的旧用户线索。
             for dimension in {clue["dimension"] for clue in parsed.clues}:
@@ -923,9 +1032,11 @@ class ChineseFreeTextParser:
                                 parsed: ParsedFeedback) -> None:
         """Literal signage text the user explicitly quotes/reports.
 
-        Only clauses that mention signage (写着/招牌/路牌/...) are considered
-        and the value is the user's literal text; nothing is inferred.
+        Only clauses that mention signage (写着/招牌/路牌/...) are considered.
+        The value is the user's literal text; nothing is inferred.
         """
+        if _has_any(clause, _QUESTION_TOKENS):
+            return
         if not _has_any(clause, _SIGNAGE_MARKERS):
             return
         existing = {_normalize(clue.get("value")) for clue in parsed.clues}
@@ -936,7 +1047,8 @@ class ChineseFreeTextParser:
         if not candidates:
             for match in _INLINE_SIGNAGE_RE.finditer(clause):
                 candidates.append((match.start("text"), match.group("text").strip()))
-        for pos, literal in candidates:
+        for pos, candidate in candidates:
+            literal = _strip_label_wrappers(candidate).strip()
             if not (2 <= len(literal) <= 40):
                 continue
             normalized = _normalize(literal)
@@ -945,11 +1057,41 @@ class ChineseFreeTextParser:
             segment = _segment_before(clause, pos)
             if _has_any(segment, _UNCERTAIN_TOKENS) or _is_negated(segment):
                 continue
+            if _has_any(segment, _INSTRUCTION_TOKENS) or _has_any(segment, _NON_EVIDENCE_TOKENS):
+                continue
             if any(phrase in literal for phrase, _dim, _value in self._phrase_index):
                 # 该文字本身已经是明确的维度线索（如"靠左行驶"），避免重复。
                 continue
-            parsed.add_clue("signage", literal, 0.8, evidence, literal, parser="rules")
+            parsed.add_clue(
+                "signage", literal, 0.8, evidence, literal, parser="rules",
+                extra=_literal_observation_extra("reported_signage"),
+            )
             existing.add(normalized)
+
+    def _parse_standalone_label(self, raw: str, evidence: str,
+                                parsed: ParsedFeedback) -> None:
+        """Save a whole-message street/POI label as literal user observation.
+
+        This path deliberately does not infer a country or city. It only records
+        the user's text; a separate curated, catalog-validated helper may propose
+        a location later.
+        """
+        literal = _standalone_label_candidate(raw)
+        if not literal:
+            return
+        normalized = _normalize(literal)
+        if not normalized:
+            return
+        existing = {_normalize(clue.get("value")) for clue in parsed.clues}
+        existing |= {_normalize((clue.get("extra") or {}).get("literal")) for clue in parsed.clues}
+        if normalized in existing:
+            return
+        if any(phrase in literal for phrase, _dim, _value in self._phrase_index):
+            return
+        parsed.add_clue(
+            "signage", literal, 0.8, evidence, literal, parser="rules",
+            extra=_literal_observation_extra("standalone_street_label"),
+        )
 
     def _phrase_matches(self, clause: str) -> List[Tuple[int, str, str, str]]:
         raw_matches: List[Tuple[int, str, str, str]] = []
@@ -1092,8 +1234,12 @@ class ChineseFreeTextParser:
             for entry in entries[:6]:
                 clue = self._validate_remote_clue(entry, text)
                 if clue:
+                    extra = None
+                    if clue["dimension"] == "signage":
+                        extra = _literal_observation_extra("remote_signage")
                     result.add_clue(clue["dimension"], clue["value"], self.REMOTE_CONFIDENCE,
-                                    _truncate(text, 200), clue["literal"], parser="deepseek")
+                                    _truncate(text, 200), clue["literal"], parser="deepseek",
+                                    extra=extra)
         rejects = payload.get("reject")
         if isinstance(rejects, list):
             for entry in rejects[:4]:
@@ -1126,10 +1272,15 @@ class ChineseFreeTextParser:
         segment = _segment_before(text, pos)
         if _has_any(segment, _UNCERTAIN_TOKENS) or _is_negated(segment):
             return None
-        if dimension == "signage":
-            if _normalize(raw_value) and _normalize(raw_value) in _normalize(text):
-                return {"dimension": dimension, "value": raw_value, "literal": quote}
+        if _has_any(segment, _INSTRUCTION_TOKENS):
             return None
+        if dimension == "signage":
+            literal = _strip_label_wrappers(raw_value).strip()
+            if not (2 <= len(literal) <= 40):
+                return None
+            if not _normalize(literal) or _normalize(literal) not in _normalize(quote):
+                return None
+            return {"dimension": dimension, "value": literal, "literal": quote}
         if dimension == "place_name":
             iso = self._resolve_iso(raw_value)
             if iso and self._anchor_supported(dimension, iso, quote):
@@ -1768,3 +1919,4 @@ class ChatService:
     # ---- 向后兼容：旧的简单关键词接口 ----
     def _parse_free_text(self, text: str) -> List[Dict[str, Any]]:
         return self.parser.parse(text).clues
+

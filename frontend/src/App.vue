@@ -17,9 +17,11 @@ import type {
 } from '@/types'
 import { useGeoSession } from '@/composables/useGeoSession'
 import { useGuidedDialogue } from '@/composables/useGuidedDialogue'
+import type { GuidedFreeTextSubmission } from '@/composables/useGuidedComposer'
 import { clueIdentity, clueValueLabel, countGroupedClues, dimensionLabel } from '@/utils/clues'
 import { isQuestionAction } from '@/utils/dialogue'
 import {
+  guidedFreeTextReceiptOutcome,
   guidedQuestionMessage,
   guidedStageTitle,
   guidedTargetKey,
@@ -97,6 +99,7 @@ const regionRequests = ref<RegionAnalysisRecord[]>([])
 const immediateRegionReports = ref<RegionReport[]>([])
 const selectedRegionReportId = ref<string | null>(null)
 const guidedDraftText = ref<string | null>(null)
+const guidedFreeTextSubmission = ref<GuidedFreeTextSubmission | null>(null)
 
 /** Monotonic session generation: stale responses can never overwrite newer state. */
 const sessionEpoch = ref(0)
@@ -104,6 +107,7 @@ const sessionEpoch = ref(0)
 let cityRequestNonce = 0
 let pendingNonce = 0
 let regionRequestNonce = 0
+let guidedFreeTextNonce = 0
 
 const regionReports = computed(() =>
   mergeRegionReports(regionReportsFromMessages(session.messages.value), immediateRegionReports.value),
@@ -323,6 +327,11 @@ function releasePreviewUrl(): void {
   localPreviewUrl.value = null
 }
 
+function resetGuidedFreeTextSubmission(): void {
+  guidedFreeTextNonce += 1
+  guidedFreeTextSubmission.value = null
+}
+
 function resetTransientUi(): void {
   viewerOpen.value = false
   confirmCandidate.value = null
@@ -334,6 +343,7 @@ function resetTransientUi(): void {
   citySourceLabel.value = null
   pointStatus.value = '点选或框选区域后，点击“分析选定区域”；分析结果只作为线索。'
   pointStatusKind.value = 'idle'
+  resetGuidedFreeTextSubmission()
   resetRegionAnalysisState()
 }
 
@@ -985,8 +995,36 @@ function useRegionQuestion(question: RegionQuestion): void {
 }
 
 async function onGuidedFreeText(text: string): Promise<void> {
-  const applied = await guided.freeText(text)
-  if (applied) guidedDraftText.value = null
+  const submitted = text.trim()
+  if (!submitted) return
+  const nonce = ++guidedFreeTextNonce
+  const sessionId = session.sessionId.value
+  guidedFreeTextSubmission.value = { text: submitted, status: 'pending' }
+  const applied = await guided.freeText(submitted)
+  if (nonce !== guidedFreeTextNonce || session.sessionId.value !== sessionId) return
+  if (!applied) {
+    guidedFreeTextSubmission.value = {
+      text: submitted,
+      status: 'failed',
+      error: guided.error.value ?? guided.conflict.value ?? '提交失败，请重试。',
+    }
+    return
+  }
+
+  const outcome = guidedFreeTextReceiptOutcome(guided.receipt.value)
+  if (outcome.status === 'failed') {
+    guidedFreeTextSubmission.value = {
+      text: submitted,
+      status: 'failed',
+      error: outcome.error ?? '没有识别到新的线索，请修改后重试。',
+    }
+    return
+  }
+
+  guidedDraftText.value = null
+  // Preserve the server's distinction between an applied mutation and an
+  // acknowledged pre-existing clue; never relabel unchanged as applied.
+  guidedFreeTextSubmission.value = { text: submitted, status: outcome.status }
 }
 
 async function requestCities(iso: string, sourceIso?: string | null): Promise<void> {
@@ -1130,6 +1168,7 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
               :receipt="guided.receipt.value"
               :selected-guided-target-key="selectedGuidedTargetKey"
               :suggested-free-text="guidedDraftText"
+              :free-text-submission="guidedFreeTextSubmission"
               :phase="guided.phase.value"
               :candidates-unlocked="guidedRankingsUnlocked"
               :can-review-back="guided.canReviewBack.value"

@@ -10,6 +10,7 @@ import type {
 import { cityMatchedClueCount, cityScoreLabel } from '@/utils/city'
 import {
   candidateScoreLabel,
+  guidedCandidateComposition,
   locationLevelLabel,
   selectTopGuidedCandidates,
   targetLabel,
@@ -87,8 +88,6 @@ const guidedTabLabel = computed(() => {
   switch (props.guidedStage) {
     case 'country':
       return '国家 / 地区'
-    case 'admin1':
-      return '省份 / 地区'
     case 'city':
       return '城市候选'
     default:
@@ -109,8 +108,47 @@ const tabs = computed(() => {
 const activeTab = ref<CandidateTab>(slots.map ? 'map' : 'country')
 
 const guidedTopCandidates = computed(() =>
-  props.guidedMode ? selectTopGuidedCandidates(props.guidedCandidates ?? []) : [],
+  props.guidedMode
+    ? selectTopGuidedCandidates(props.guidedCandidates ?? [], props.guidedStage)
+    : [],
 )
+const guidedComposition = computed(() => guidedCandidateComposition(guidedTopCandidates.value))
+const guidedCandidateLevelName = computed(() =>
+  props.guidedStage === 'city' ? '城市' : '国家 / 地区',
+)
+const guidedSectionNote = computed(() => {
+  const composition = guidedComposition.value
+  if (composition.hasUserText) {
+    return composition.mixed ? '线索匹配优先 · 其余按排序分' : '线索匹配候选'
+  }
+  if (composition.hasCatalogSearch) {
+    return composition.mixed ? '目录检索优先 · 其余按排序分' : '目录检索候选'
+  }
+  if (composition.hasModelScores) return '候选可信度前五'
+  return `目录候选（当前显示 ${guidedTopCandidates.value.length} 项）`
+})
+const guidedSectionHint = computed(() => {
+  const composition = guidedComposition.value
+  if (!props.guidedConfirmationReady) {
+    return composition.hasModelScores && !composition.hasExplicitSelectionBasis
+      ? '新增观察待核对，排名仍可查看，但暂不能确认或排除地点。'
+      : '新增观察待核对，候选仍可查看，但暂不能确认或排除地点。'
+  }
+  if (composition.hasUserText) {
+    return composition.mixed
+      ? '带“线索匹配候选”的条目来自你提供的文字线索，优先展示且不是模型概率；其余条目保留真实排序分。'
+      : '带“线索匹配候选”的条目来自你提供的文字线索，优先展示且不是模型概率。'
+  }
+  if (composition.hasCatalogSearch) {
+    return composition.mixed
+      ? '目录检索命中优先展示且不是模型概率；其余条目保留真实排序分。'
+      : '目录检索命中优先展示，不是模型概率。'
+  }
+  if (composition.hasModelScores) {
+    return '候选可信度前五 · 排序分仅供参考，不代表概率'
+  }
+  return `按目录顺序展示，可输入${guidedCandidateLevelName.value}名称查找更多；尚无图像评分，不代表最可能的五个`
+})
 const countryCount = computed(() =>
   props.guidedMode
     ? props.guidedCandidatesUnlocked
@@ -246,21 +284,16 @@ function isForeignCitySelection(): boolean {
         </div>
         <div v-else-if="!guidedCandidatesUnlocked" class="candidate-empty candidate-locked">
           先核对观察，再查看地点候选
-          <span class="next">处理完待核对观察后，这里会按排序分显示前五。</span>
+          <span class="next">处理完待核对观察后，这里会显示当前层级的候选。</span>
         </div>
         <template v-else>
           <div v-if="!guidedTopCandidates.length" class="candidate-empty">
             暂无当前层级的地点候选
-            <span class="next">可通过主引导面板补充线索或检索目录</span>
+            <span class="next">可通过下方对话补充线索，或直接输入地名检索目录</span>
           </div>
           <template v-else>
-            <div class="panel-hint">
-              {{
-                guidedConfirmationReady
-                  ? '候选可信度前五 · 排序分仅供参考，不代表概率'
-                  : '新增观察待核对，排名仍可查看，但暂不能确认或排除地点。'
-              }}
-            </div>
+            <div class="panel-hint">{{ guidedSectionNote }}</div>
+            <div class="panel-hint">{{ guidedSectionHint }}</div>
             <article
               v-for="(candidate, index) in guidedTopCandidates"
               :key="`${candidate.target.level}:${candidate.target.id}`"

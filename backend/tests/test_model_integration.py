@@ -14,6 +14,7 @@ from PIL import Image
 
 from backend.app.main import create_app
 from backend.app.database import GeoSession
+from backend.app.services.catalog_access import catalog_for_settings
 from backend.app.services.geo_session import GeoSessionService
 from backend.app.services.model_gateway import StreetClipGateway, MODEL_ID, MODEL_REVISION, catalog_revision
 from backend.app.services.deepseek import DeepSeekClient
@@ -32,8 +33,7 @@ def evidence(settings):
     entries, so the remainder steps down by a fraction sized to land just
     above -1 (see ``test_fusion.full_evidence`` for the same problem).
     """
-    countries = sorted(json.loads(settings.countries_path.read_text(encoding="utf-8")),
-                       key=lambda c: c["iso"])
+    countries = sorted(catalog_for_settings(settings).countries(), key=lambda c: c["iso"])
     head = min(len(countries), HEAD_ROWS)
     tail = len(countries) - head
     tail_step = min(0.01, 0.40 / tail) if tail else 0.01
@@ -47,7 +47,10 @@ def evidence(settings):
 
 @pytest.fixture
 def settings(tmp_path):
-    return replace(make_settings(tmp_path), streetclip_enabled=True, streetclip_api_key="local-secret")
+    config = replace(make_settings(tmp_path), streetclip_enabled=True, streetclip_api_key="local-secret")
+    # Standalone gateway/provider tests also need the SQLite seed initialized.
+    with TestClient(create_app(config)):
+        yield config
 
 
 def test_gateway_uploads_bytes_and_full_validated_ranking(settings, tmp_path):
@@ -132,7 +135,11 @@ def test_full_model_prior_survives_rejections_restart_and_points(settings):
             assert response.status_code == 201, response.text
             initial = response.json(); sid = initial["session_id"]
             assert initial["scores"][0]["raw_cosine"] == 0.4
-            assert initial["action"]["kind"] != "confirm"
+            assert initial["confidence"]["tier"] == "medium"
+            assert initial["confidence"]["action"] == "confirm_candidates"
+            assert initial["action"]["kind"] == "confirm"
+            with app.state.session_factory() as db:
+                assert db.get(GeoSession, sid).confirmed_iso is None
             assert not any(c["dimension"] == "country" for c in initial["clues"])
             for row in data["rankings"][:7]:
                 response = client.post(f"/api/geo/{sid}/feedback", json={"type": "reject", "iso": row["iso"]})
@@ -173,22 +180,31 @@ def test_external_calls_precede_write_transaction_and_confirmation_skips_llm(set
         assert not inside
         calls.append("image")
         return evidence(cfg)
+    narrated = []
     def narrate(provider, context):
         assert not inside
         calls.append("chat")
-        return "请补充文字线索，候选尚不能确定。"
+        action_message = str((context.get("action") or {}).get("message") or "")
+        message = f"规则解释：{action_message}"
+        narrated.append(message)
+        return message
     with mock.patch.object(GeoSessionService, "transaction", track), \
          mock.patch.object(StreetClipGateway, "rank_image", autospec=True, side_effect=rank), \
          mock.patch.object(DeepSeekClient, "narrate", autospec=True, side_effect=narrate):
         with TestClient(create_app(cfg)) as client:
             payload = client.post("/api/geo/upload", files={"image": ("x.png", make_test_image_bytes(), "image/png")}).json()
             sid = payload["session_id"]
-            assert payload["messages"][-1]["content"] == "请补充文字线索，候选尚不能确定。"
+            assert payload["messages"][-1]["content"] == payload["action"]["message"] == narrated[-1]
+            assert "规则解释：" in payload["messages"][-1]["content"]
             assert payload["messages"][-1]["meta"]["conversation_provider"] == "deepseek"
             for path, body in [("feedback", {"type":"reject", "iso":"AU"}), ("analyze-point", {"x":0.5, "y":0.5})]:
                 response = client.post(f"/api/geo/{sid}/{path}", json=body)
                 assert response.status_code == 200, response.text
-                assert response.json()["messages"][-1]["meta"]["conversation_provider"] == "deepseek"
+                result = response.json()
+                message = result["messages"][-1]
+                assert message["content"] == result["action"]["message"]
+                assert narrated[-1] in message["content"]
+                assert message["meta"]["conversation_provider"] == "deepseek"
             count = calls.count("chat")
             assert client.post(f"/api/geo/{sid}/feedback", json={"type":"confirm", "iso":"JP"}).json()["done"]
             assert calls.count("chat") == count == 3

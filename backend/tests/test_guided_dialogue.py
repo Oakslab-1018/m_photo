@@ -145,13 +145,19 @@ def confirm_country(
     return response.json()
 
 
-def confirm_admin1(client: TestClient, session_id: int, body: dict, event_id: str = "admin1") -> dict:
+def confirm_city(
+    client: TestClient,
+    session_id: int,
+    body: dict,
+    event_id: str = "city",
+    city_id: str = "1850147",
+) -> dict:
     body = review_pending_clues(client, session_id, body, tag=f"{event_id}-review")
     response = event(client, session_id, {
         "type": "confirm_location",
         "event_id": event_id,
         "expected_revision": body["dialogue"]["revision"],
-        "target": {"level": "admin1", "id": "JP.40"},
+        "target": {"level": "city", "id": city_id},
     })
     assert response.status_code == 200, response.text
     return response.json()
@@ -172,42 +178,45 @@ def test_start_is_idempotent_and_get_is_read_only(api):
 
 
 def test_explicit_path_and_legacy_status_are_coherent(api):
-    client, settings, app = api
+    client, _, app = api
     session_id = upload(client)
     body = start(client, session_id)
     assert body["dialogue"]["stage"] == "country"
 
     body = confirm_country(client, session_id, body)
-    assert body["dialogue"]["stage"] == "admin1"
+    assert body["dialogue"]["stage"] == "city"
     assert body["dialogue"]["confirmed"]["country"]["id"] == "JP"
+    assert body["dialogue"]["confirmed"]["admin1"] is None
+    assert body["dialogue"]["confirmed"]["city"] is None
 
     with app.state.session_factory() as db:
         row = db.get(GeoSession, session_id)
         assert (row.confirmed_iso, row.status) == ("JP", "active")
 
-    body = confirm_admin1(client, session_id, body)
-    assert body["dialogue"]["stage"] == "city"
-    assert body["dialogue"]["confirmed"]["admin1"]["source_iso"] == "JP"
-
-    city_id = next(
-        row.city_id
-        for row in load_city_index(settings.cities_path)["JP"].values()
-        if row.region == "40"
-    )
+    city_id = "1850147"
     response = event(client, session_id, {
         "type": "confirm_location",
         "event_id": "city",
         "expected_revision": body["dialogue"]["revision"],
-        "target": {"level": "city", "id": str(city_id)},
+        "target": {"level": "city", "id": city_id},
     })
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["dialogue"]["stage"] == "resolved"
-    assert body["dialogue"]["confirmed"]["city"]["id"] == str(city_id)
+    assert body["dialogue"]["confirmed"]["city"]["id"] == city_id
+    assert body["dialogue"]["confirmed"]["admin1"] is None
 
     with app.state.session_factory() as db:
         row = db.get(GeoSession, session_id)
         assert (row.confirmed_iso, row.status) == ("JP", "done")
+
+    direct_admin1 = event(client, session_id, {
+        "type": "confirm_location",
+        "event_id": "reject-admin1-step",
+        "expected_revision": body["dialogue"]["revision"],
+        "target": {"level": "admin1", "id": "JP.40"},
+    })
+    assert direct_admin1.status_code == 422, direct_admin1.text
 
 
 def test_clue_review_reject_and_retract(api):
@@ -308,7 +317,7 @@ def test_unknown_then_retract_requeues_review_before_location_confirmation(api):
         "target": {"level": "country", "id": "JP"},
     })
     assert confirmed.status_code == 200, confirmed.text
-    assert confirmed.json()["dialogue"]["stage"] == "admin1"
+    assert confirmed.json()["dialogue"]["stage"] == "city"
 
 
 def test_get_repairs_persisted_pending_clue_with_stale_asked_review(api):
@@ -366,46 +375,49 @@ def test_scoped_exclusion_filters_only_its_scope_and_retract_restores(api):
         "type": "reject_location",
         "event_id": "exclude-tokyo",
         "expected_revision": body["dialogue"]["revision"],
-        "target": {"level": "admin1", "id": "JP.40"},
+        "target": {"level": "city", "id": "1850147"},
     })
     assert excluded.status_code == 200, excluded.text
     excluded_body = excluded.json()
-    assert all(item["target"]["id"] != "JP.40" for item in excluded_body["candidates"])
-    assert any(item["target"]["id"] == "JP.32" for item in excluded_body["candidates"])
+    assert all(item["target"]["id"] != "1850147" for item in excluded_body["candidates"])
+    assert any(item["target"]["id"] == "1853909" for item in excluded_body["candidates"])
 
     restored = event(client, session_id, {
         "type": "retract",
         "event_id": "restore-tokyo",
         "expected_revision": excluded_body["dialogue"]["revision"],
-        "target": {"level": "admin1", "id": "JP.40"},
+        "target": {"level": "city", "id": "1850147"},
     })
     assert restored.status_code == 200, restored.text
-    assert any(item["target"]["id"] == "JP.40" for item in restored.json()["candidates"])
+    assert any(item["target"]["id"] == "1850147" for item in restored.json()["candidates"])
 
 
 def test_backtrack_clears_children_but_keeps_exclusions(api):
     client, _, _ = api
     session_id = upload(client)
     body = confirm_country(client, session_id, start(client, session_id))
-    body = confirm_admin1(client, session_id, body)
     excluded = event(client, session_id, {
         "type": "reject_location",
         "event_id": "exclude-city",
         "expected_revision": body["dialogue"]["revision"],
-        "target": {"level": "city", "id": "1850147"},
+        "target": {"level": "city", "id": "1853909"},
     }).json()
+    assert excluded["dialogue"]["stage"] == "city"
+
+    # The old city-stage parent was admin1. It now aliases country.
     backtracked = event(client, session_id, {
         "type": "backtrack",
-        "event_id": "backtrack-admin1",
+        "event_id": "backtrack-city-to-country",
         "expected_revision": excluded["dialogue"]["revision"],
         "level": "admin1",
     })
     assert backtracked.status_code == 200, backtracked.text
     result = backtracked.json()
-    assert result["dialogue"]["stage"] == "admin1"
-    assert result["dialogue"]["confirmed"]["country"]["id"] == "JP"
+    assert result["dialogue"]["stage"] == "country"
+    assert result["dialogue"]["confirmed"]["country"] is None
     assert result["dialogue"]["confirmed"]["admin1"] is None
-    assert any(item["id"] == "1850147" for item in result["dialogue"]["exclusions"])
+    assert result["dialogue"]["confirmed"]["city"] is None
+    assert any(item["id"] == "1853909" for item in result["dialogue"]["exclusions"])
 
 
 def test_duplicate_event_id_replays_receipt_and_stale_revision_conflicts(api):
@@ -438,15 +450,12 @@ def test_duplicate_event_id_replays_receipt_and_stale_revision_conflicts(api):
 
 
 def test_free_text_proposes_city_outside_national_top10_without_confirming(api):
-    client, settings, app = api
+    client, settings, _ = api
     session_id = upload(client)
     body = confirm_country(client, session_id, start(client, session_id))
-    body = confirm_admin1(client, session_id, body)
+    assert body["dialogue"]["stage"] == "city"
     scoped = sorted(
-        (
-            row for row in load_city_index(settings.cities_path)["JP"].values()
-            if row.region == "40"
-        ),
+        load_city_index(settings.cities_path)["JP"].values(),
         key=lambda row: (-row.population, row.city_id),
     )
     omitted = next(
@@ -462,7 +471,12 @@ def test_free_text_proposes_city_outside_national_top10_without_confirming(api):
     assert response.status_code == 200, response.text
     result = response.json()
     assert result["dialogue"]["stage"] == "city"
-    assert any(item["target"]["id"] == str(omitted.city_id) for item in result["candidates"])
+    matched = next(
+        item for item in result["candidates"]
+        if item["target"]["id"] == str(omitted.city_id)
+    )
+    assert matched["selection_basis"] == "user_text"
+    assert "score" not in matched
     assert result["dialogue"]["confirmed"]["city"] is None
 
     reviewed = review_pending_clues(client, session_id, result, tag="omitted-city-review")
@@ -477,14 +491,15 @@ def test_free_text_proposes_city_outside_national_top10_without_confirming(api):
 
 
 def test_reject_location_enforces_active_scope(api):
-    client, _, _ = api
+    client, settings, _ = api
     session_id = upload(client)
     body = confirm_country(client, session_id, start(client, session_id))
+    foreign_city = next(iter(load_city_index(settings.cities_path)["US"].values())).city_id
     response = event(client, session_id, {
         "type": "reject_location",
-        "event_id": "unrelated-admin1",
+        "event_id": "unrelated-city",
         "expected_revision": body["dialogue"]["revision"],
-        "target": {"level": "admin1", "id": "US.CA"},
+        "target": {"level": "city", "id": str(foreign_city)},
     })
     assert response.status_code == 422, response.text
     current = client.get(f"/api/geo/{session_id}/dialogue").json()
@@ -495,14 +510,7 @@ def test_chinese_city_alias_is_proposal_only_and_audited(api):
     client, _, app = api
     session_id = upload(client)
     body = confirm_country(client, session_id, start(client, session_id), event_id="cn-country", iso="CN")
-    response = event(client, session_id, {
-        "type": "confirm_location",
-        "event_id": "zhejiang",
-        "expected_revision": body["dialogue"]["revision"],
-        "target": {"level": "admin1", "id": "CN.02"},
-    })
-    assert response.status_code == 200, response.text
-    body = response.json()
+    assert body["dialogue"]["stage"] == "city"
     response = event(client, session_id, {
         "type": "free_text",
         "event_id": "hangzhou-alias",
@@ -512,7 +520,9 @@ def test_chinese_city_alias_is_proposal_only_and_audited(api):
     assert response.status_code == 200, response.text
     result = response.json()
     assert result["dialogue"]["confirmed"]["city"] is None
-    assert any(item["target"]["id"] == "1808926" for item in result["candidates"])
+    matched = next(item for item in result["candidates"] if item["target"]["id"] == "1808926")
+    assert matched["selection_basis"] == "user_text"
+    assert "score" not in matched
     assert result["messages"][-2]["content"] == "杭州"
     assert result["messages"][-2]["meta"]["event_payload"]["text"] == "杭州"
     assert any(item["id"] == "1808926" for item in result["messages"][-2]["meta"]["proposals"])
@@ -525,31 +535,38 @@ def test_chinese_city_alias_is_proposal_only_and_audited(api):
     assert queried.status_code == 200
     assert queried.json()["candidates"][0]["target"]["id"] == "1808926"
 
+    confirmed = event(client, session_id, {
+        "type": "confirm_location",
+        "event_id": "confirm-hangzhou",
+        "expected_revision": result["dialogue"]["revision"],
+        "target": {"level": "city", "id": "1808926"},
+    })
+    assert confirmed.status_code == 200, confirmed.text
+    assert confirmed.json()["dialogue"]["stage"] == "resolved"
+
 
 def test_free_text_conflict_prompts_clarification_without_path_change(api):
     client, _, _ = api
     session_id = upload(client)
     body = confirm_country(client, session_id, start(client, session_id))
-    body = confirm_admin1(client, session_id, body)
     response = event(client, session_id, {
         "type": "free_text",
-        "event_id": "conflicting-city",
+        "event_id": "conflicting-country",
         "expected_revision": body["dialogue"]["revision"],
-        "text": "Osaka",
+        "text": "这是法国",
     })
     assert response.status_code == 200, response.text
     result = response.json()
     assert result["dialogue"]["stage"] == "city"
-    assert result["dialogue"]["confirmed"]["admin1"]["id"] == "JP.40"
+    assert result["dialogue"]["confirmed"]["country"]["id"] == "JP"
     assert result["dialogue"]["confirmed"]["city"] is None
     assert result["dialogue"]["pending_question"]["kind"] == "ask"
     assert result["action"]["kind"] == "ask"
 
 
-def test_city_model_ranking_is_scoped_before_limit(api, monkeypatch):
+def test_city_model_ranking_is_country_wide_before_limit(api, monkeypatch):
     client, _, _ = api
     session_id = upload(client)
-    body = confirm_country(client, session_id, start(client, session_id))
     monkeypatch.setattr(
         StreetClipGateway,
         "rank_cities",
@@ -582,14 +599,16 @@ def test_city_model_ranking_is_scoped_before_limit(api, monkeypatch):
             ]
         },
     )
-    body = confirm_admin1(client, session_id, body)
+    body = confirm_country(client, session_id, start(client, session_id))
+    assert body["dialogue"]["stage"] == "city"
     targets = {item["target"]["id"]: item for item in body["candidates"]}
     assert "1850147" in targets
-    assert "1853909" not in targets
+    assert "1853909" in targets
     assert targets["1850147"]["score"] == pytest.approx(0.4)
+    assert targets["1853909"]["score"] == pytest.approx(0.9)
 
 
-def test_missing_admin1_catalog_is_explicit_unavailable(api, monkeypatch):
+def test_missing_admin1_catalog_does_not_block_country_city_flow(api, monkeypatch):
     client, _, _ = api
     session_id = upload(client)
     confirm_country(client, session_id, start(client, session_id))
@@ -597,12 +616,15 @@ def test_missing_admin1_catalog_is_explicit_unavailable(api, monkeypatch):
     import backend.app.services.geo_catalog_store as store_module
 
     def missing(self, source_iso):
-        raise RuntimeError("missing catalog")
+        raise RuntimeError("missing admin1 catalog")
 
     monkeypatch.setattr(store_module.GeoCatalogStore, "admin1_rows", missing)
     response = client.get(f"/api/geo/{session_id}/dialogue")
-    assert response.status_code == 503
-    assert response.json()["error"] == "地理目录数据库不可用"
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["dialogue"]["stage"] == "city"
+    assert body["candidates"]
+    assert body["dialogue"]["confirmed"]["admin1"] is None
 
 
 def test_guided_state_survives_restart(tmp_path, monkeypatch):
@@ -619,7 +641,7 @@ def test_guided_state_survives_restart(tmp_path, monkeypatch):
         body = client.get(f"/api/geo/{session_id}/dialogue").json()
         assert body["dialogue"]["revision"] == revision
         assert body["dialogue"]["confirmed"]["country"]["id"] == "JP"
-        assert body["dialogue"]["stage"] == "admin1"
+        assert body["dialogue"]["stage"] == "city"
 
 
 def test_confirm_location_cannot_skip_pending_clue_review(api):
@@ -655,7 +677,7 @@ def test_confirm_location_cannot_skip_pending_clue_review(api):
         "target": {"level": "country", "id": "JP"},
     })
     assert confirmed.status_code == 200, confirmed.text
-    assert confirmed.json()["dialogue"]["stage"] == "admin1"
+    assert confirmed.json()["dialogue"]["stage"] == "city"
 
 
 def test_free_text_proposal_cannot_confirm_past_pending_review(api):
@@ -729,14 +751,14 @@ def test_confirm_location_blocked_while_correction_ask_has_pending_clues(api):
         "target": {"level": "country", "id": "JP"},
     })
     assert confirmed.status_code == 200, confirmed.text
-    assert confirmed.json()["dialogue"]["stage"] == "admin1"
+    assert confirmed.json()["dialogue"]["stage"] == "city"
 
 
 def test_confirm_location_blocked_while_conflict_ask_has_pending_clues(api):
     client, _, _ = api
     session_id = upload(client)
     body = confirm_country(client, session_id, start(client, session_id))
-    body = confirm_admin1(client, session_id, body)
+    body = confirm_city(client, session_id, body)
     conflicted = event(client, session_id, {
         "type": "free_text",
         "event_id": "conflict-ask",
@@ -1107,7 +1129,7 @@ def test_pending_question_exposes_target_and_confirm_without_qid_stays_valid(api
         "target": {"level": "country", "id": target_id},
     })
     assert confirmed.status_code == 200, confirmed.text
-    assert confirmed.json()["dialogue"]["stage"] == "admin1"
+    assert confirmed.json()["dialogue"]["stage"] == "city"
 
 
 def test_degraded_session_drops_stale_confirm_question(model_api, monkeypatch):

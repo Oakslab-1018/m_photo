@@ -194,45 +194,33 @@ function scoreText(point: MapPoint): string {
   return ''
 }
 function isGuidedParentPoint(point: MapPoint): boolean {
-  if (!point.confirmed) return false
-  if (props.guidedStage === 'city') return point.level === 'admin1' || point.level === 'country'
-  if (props.guidedStage === 'admin1') return point.level === 'country'
-  return false
+  return Boolean(
+    point.confirmed && props.guidedStage === 'city' && point.level === 'country',
+  )
 }
 
 function guidedPointTooltip(point: MapPoint): string {
   const level = point.level ?? point.kind
   const levelLabel = locationLevelLabel(level)
   const score = scoreText(point)
-  const admin1Provenance = point.derivedCoordinate
-    ? '省级代表点（由目录最大城市坐标派生，不是行政区多边形，也不是照片 GPS）'
-    : '省级目录代表点（不是行政区多边形，也不是照片 GPS）'
 
   if (point.resolved) {
     return '最终确认城市 ' + point.name + ' · 城市目录代表点，不是照片 GPS' + score
   }
   if (point.confirmed) {
     const parentPrefix = isGuidedParentPoint(point) ? '已确认父级' : '已确认'
-    if (level === 'admin1') {
-      return parentPrefix + '省份 / 地区 ' + point.name + ' · ' + admin1Provenance + score
-    }
-    return parentPrefix + levelLabel + ' ' + point.name + ' · 用户确认路径；坐标为代表点，不是照片 GPS' + score
+    return (
+      parentPrefix +
+      levelLabel +
+      ' ' +
+      point.name +
+      ' · 用户确认路径；坐标为代表点，不是照片 GPS' +
+      score
+    )
   }
   const actionHint = props.guidedConfirmationReady
     ? '双击确认'
     : '完成新增观察核对后可双击确认'
-  if (level === 'admin1') {
-    return (
-      '候选省份 / 地区 ' +
-      point.name +
-      ' · ' +
-      admin1Provenance +
-      score +
-      ' · 单击选中，' +
-      actionHint +
-      '省份 / 地区'
-    )
-  }
   if (level === 'city') {
     return '候选城市 ' + point.name + ' · 城市目录代表点，不是照片 GPS' + score + ' · 单击选中，' + actionHint + '城市'
   }
@@ -343,8 +331,6 @@ function stageFitOptions(): FitToPointsOptions {
   switch (props.guidedStage) {
     case 'country':
       return { padding: 56, maxZoom: 5, singleZoom: 4, duration: 0 }
-    case 'admin1':
-      return { padding: 56, maxZoom: 8, singleZoom: 7, duration: 0 }
     case 'city':
       return { padding: 56, maxZoom: 11, singleZoom: 10, duration: 0 }
     case 'resolved':
@@ -357,27 +343,19 @@ function stageFitOptions(): FitToPointsOptions {
 function fallbackZoom(level: GuidedLocationLevel, resolved: boolean): number {
   if (resolved) return 12
   if (level === 'country') return 4
-  if (level === 'admin1') return 6
   return 9
 }
 
 function focusZoom(level: GuidedLocationLevel, resolved: boolean): number {
   if (resolved) return 12
   if (level === 'country') return 4
-  if (level === 'admin1') return 7
   return 10
 }
 
 function nearestConfirmedParent(): MapPoint | null {
   const stage = props.guidedStage
   const levels: GuidedLocationLevel[] =
-    stage === 'city'
-      ? ['admin1', 'country']
-      : stage === 'admin1'
-        ? ['country']
-        : stage === 'resolved'
-          ? ['city', 'admin1', 'country']
-          : []
+    stage === 'resolved' ? ['city', 'country'] : stage === 'city' ? ['country'] : []
   for (const level of levels) {
     const point = guidedMap.value.points.find(
       (candidate) => candidate.confirmed && candidate.level === level,
@@ -547,7 +525,7 @@ onBeforeUnmount(() => {
         ref="container"
         class="maplibre-map"
         role="application"
-        :aria-label="guidedMode ? '国家、省份与城市引导候选代表点交互地图' : '候选国家与城市代表点交互地图'"
+        :aria-label="guidedMode ? '国家与城市引导候选代表点交互地图' : '候选国家与城市代表点交互地图'"
       />
       <div v-if="styleConfig.demoOnly" class="map-badge demo">
         Demo 底图 · 仅开发预览，不可用于生产
@@ -564,7 +542,6 @@ onBeforeUnmount(() => {
     <div class="map-footer">
       <div v-if="guidedMode" class="map-legend">
         <span><i class="legend-dot" />国家 / 地区候选</span>
-        <span><i class="legend-dot admin1" />省份代表点</span>
         <span><i class="legend-dot city" />城市候选</span>
         <span><i class="legend-dot confirmed" />已确认路径</span>
         <span v-if="guidedMap.fallbackPoints.length"><i class="legend-dot fallback" />已确认父级范围</span>
@@ -577,7 +554,7 @@ onBeforeUnmount(() => {
       <span class="map-hint">
         {{ guidedMode
           ? (guidedConfirmationReady
-            ? '单击选中候选 · 双击确认当前层级 · 省级代表点非行政区多边形，所有坐标非照片 GPS'
+            ? '单击选中候选 · 双击确认当前层级 · 所有坐标非照片 GPS'
             : '单击选中候选 · 新增观察待核对，暂不能确认地点 · 所有坐标非照片 GPS')
           : '单击选中国家 · 双击确认国家 · 标记均为代表点，不是照片 GPS' }}
       </span>

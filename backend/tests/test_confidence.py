@@ -285,7 +285,7 @@ def test_guided_high_is_prediction_requires_explicit_confirmation(settings, monk
         "event_id": "high-explicit-confirm",
         "target": {"level": "country", "id": target_iso},
     })
-    assert confirmed["dialogue"]["stage"] == "admin1"
+    assert confirmed["dialogue"]["stage"] == "city"
     assert confirmed["confidence"] is None
     assert confirmed["action"]["payload"].get("confidence") is None
 
@@ -311,7 +311,7 @@ def test_guided_medium_bypasses_routine_review_with_top3_confirmation(settings, 
         "event_id": "medium-explicit-confirm",
         "target": {"level": "country", "id": question["target"]["id"]},
     })
-    assert confirmed["dialogue"]["stage"] == "admin1"
+    assert confirmed["dialogue"]["stage"] == "city"
     assert confirmed["confidence"] is None
 
 

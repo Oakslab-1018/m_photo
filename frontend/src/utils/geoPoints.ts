@@ -31,7 +31,6 @@ export interface GeoPoint {
   coordinateQuality?: string | null
   isCurrentCandidate?: boolean
   resolved?: boolean
-  derivedCoordinate?: boolean
 }
 
 function finite(value: unknown): number | null {
@@ -114,19 +113,14 @@ function targetLabelValue(target: LocationTarget): string {
   return label || target.id
 }
 
-function isDerivedCoordinate(target: LocationTarget): boolean {
-  return (
-    target.coordinate_source === 'admin1-largest-city-v1' ||
-    target.coordinate_quality === 'derived'
-  )
-}
-
 /**
  * Guided-map markers for the current stage plus the confirmed path.
  *
- * Markers are only emitted for real catalog coordinates. A missing admin1/city
- * coordinate is listed as missing and receives no marker. ``(0, 0)``,
- * non-finite, out-of-range, and missing pairs never become invented positions.
+ * Markers are only emitted for the public country -> city path and real
+ * catalog coordinates. Deprecated ``confirmed.admin1`` metadata is ignored.
+ * Missing city coordinates are listed as missing and receive no marker.
+ * ``(0, 0)``, non-finite, out-of-range, and missing pairs never become
+ * invented positions.
  */
 export function guidedLocationPoints(
   candidates: readonly LocationCandidate[] | undefined,
@@ -141,7 +135,7 @@ export function guidedLocationPoints(
     byKey.set(point.key, point)
   }
 
-  const confirmedLevels: GuidedLocationLevel[] = ['country', 'admin1', 'city']
+  const confirmedLevels: GuidedLocationLevel[] = ['country', 'city']
   for (const level of confirmedLevels) {
     const target = confirmedPath ? confirmedPath[level] : null
     if (!target || !guidedTargetKey(target) || !isUsableLngLat(target.lng, target.lat)) continue
@@ -163,7 +157,6 @@ export function guidedLocationPoints(
       coordinateQuality: target.coordinate_quality ?? null,
       isCurrentCandidate: false,
       resolved: stage === 'resolved' && target.level === 'city',
-      derivedCoordinate: isDerivedCoordinate(target),
       subregion: null,
     })
   }
@@ -199,7 +192,6 @@ export function guidedLocationPoints(
         coordinateQuality: target.coordinate_quality ?? null,
         isCurrentCandidate: true,
         resolved: false,
-        derivedCoordinate: isDerivedCoordinate(target),
         subregion: null,
       })
     }
@@ -213,12 +205,9 @@ export function guidedLocationPoints(
     points: ordered,
     fitPoints: ordered.filter((point) => point.isCurrentCandidate),
     currentStagePoints: ordered.filter((point) => point.isCurrentCandidate),
-    fallbackPoints: ordered.filter((point) => {
-      if (!point.confirmed) return false
-      if (stage === 'city') return point.level === 'admin1' || point.level === 'country'
-      if (stage === 'admin1') return point.level === 'country'
-      return false
-    }),
+    fallbackPoints: ordered.filter(
+      (point) => point.confirmed && stage === 'city' && point.level === 'country',
+    ),
     missingCoordinates: Array.from(missingByKey.values()),
   }
 }

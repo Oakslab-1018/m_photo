@@ -7,10 +7,17 @@ import {
   boundsForPoints,
   cityPoints,
   countryPoints,
+  guidedLocationPoints,
   isUsableLngLat,
   markerStack,
 } from '@/utils/geoPoints'
-import type { CityScore, CountryScore } from '@/types'
+import type {
+  CityScore,
+  CountryScore,
+  GuidedConfirmedPath,
+  LocationCandidate,
+  LocationTarget,
+} from '@/types'
 
 function country(overrides: Partial<CountryScore> = {}): CountryScore {
   return { iso: 'JP', name: 'Japan', name_zh: '日本', score: 0.5, lat: 36.2, lng: 138.25, ...overrides }
@@ -105,6 +112,58 @@ describe('countryPoints / cityPoints', () => {
   it('puts country markers above city markers in the overlay stack', () => {
     const stack = markerStack(countryPoints([country()], null), cityPoints([city()]))
     expect(stack.map((point) => point.kind)).toEqual(['city', 'country'])
+  })
+})
+
+describe('guidedLocationPoints', () => {
+  it('ignores deprecated admin1 path metadata while preserving city provenance', () => {
+    const japan: LocationTarget = {
+      level: 'country',
+      id: 'JP',
+      label: '日本',
+      country_iso: 'JP',
+      lat: 36.2,
+      lng: 138.25,
+    }
+    const legacyAdmin1: LocationTarget = {
+      level: 'admin1',
+      id: 'JP.01',
+      label: '北海道',
+      country_iso: 'JP',
+      admin1_id: 'JP.01',
+      lat: 43.06,
+      lng: 141.35,
+    }
+    const sapporo: LocationCandidate = {
+      target: {
+        level: 'city',
+        id: '1001',
+        label: '札幌',
+        country_iso: 'JP',
+        admin1_id: 'JP.01',
+        city_id: '1001',
+        lat: 43.06,
+        lng: 141.35,
+      },
+      score: 0.7,
+    }
+    const path = {
+      country: japan,
+      admin1: legacyAdmin1,
+      city: null,
+    } satisfies GuidedConfirmedPath
+
+    const result = guidedLocationPoints(
+      [sapporo, { target: legacyAdmin1, score: 0.9 }],
+      path,
+      'city',
+    )
+
+    expect(result.points.map((point) => point.key)).toEqual(['country:JP', 'city:1001'])
+    expect(result.points.some((point) => point.level === 'admin1')).toBe(false)
+    expect(result.fallbackPoints.map((point) => point.key)).toEqual(['country:JP'])
+    expect(result.missingCoordinates).toEqual([])
+    expect(result.points.find((point) => point.level === 'city')?.target?.admin1_id).toBe('JP.01')
   })
 })
 
