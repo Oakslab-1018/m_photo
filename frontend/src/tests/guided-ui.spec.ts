@@ -109,6 +109,12 @@ describe('GuidedDialoguePanel review box', () => {
     )
 
     expect(countryHtml).toContain('1 / 2 · 当前步骤')
+    expect(countryHtml).toContain('<details class="guided-dock-details"')
+    expect(countryHtml).not.toMatch(/<details class="guided-dock-details"[^>]*\sopen/)
+    expect(countryHtml.match(/id="guided-stage-heading"/g)).toHaveLength(1)
+    expect(countryHtml).not.toContain('引导定位')
+    expect(countryHtml).not.toContain('guided-task-pill')
+    expect(countryHtml).not.toContain('guided-kicker')
     expect(html).toContain('国家 / 地区')
     expect(html).toContain('城市')
     expect(html).toContain('日本')
@@ -375,9 +381,18 @@ describe('GuidedDialoguePanel review box', () => {
       }),
     )
 
-    expect(cityHtml).toContain('返回上一步：国家 / 地区')
+    const cityDisclosure = cityHtml.match(
+      /<details class="guided-dock-details"[^>]*>[\s\S]*?<\/details>/,
+    )?.[0]
+    const resolvedDisclosure = resolvedHtml.match(
+      /<details class="guided-dock-details"[^>]*>[\s\S]*?<\/details>/,
+    )?.[0]
+    expect(cityDisclosure).toContain('返回上一步：国家 / 地区')
+    expect(cityDisclosure).toContain('日本')
+    expect(cityDisclosure).toContain('已确认路径')
     expect(cityHtml).not.toContain('返回上一步：城市')
-    expect(resolvedHtml).toContain('返回上一步：城市')
+    expect(resolvedDisclosure).toContain('返回上一步：城市')
+    expect(resolvedDisclosure).toContain('2 / 2 · 已完成')
     expect(resolvedHtml).toContain('最终结果')
     expect(resolvedHtml).toContain('2 / 2 · 已完成')
     expect(resolvedHtml).not.toContain('省份')
@@ -646,9 +661,15 @@ describe('GuidedDialoguePanel utilities', () => {
       },
     )
 
-    expect(html).toContain('guided-task-message')
-    expect(html).toContain('最新助手提示')
-    expect(html).toContain('请结合照片中的道路方向和地名，确认城市候选。')
+    const disclosure = html.match(
+      /<details class="guided-dock-details"[^>]*>[\s\S]*?<\/details>/,
+    )?.[0]
+    expect(html).toContain('<details class="guided-dock-details"')
+    expect(html).not.toMatch(/<details class="guided-dock-details"[^>]*\sopen/)
+    expect(html.match(/class="guided-dock-details"/g)).toHaveLength(1)
+    expect(disclosure).toContain('guided-task-message')
+    expect(disclosure).toContain('最新助手提示')
+    expect(disclosure).toContain('请结合照片中的道路方向和地名，确认城市候选。')
     expect(html).not.toContain('guided-composer-assistant')
     expect(html).not.toContain('guided-composer-head')
   })
@@ -681,17 +702,26 @@ describe('GuidedDialoguePanel utilities', () => {
     expect(html.indexOf('札幌')).toBeLessThan(html.indexOf('小樽'))
   })
 
-  it('keeps one sticky task header, one scroll panel, and a compact external composer', () => {
+  it('keeps one compact disclosure header in normal flow and a compact external composer', () => {
     const source = readFileSync(
       new URL('../components/GuidedDialoguePanel.vue', import.meta.url),
       'utf8',
     )
+    const detailsBodyCss = source.match(/\.guided-dock-details-body\s*\{([^}]*)\}/s)?.[1] ?? ''
 
     expect(source).toContain('class="guided-dock-header"')
-    expect(source).toMatch(/\.guided-dock-header\s*\{[^}]*position:\s*sticky;/s)
-    expect(source).toMatch(/\.guided-panel\s*\{[^}]*overflow-y:\s*auto;/s)
+    expect(source).toContain('<details class="guided-dock-details">')
+    expect(source).toMatch(/\.guided-dock-header\s*\{[^}]*position:\s*relative;/s)
+    expect(source).not.toMatch(/\.guided-dock-header\s*\{[^}]*position:\s*sticky;/s)
+    expect(source).toMatch(/\.guided-dock-summary\s*\{[^}]*min-height:\s*44px;/s)
+    expect(source).toMatch(/\.guided-panel\s*\{[^}]*overflow-y:\s*auto;[^}]*scroll-padding-top:\s*8px;/s)
     expect(source).toMatch(/\.guided-composer\s*\{[^}]*flex:\s*0 0 auto;/s)
-    expect(source).toMatch(/\.guided-path\s*\{[^}]*display:\s*flex;[^}]*flex-direction:\s*row;/s)
+    expect(source).toMatch(/\.guided-path\s*\{[^}]*display:\s*grid;/s)
+    expect(detailsBodyCss).not.toContain('overflow')
+    expect(source).not.toContain('ResizeObserver')
+    expect(source).not.toContain('guided-header-height')
+    expect(source).not.toContain('guided-kicker')
+    expect(source).not.toContain('guided-task-pill')
     expect(source).not.toContain('guided-composer-head')
     expect(source).not.toContain('看到新线索？随时补充')
   })

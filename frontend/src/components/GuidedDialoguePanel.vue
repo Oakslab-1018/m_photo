@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 import { AnimatePresence, motion, useReducedMotion } from 'motion-v'
 import PlaceMatchEvidence from '@/components/PlaceMatchEvidence.vue'
 import type {
@@ -127,23 +127,6 @@ const reduceMotion = useReducedMotion()
 const enterState = computed(() => (reduceMotion.value ? false : { opacity: 0, y: 6 }))
 const enterTarget = { opacity: 1, y: 0 }
 const enterTransition = { duration: 0.22, ease: [0.2, 0.7, 0.2, 1] as const }
-let headerResizeObserver: ResizeObserver | null = null
-
-// Native focus/scrollIntoView must leave controls below the sticky task header.
-onMounted(() => {
-  const panel = panelRef.value
-  const header = panel?.querySelector<HTMLElement>('.guided-dock-header')
-  if (!panel || !header) return
-  const measureHeader = () => {
-    panel.style.setProperty('--guided-header-height', `${Math.ceil(header.getBoundingClientRect().height) + 8}px`)
-  }
-  measureHeader()
-  if (typeof ResizeObserver !== 'undefined') {
-    headerResizeObserver = new ResizeObserver(measureHeader)
-    headerResizeObserver.observe(header)
-  }
-})
-onBeforeUnmount(() => headerResizeObserver?.disconnect())
 const searchInputRef = ref<HTMLInputElement | null>(null)
 const questionSectionRef = ref<HTMLElement | null>(null)
 const candidateSectionRef = ref<HTMLElement | null>(null)
@@ -270,6 +253,7 @@ const progressText = computed(() => {
   const current = GUIDED_STEPS.findIndex((step) => step.level === stage.value)
   return `${Math.max(1, current + 1)} / ${GUIDED_STEPS.length} · 当前步骤`
 })
+const compactProgressText = computed(() => progressText.value.split(' · ')[0])
 
 const pathSteps = computed(() =>
   GUIDED_STEPS.map((step) => ({
@@ -424,9 +408,7 @@ function scrollPanelTo(target: HTMLElement | null): void {
   if (!panel || !target) return
   const panelRect = panel.getBoundingClientRect()
   const targetRect = target.getBoundingClientRect()
-  const header = panel.querySelector<HTMLElement>('.guided-dock-header')
-  const headerOffset = header?.offsetHeight ?? 0
-  const nextTop = panel.scrollTop + targetRect.top - panelRect.top - headerOffset
+  const nextTop = panel.scrollTop + targetRect.top - panelRect.top - 8
   const maxTop = Math.max(0, panel.scrollHeight - panel.clientHeight)
   panel.scrollTop = Math.min(Math.max(0, nextTop), maxTop)
 }
@@ -511,85 +493,76 @@ watch(stage, (nextStage, previousStage) => {
   <section class="guided-dialogue-shell">
     <div ref="panelRef" class="guided-panel">
       <header class="guided-dock-header">
-        <div class="guided-panel-head">
-          <div class="guided-title-block">
-            <span class="guided-kicker">引导定位</span>
-            <div class="guided-title-row">
-              <h2 id="guided-stage-heading">{{ stageTitle }}</h2>
-              <motion.span
-                :key="currentTaskLabel"
-                class="guided-task-pill"
-                role="status"
-                aria-live="polite"
-                :initial="enterState"
-                :animate="enterTarget"
-                :transition="enterTransition"
+        <details class="guided-dock-details">
+          <summary
+            class="guided-dock-summary"
+            :aria-label="`${stageTitle}，${progressText}，查看路径和助手详情`"
+          >
+            <h2 id="guided-stage-heading">{{ stageTitle }}</h2>
+            <span class="guided-progress" aria-hidden="true">{{ compactProgressText }}</span>
+            <span class="guided-details-toggle" aria-hidden="true">详情</span>
+          </summary>
+
+          <div class="guided-dock-details-body">
+            <div class="guided-details-heading">
+              <span>{{ progressText }}</span>
+              <span role="status" aria-live="polite">{{ currentTaskLabel }}</span>
+            </div>
+
+            <div v-if="previousLevel && dialogue" class="guided-details-backtrack">
+              <button
+                type="button"
+                class="ghost-btn guided-back-btn"
+                :disabled="busy"
+                :title="`回到上一层级：${locationLevelLabel(previousLevel)}（保留其他证据与排除）`"
+                @click="emit('backtrack', previousLevel)"
               >
-                {{ currentTaskLabel }}
-              </motion.span>
+                返回上一步：{{ locationLevelLabel(previousLevel) }}
+              </button>
+            </div>
+
+            <ol class="guided-path" aria-label="已确认路径">
+              <li
+                v-for="(step, index) in pathSteps"
+                :key="step.level"
+                :class="`is-${step.state}`"
+              >
+                <span class="guided-step-index" aria-hidden="true">{{ index + 1 }}</span>
+                <span class="guided-step-main">
+                  <span class="guided-step-label">{{ step.label }}</span>
+                  <strong>{{ step.target ? targetLabel(step.target) : '待确认' }}</strong>
+                </span>
+                <button
+                  v-if="step.target && !busy"
+                  type="button"
+                  class="guided-backtrack-btn"
+                  :title="`返回${step.label}会清除后续确认`"
+                  :aria-label="`返回${step.label}，会清除后续确认`"
+                  @click="requestBacktrack(step.level)"
+                >
+                  返回
+                </button>
+              </li>
+            </ol>
+
+            <div v-if="dialogue && latestAssistantMessage" class="guided-task-message">
+              <span class="guided-task-message-label">最新助手提示</span>
+              <p>{{ latestAssistantMessage }}</p>
+            </div>
+
+            <div v-if="backtrackPrompt" class="guided-backtrack-confirm" role="alert">
+              <span>后续已确认层级会被清除，继续？</span>
+              <div>
+                <button type="button" class="ghost-btn" :disabled="busy" @click="backtrackPrompt = null">
+                  取消
+                </button>
+                <button type="button" class="mini-btn reject" :disabled="busy" @click="confirmBacktrack">
+                  确认返回
+                </button>
+              </div>
             </div>
           </div>
-          <div class="guided-panel-head-actions">
-            <span class="guided-progress">{{ progressText }}</span>
-            <button
-              v-if="previousLevel && dialogue"
-              type="button"
-              class="ghost-btn guided-back-btn"
-              :disabled="busy"
-              :title="`回到上一层级：${locationLevelLabel(previousLevel)}（保留其他证据与排除）`"
-              @click="emit('backtrack', previousLevel)"
-            >
-              返回上一步：{{ locationLevelLabel(previousLevel) }}
-            </button>
-          </div>
-        </div>
-
-        <ol class="guided-path" aria-label="已确认路径">
-          <li
-            v-for="(step, index) in pathSteps"
-            :key="step.level"
-            :class="`is-${step.state}`"
-          >
-            <span class="guided-step-index" aria-hidden="true">{{ index + 1 }}</span>
-            <span class="guided-step-main">
-              <span class="guided-step-label">{{ step.label }}</span>
-              <strong>{{ step.target ? targetLabel(step.target) : '待确认' }}</strong>
-            </span>
-            <button
-              v-if="step.target && !busy"
-              type="button"
-              class="guided-backtrack-btn"
-              :title="`返回${step.label}会清除后续确认`"
-              :aria-label="`返回${step.label}，会清除后续确认`"
-              @click="requestBacktrack(step.level)"
-            >
-              返回
-            </button>
-          </li>
-        </ol>
-
-        <details
-          v-if="dialogue && latestAssistantMessage"
-          class="guided-task-message"
-        >
-          <summary>
-            <span class="guided-task-message-label">最新助手提示</span>
-            <span class="guided-task-message-toggle" aria-hidden="true">详情</span>
-          </summary>
-          <p>{{ latestAssistantMessage }}</p>
         </details>
-
-        <div v-if="backtrackPrompt" class="guided-backtrack-confirm" role="alert">
-          <span>后续已确认层级会被清除，继续？</span>
-          <div>
-            <button type="button" class="ghost-btn" :disabled="busy" @click="backtrackPrompt = null">
-              取消
-            </button>
-            <button type="button" class="mini-btn reject" :disabled="busy" @click="confirmBacktrack">
-              确认返回
-            </button>
-          </div>
-        </div>
       </header>
 
       <div class="guided-main">
@@ -1124,85 +1097,56 @@ watch(stage, (nextStage, previousStage) => {
   overscroll-behavior: contain;
   scrollbar-gutter: stable;
   scroll-behavior: smooth;
-  scroll-padding-top: var(--guided-header-height, 160px);
+  scroll-padding-top: 8px;
   padding: 0;
   background: transparent;
 }
 
 .guided-dock-header {
-  position: sticky;
-  top: 0;
-  z-index: 20;
-  display: grid;
-  gap: 8px;
-  padding: 12px 16px;
+  position: relative;
+  z-index: auto;
+  padding: 0;
   border-bottom: 1px solid var(--guided-line);
-  border-radius: 0;
-  background: rgba(13, 21, 25, 0.985);
-  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.24);
-  backdrop-filter: blur(14px);
+  background: transparent;
 }
 
-.guided-panel-head {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 10px;
+.guided-dock-details {
+  margin: 0;
+  border: 0;
+  background: transparent;
 }
 
-.guided-title-block {
-  min-width: 0;
-}
-
-.guided-title-row {
-  display: flex;
-  flex-wrap: wrap;
+.guided-dock-summary {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
   align-items: center;
-  gap: 5px 8px;
-  margin-top: 1px;
+  gap: 8px;
+  min-height: 44px;
+  margin: 0;
+  padding: 6px 16px;
+  color: var(--guided-muted);
+  list-style: none;
+  cursor: pointer;
 }
 
-.guided-kicker {
-  display: block;
+.guided-dock-summary::-webkit-details-marker {
+  display: none;
+}
+
+.guided-dock-summary:hover h2 {
   color: var(--guided-teal);
-  font-family: var(--font-mono);
-  font-size: 13px;
-  font-weight: 400;
-  line-height: 20px;
-  letter-spacing: 0.08em;
 }
 
-.guided-panel-head h2 {
+.guided-dock-summary h2 {
+  overflow: hidden;
   margin: 0;
   color: var(--guided-ink);
-  font-size: 18px;
+  font-size: 15px;
   font-weight: 700;
-  line-height: 28px;
+  line-height: 22px;
   letter-spacing: -0.005em;
-}
-
-.guided-task-pill {
-  display: inline-flex;
-  align-items: center;
-  min-height: 24px;
-  padding: 3px 8px;
-  border: 1px solid var(--guided-line);
-  border-radius: 3px;
-  color: var(--guided-muted);
-  background: transparent;
-  font-family: var(--font-mono);
-  font-size: 13px;
-  font-weight: 400;
-  line-height: 20px;
+  text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.guided-panel-head-actions {
-  display: flex;
-  flex: 0 0 auto;
-  flex-direction: column;
-  align-items: flex-end;
-  gap: 4px;
 }
 
 .guided-progress {
@@ -1215,16 +1159,70 @@ watch(stage, (nextStage, previousStage) => {
   white-space: nowrap;
 }
 
+.guided-details-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding-left: 8px;
+  border-left: 1px solid var(--guided-line);
+  color: var(--guided-teal);
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 20px;
+  white-space: nowrap;
+}
+
+.guided-details-toggle::after {
+  content: "▾";
+  color: var(--faint);
+  font-size: 10px;
+  line-height: 1;
+  transition: transform 0.16s ease;
+}
+
+.guided-dock-details[open] .guided-details-toggle::after {
+  transform: rotate(180deg);
+}
+
+.guided-dock-details-body {
+  display: grid;
+  gap: 9px;
+  padding: 8px 16px 14px;
+  border-top: 1px solid var(--guided-line);
+  background: transparent;
+}
+
+.guided-details-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--faint);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 18px;
+}
+
+.guided-details-heading [role="status"] {
+  overflow-wrap: anywhere;
+  color: var(--guided-muted);
+  text-align: right;
+}
+
+.guided-details-backtrack {
+  display: flex;
+}
+
 .guided-back-btn {
-  min-height: 32px;
+  min-height: 30px;
   padding: 4px 8px;
   border-color: var(--guided-line);
   border-radius: 4px;
   color: var(--guided-muted);
-  font-size: 14px;
+  font-size: 13px;
   font-weight: 400;
   line-height: 20px;
-  white-space: nowrap;
 }
 
 .guided-back-btn:hover:not(:disabled) {
@@ -1234,56 +1232,30 @@ watch(stage, (nextStage, previousStage) => {
 }
 
 .guided-path {
-  display: flex;
-  flex-direction: row;
-  align-items: stretch;
-  gap: 8px;
+  display: grid;
+  gap: 0;
   margin: 0;
   padding: 0;
   list-style: none;
 }
 
 .guided-path li {
-  position: relative;
-  display: flex;
-  flex: 1 1 0;
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr) auto;
   align-items: center;
   gap: 8px;
   min-width: 0;
-  min-height: 50px;
+  min-height: 30px;
   margin: 0;
-  padding: 6px 10px;
-  border: 1px solid var(--guided-line);
-  border-radius: 6px;
-  background: rgba(255, 255, 255, 0.018);
+  padding: 4px 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
   opacity: 1;
 }
 
-.guided-path li:not(:last-child)::after {
-  content: "";
-  position: absolute;
-  right: -7px;
-  top: 50%;
-  z-index: 1;
-  width: 7px;
-  height: 1px;
-  background: var(--guided-line-strong);
-  transform: translateY(-50%);
-  pointer-events: none;
-}
-
-.guided-path li.is-current {
-  border-color: var(--amber-line);
-  background: var(--guided-teal-soft);
-}
-
-.guided-path li.is-done {
-  border-color: var(--sage-line);
-  background: var(--sage-soft);
-}
-
-.guided-path li.is-pending {
-  opacity: 1;
+.guided-path li + li {
+  border-top: 1px solid var(--guided-line);
 }
 
 .guided-path li.is-pending .guided-step-main strong {
@@ -1292,19 +1264,18 @@ watch(stage, (nextStage, previousStage) => {
 
 .guided-step-index {
   display: inline-flex;
-  flex: 0 0 auto;
   align-items: center;
   justify-content: center;
-  width: 26px;
-  height: 26px;
+  width: 20px;
+  height: 20px;
   border: 1px solid var(--guided-line-strong);
   border-radius: 3px;
   color: var(--guided-muted);
   background: transparent;
   font-family: var(--font-mono);
-  font-size: 13px;
-  line-height: 20px;
+  font-size: 11px;
   font-weight: 400;
+  line-height: 18px;
 }
 
 .guided-path li.is-done .guided-step-index {
@@ -1320,25 +1291,27 @@ watch(stage, (nextStage, previousStage) => {
 }
 
 .guided-step-main {
-  display: flex;
-  flex: 1 1 auto;
-  flex-direction: column;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: baseline;
+  gap: 8px;
   min-width: 0;
 }
 
 .guided-step-label {
   color: var(--faint);
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 400;
-  line-height: 20px;
+  line-height: 18px;
+  white-space: nowrap;
 }
 
 .guided-step-main strong {
   overflow: hidden;
   color: var(--guided-ink);
-  font-size: 15px;
+  font-size: 13px;
   font-weight: 600;
-  line-height: 22px;
+  line-height: 18px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -1346,15 +1319,15 @@ watch(stage, (nextStage, previousStage) => {
 .guided-backtrack-btn,
 .guided-link-btn {
   flex: 0 0 auto;
-  min-height: 22px;
+  min-height: 20px;
   padding: 1px 2px;
   border: 0;
   border-radius: 3px;
   color: var(--guided-teal);
   background: transparent;
-  font-size: 14px;
+  font-size: 13px;
   font-weight: 400;
-  line-height: 20px;
+  line-height: 18px;
   cursor: pointer;
 }
 
@@ -1372,63 +1345,28 @@ watch(stage, (nextStage, previousStage) => {
 }
 
 .guided-task-message {
-  overflow: hidden;
   margin: 0;
-  padding-left: 8px;
-  border: 0;
-  border-left: 2px solid var(--amber-line);
-  border-radius: 0;
+  padding: 8px 0 0;
+  border-top: 1px solid var(--guided-line);
   background: transparent;
 }
 
-.guided-task-message summary {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  min-height: 28px;
-  padding: 2px 0;
-  color: var(--guided-muted);
-  font-size: 14px;
-  font-weight: 400;
-  line-height: 20px;
-  cursor: pointer;
-  list-style: none;
-}
-
-.guided-task-message summary::-webkit-details-marker,
-.guided-candidate-detail summary::-webkit-details-marker {
-  display: none;
-}
-
 .guided-task-message-label {
+  display: block;
   color: var(--amber);
   font-family: var(--font-mono);
-  font-size: 13px;
-  line-height: 20px;
+  font-size: 12px;
   font-weight: 400;
+  line-height: 18px;
   letter-spacing: 0.04em;
 }
 
-.guided-task-message-toggle {
-  flex: 0 0 auto;
-  color: var(--faint);
+.guided-task-message p {
+  margin: 2px 0 0;
+  color: var(--guided-muted);
   font-size: 13px;
   font-weight: 400;
-  line-height: 20px;
-}
-
-.guided-task-message[open] .guided-task-message-toggle {
-  color: var(--guided-ink);
-}
-
-.guided-task-message p {
-  margin: 0;
-  padding: 0 0 8px;
-  color: var(--guided-muted);
-  font-size: 14px;
-  font-weight: 400;
-  line-height: 20px;
+  line-height: 19px;
   overflow-wrap: anywhere;
 }
 
@@ -1437,9 +1375,9 @@ watch(stage, (nextStage, previousStage) => {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  padding: 12px;
+  padding: 8px;
   border: 1px solid var(--coral-line);
-  border-radius: 5px;
+  border-radius: 4px;
   color: var(--guided-danger);
   background: var(--coral-soft);
   font-size: 13px;
@@ -1455,9 +1393,9 @@ watch(stage, (nextStage, previousStage) => {
 
 .guided-backtrack-confirm .ghost-btn,
 .guided-backtrack-confirm .mini-btn {
-  min-height: 36px;
-  padding: 8px 12px;
-  font-size: 14px;
+  min-height: 32px;
+  padding: 6px 10px;
+  font-size: 13px;
   font-weight: 400;
   line-height: 20px;
 }
@@ -2398,38 +2336,35 @@ watch(stage, (nextStage, previousStage) => {
     border-radius: 0;
   }
 
-  .guided-dock-header {
+  .guided-dock-summary {
     gap: 6px;
-    padding: 8px 10px;
-    border-radius: 0;
+    min-height: 42px;
+    padding: 5px 10px;
   }
 
-  .guided-panel-head {
-    gap: 7px;
+  .guided-dock-summary h2 {
+    font-size: 14px;
+    line-height: 20px;
   }
 
   .guided-progress {
     padding-inline: 0;
+    font-size: 12px;
   }
 
-  .guided-back-btn {
-    max-width: 132px;
-    overflow: hidden;
-    text-overflow: ellipsis;
+  .guided-details-toggle {
+    gap: 3px;
+    padding-left: 6px;
+    font-size: 12px;
   }
 
-  .guided-path {
-    gap: 5px;
+  .guided-dock-details-body {
+    gap: 8px;
+    padding: 7px 10px 12px;
   }
 
-  .guided-path li {
-    gap: 5px;
-    padding: 4px;
-  }
-
-  .guided-path li:not(:last-child)::after {
-    right: -5px;
-    width: 5px;
+  .guided-step-main {
+    gap: 6px;
   }
 
   .guided-main {
@@ -2475,8 +2410,14 @@ watch(stage, (nextStage, previousStage) => {
 }
 
 @media (max-width: 360px) {
-  .guided-task-pill {
-    white-space: normal;
+  .guided-dock-summary {
+    gap: 5px;
+    padding-inline: 8px;
+  }
+
+  .guided-step-main {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0;
   }
 
   .guided-backtrack-btn {
