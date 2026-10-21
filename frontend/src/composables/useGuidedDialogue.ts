@@ -82,6 +82,8 @@ function buildEvent(
   if (input.value !== undefined) event.value = input.value
   if (input.text !== undefined) event.text = input.text
   if (input.level !== undefined) event.level = input.level
+  if (input.report_id !== undefined) event.report_id = input.report_id
+  if (input.observation_id !== undefined) event.observation_id = input.observation_id
   return event
 }
 
@@ -120,6 +122,8 @@ function describePendingOperation(
       return { kind: event.type, label: '正在返回上一层级…' }
     case 'free_text':
       return { kind: event.type, label: '正在解析补充线索…' }
+    case 'adopt_observation':
+      return { kind: event.type, label: '正在确认 OCR 文字并检索地点…' }
     default:
       return { kind: event.type, label: '正在提交引导操作…' }
   }
@@ -150,6 +154,11 @@ function validateEvent(input: GuidedEventInput): string | null {
       return null
     case 'free_text':
       if (!input.text?.trim()) return '请输入文字线索或目录名称。'
+      return null
+    case 'adopt_observation':
+      if (!input.report_id?.trim() || !input.observation_id?.trim()) {
+        return '缺少区域报告或 OCR 观察。'
+      }
       return null
   }
 }
@@ -822,6 +831,58 @@ export function useGuidedDialogue(
   }
 
   /**
+   * Adopt one backend-stored OCR observation. The text itself is never sent;
+   * report_id + observation_id are the only evidence identity.
+   */
+  async function adoptObservation(reportId: string, observationId: string): Promise<boolean> {
+    const report = reportId.trim()
+    const observation = observationId.trim()
+    if (!report || !observation) {
+      error.value = '缺少区域报告或 OCR 观察。'
+      return false
+    }
+
+    if (!active.value || !dialogue.value) {
+      if (loading.value || applying.value) {
+        error.value = '引导状态正在初始化，请稍后再试。'
+        return false
+      }
+      const target = sessionId.value
+      if (target === null || target === undefined) {
+        error.value = '当前没有会话，请先上传图片。'
+        return false
+      }
+      const started = await start(target)
+      if (!started) return false
+      if (
+        !active.value ||
+        !dialogue.value ||
+        activeSessionId.value !== target ||
+        sessionId.value !== target
+      ) {
+        return false
+      }
+    }
+
+    return send({
+      type: 'adopt_observation',
+      report_id: report,
+      observation_id: observation,
+    })
+  }
+
+  /** True only while this exact adoption event retains a reusable event_id. */
+  function isRetryableAdoption(reportId: string, observationId: string): boolean {
+    const event = failedEvent.value
+    return (
+      canRetry.value &&
+      event?.type === 'adopt_observation' &&
+      event.report_id === reportId &&
+      event.observation_id === observationId
+    )
+  }
+
+  /**
    * Manual retry preserves the original event_id and refreshes expected_revision.
    *
    * A 409 is defined as no mutation, so this is a deliberate retry against the
@@ -907,6 +968,8 @@ export function useGuidedDialogue(
     reviewBack,
     backtrackPrevious,
     freeText,
+    adoptObservation,
+    isRetryableAdoption,
   }
 }
 

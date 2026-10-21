@@ -545,6 +545,7 @@ export type GuidedEventType =
   | 'retract'
   | 'backtrack'
   | 'free_text'
+  | 'adopt_observation'
 
 /** Event sent to the authoritative dialogue endpoint. */
 export interface GuidedEventPayload {
@@ -557,12 +558,35 @@ export interface GuidedEventPayload {
   value?: string
   text?: string
   level?: GuidedLocationLevel
+  report_id?: string
+  observation_id?: string
 }
 
 export interface GuidedEventReceipt {
   event_id: string
   status: string
   summary?: string | null
+}
+
+/** UI-only adoption request. Observation text is resolved from stored reports and never sent. */
+export interface ObservationAdoptionRequest {
+  report_id: string
+  observation_id: string
+}
+
+export type ObservationAdoptionStatus =
+  | 'pending'
+  | 'applied'
+  | 'unchanged'
+  | 'unconfirmed'
+  | 'failed'
+
+/** Per-observation adoption state; receipt is snapshotted for this exact event. */
+export interface ObservationAdoptionSubmission extends ObservationAdoptionRequest {
+  text: string
+  status: ObservationAdoptionStatus
+  receipt?: GuidedEventReceipt | null
+  error?: string | null
 }
 
 /** Every guided endpoint returns this envelope. */

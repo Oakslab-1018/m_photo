@@ -6,6 +6,7 @@ SQLAlchemy session (typically the request-scoped session from
 :mod:`backend.app.deps`) and exposes:
 
 * :meth:`GeoCatalogStore.get_place` - exact lookup by ``(level, place_id)``
+* :meth:`GeoCatalogStore.get_places` - bounded batch lookup by stable IDs
 * :meth:`GeoCatalogStore.revisions` - source fingerprints + import version
 * :meth:`GeoCatalogStore.query_places` - bounded, scoped, paginated queries
 * :meth:`GeoCatalogStore.admin1_rows` / :meth:`GeoCatalogStore.city_rows` -
@@ -22,7 +23,7 @@ stable per scope; city rows order by population (desc) then numeric id.
 from __future__ import annotations
 
 import unicodedata
-from typing import Any
+from typing import Any, Sequence
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -40,6 +41,7 @@ from .geo_catalog_models import LEVELS, GeoCatalogSource, GeoPlace
 #: router must never expose an unbounded city query).
 QUERY_DEFAULT_LIMIT = 500
 QUERY_MAX_LIMIT = 2000
+BATCH_PLACE_IDS_MAX = 500
 
 BBox = tuple[float, float, float, float]
 
@@ -128,6 +130,37 @@ class GeoCatalogStore:
                 GeoPlace.level == level, GeoPlace.place_id == place_id
             )
         ).scalar_one_or_none()
+
+    def get_places(self, level: str, place_ids: Sequence[str]) -> tuple[GeoPlace, ...]:
+        """Return known rows for stable IDs, preserving request order.
+
+        The batch is bounded by :data:`BATCH_PLACE_IDS_MAX`; unknown IDs are
+        omitted rather than fabricated. This is used by local alias indexes
+        whose IDs are stable but whose rows may lag behind the label snapshot.
+        """
+
+        _check_level(level)
+        if isinstance(place_ids, (str, bytes)):
+            raise ValueError("place_ids must be a sequence of strings")
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for place_id in place_ids:
+            if not isinstance(place_id, str) or not place_id:
+                raise ValueError("place_ids must contain non-empty strings")
+            if place_id not in seen:
+                normalized.append(place_id)
+                seen.add(place_id)
+        if len(normalized) > BATCH_PLACE_IDS_MAX:
+            raise ValueError(f"place_ids must contain at most {BATCH_PLACE_IDS_MAX} IDs")
+        if not normalized:
+            return ()
+        rows = self._session.execute(
+            select(GeoPlace).where(
+                GeoPlace.level == level, GeoPlace.place_id.in_(normalized)
+            )
+        ).scalars()
+        by_id = {place.place_id: place for place in rows}
+        return tuple(by_id[place_id] for place_id in normalized if place_id in by_id)
 
     def revisions(self) -> dict[str, str | None]:
         """Return ``countries``/``admin1``/``cities`` fingerprints + version.
@@ -334,6 +367,7 @@ class GeoCatalogStore:
 
 
 __all__ = [
+    "BATCH_PLACE_IDS_MAX",
     "GeoCatalogStore",
     "QUERY_DEFAULT_LIMIT",
     "QUERY_MAX_LIMIT",

@@ -108,7 +108,9 @@ class StreetClipPredictor:
         self._torch: Any = None
         self._inference_lock = threading.Lock()
         self._city_cache_lock = threading.Lock()
-        self._city_cache: "OrderedDict[str, tuple[tuple[int, ...], np.ndarray]]" = OrderedDict()
+        self._city_cache: "OrderedDict[tuple[str, tuple[int, ...]], np.ndarray]" = (
+            OrderedDict()
+        )
         self._city_locks: dict[str, threading.Lock] = {}
         self._city_cache_limit = max(1, int(CITY_TEXT_FEATURE_CACHE_COUNTRIES))
         self._scene_cache_lock = threading.Lock()
@@ -412,21 +414,22 @@ class StreetClipPredictor:
         cities: tuple[City, ...],
         country_name: str,
     ) -> np.ndarray:
-        """Return normalized per-city prototypes, cached per country (bounded)."""
+        """Return normalized per-city prototypes, cached per exact city set."""
         iso = country_iso.strip().upper()
         city_ids = tuple(city.city_id for city in cities)
+        cache_key = (iso, city_ids)
         with self._city_cache_lock:
-            cached = self._city_cache.get(iso)
-            if cached is not None and cached[0] == city_ids:
-                self._city_cache.move_to_end(iso)
-                return cached[1]
+            cached = self._city_cache.get(cache_key)
+            if cached is not None:
+                self._city_cache.move_to_end(cache_key)
+                return cached
             lock = self._city_locks.setdefault(iso, threading.Lock())
         with lock:
             with self._city_cache_lock:
-                cached = self._city_cache.get(iso)
-                if cached is not None and cached[0] == city_ids:
-                    self._city_cache.move_to_end(iso)
-                    return cached[1]
+                cached = self._city_cache.get(cache_key)
+                if cached is not None:
+                    self._city_cache.move_to_end(cache_key)
+                    return cached
             prompts: list[str] = []
             for city in cities:
                 prompts.extend(render_city_prompts(city, country_name))
@@ -435,8 +438,8 @@ class StreetClipPredictor:
             averaged = per_city.mean(axis=1)
             prototypes = _l2_normalize_numpy(averaged)
             with self._city_cache_lock:
-                self._city_cache[iso] = (city_ids, prototypes)
-                self._city_cache.move_to_end(iso)
+                self._city_cache[cache_key] = prototypes
+                self._city_cache.move_to_end(cache_key)
                 while len(self._city_cache) > self._city_cache_limit:
                     self._city_cache.popitem(last=False)
             return prototypes

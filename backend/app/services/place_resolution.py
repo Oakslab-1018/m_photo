@@ -1,11 +1,11 @@
 """Turn literal user place text into catalog city evidence.
 
 The resolver never accepts an external provider's identity or coordinates as a
-map target.  It first performs exact matching against the authoritative scoped
-city catalog, then (only when necessary) asks the configured bounded provider
-for locality names and maps those names back to catalog rows.  Ambiguity is a
-first-class result and is never resolved by population, provider rank or
-nearest-city guesses.
+map target. It first performs exact matching against the authoritative scoped
+city catalog and the local Chinese-name stable-ID index, then (only when
+necessary) asks the configured bounded provider for locality names and maps
+those names back to catalog rows. Ambiguity is a first-class result and is never
+resolved by population, provider rank or nearest-city guesses.
 """
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any, Callable, Mapping, Protocol, Sequence
 
 from ..domain.geolocation.country_policy import canonical_country_iso, normalize_iso
 from .city_catalog import CityRow
+from .city_labels import city_ids_for_name_zh
 from .geocoding import (
     GeocoderHit,
     GeocoderRequest,
@@ -23,7 +24,7 @@ from .geocoding import (
     PlaceGeocoder,
 )
 
-_RESOLUTION_VERSION = 1
+_RESOLUTION_VERSION = 2
 _MAX_TERMS = 4
 _MAX_EXACT_QUERY_LIMIT = 2000
 _LOCATIVE_MARKERS = (
@@ -39,9 +40,9 @@ _LOCATION_SUFFIXES = (
 
 def _external_search_allowed(mentions: Sequence[MentionLike]) -> bool:
     for mention in mentions:
-        # LLM terms have already passed literal-quote and assertion validation.
-        # They may be translated city names or POIs with no generic road suffix.
-        if getattr(mention, "parser", "") == "deepseek":
+        # LLM terms and explicitly adopted OCR text have already passed literal
+        # validation. They may be POIs with no generic road/store suffix.
+        if getattr(mention, "parser", "") in {"deepseek", "ocr_adopted"}:
             return True
         quote = str(getattr(mention, "quote", "") or "").casefold()
         if any(marker in quote for marker in _LOCATIVE_MARKERS):
@@ -117,6 +118,51 @@ def _normalize_text(value: object) -> str:
     return "".join(character for character in text if character.isalnum())
 
 
+def _unavailable_notice(error: GeocodingUnavailable) -> str:
+    reason = str(getattr(error, "reason", "unavailable") or "unavailable")
+    status = getattr(error, "status_code", None)
+    cooldown = bool(getattr(error, "cooldown", False))
+    if reason == "connect_timeout":
+        summary = "地名检索连接超时（ConnectTimeout）"
+    elif reason == "read_timeout":
+        summary = "地名检索响应超时（ReadTimeout）"
+    elif reason == "timeout":
+        summary = "地名检索超时"
+    elif reason == "connect_error":
+        summary = "地名检索网络连接失败（ConnectError）"
+    elif reason == "rate_limited" or (reason == "http_status" and status == 429):
+        summary = "地名检索服务限流（HTTP 429），请稍后重试"
+    elif reason == "http_status" and status == 400:
+        summary = "地名检索请求未被服务接受（HTTP 400），这不是“没有结果”"
+    elif reason == "http_status" and status in {401, 403}:
+        summary = f"地名检索服务拒绝访问（HTTP {status}）"
+    elif reason == "http_status" and status == 404:
+        summary = "地名检索接口不存在（HTTP 404）"
+    elif reason == "http_status" and status == 408:
+        summary = "地名检索请求超时（HTTP 408）"
+    elif reason == "http_status" and isinstance(status, int) and status >= 500:
+        summary = f"地名检索服务暂时异常（HTTP {status}）"
+    elif reason == "http_status" and status is not None:
+        summary = f"地名检索服务返回 HTTP {status}"
+    elif reason == "unexpected_redirect":
+        summary = f"地名检索接口返回意外跳转（HTTP {status}）"
+    elif reason == "invalid_json":
+        summary = "地名检索返回格式异常（InvalidJSON）"
+    elif reason == "malformed_response":
+        summary = "地名检索返回内容异常（MalformedResponse）"
+    elif reason == "response_too_large":
+        summary = "地名检索响应过大，已停止处理"
+    elif reason == "invalid_config":
+        summary = "地名检索配置无效"
+    elif reason == "transport_error":
+        summary = "地名检索网络传输失败"
+    else:
+        summary = "地名检索暂时不可用"
+    if cooldown:
+        summary = f"{summary}；服务正在短暂冷却"
+    return f"{summary}。文字线索已保留，请补充城市、区名或附近地标。"
+
+
 def _bounded_terms(mentions: Sequence[MentionLike]) -> tuple[str, ...]:
     result: list[str] = []
     seen: set[str] = set()
@@ -174,6 +220,27 @@ def _city_row(place: Any) -> CityRow | None:
         )
     except (TypeError, ValueError):
         return None
+
+
+def _place_names(place: Any, extra_names: Sequence[str] = ()) -> tuple[str, ...]:
+    aliases = getattr(place, "aliases", ()) or ()
+    if isinstance(aliases, str):
+        aliases = (aliases,)
+    elif not isinstance(aliases, (list, tuple, set)):
+        aliases = ()
+    values = (
+        *extra_names,
+        str(getattr(place, "name", "") or ""),
+        str(getattr(place, "ascii_name", "") or ""),
+        str(getattr(place, "name_zh", "") or ""),
+        *aliases,
+    )
+    result: list[str] = []
+    for item in values:
+        text = str(item or "").strip()
+        if text and text not in result:
+            result.append(text)
+    return tuple(result)
 
 
 class PlaceResolutionService:
@@ -240,15 +307,13 @@ class PlaceResolutionService:
             return self._batch(
                 "unavailable",
                 terms,
-                notice="地名检索暂时不可用；文字线索已保留，请补充城市、区名或附近地标。",
-                detail=type(exc).__name__,
+                notice=_unavailable_notice(exc),
             )
-        except Exception as exc:
+        except Exception:
             return self._batch(
                 "unavailable",
                 terms,
-                notice="地名检索暂时不可用；文字线索已保留，请补充城市、区名或附近地标。",
-                detail=type(exc).__name__,
+                notice="地名检索暂时不可用。文字线索已保留，请补充城市、区名或附近地标。",
             )
         if not hits:
             return self._batch(
@@ -265,6 +330,35 @@ class PlaceResolutionService:
         )
 
     # ---------------------------------------------------------------- local
+    def _exact_city(
+        self,
+        place: Any,
+        term: str,
+        canonical_country: str,
+        source_isos: Sequence[str],
+        *,
+        extra_names: Sequence[str] = (),
+    ) -> _ExactCity | None:
+        row = _city_row(place)
+        if row is None:
+            return None
+        if source_isos and row.iso not in source_isos:
+            return None
+        names = _place_names(place, extra_names)
+        normalized = _normalize_text(term)
+        if not normalized or not any(
+            _normalize_text(name) == normalized for name in names
+        ):
+            return None
+        country = canonical_country_iso(row.iso)
+        if canonical_country and country != canonical_country:
+            return None
+        return _ExactCity(
+            row=row,
+            canonical_country=country,
+            names=names,
+        )
+
     def _local_matches(
         self,
         store: "GeoCatalogStore",
@@ -272,8 +366,38 @@ class PlaceResolutionService:
         canonical_country: str,
         source_isos: Sequence[str],
     ) -> tuple[_ExactCity, ...]:
-        queries = list(source_isos) if source_isos else [None]
         found: dict[tuple[str, int], _ExactCity] = {}
+
+        # Local Chinese display names are stable-ID aliases, but they are not
+        # duplicated into GeoPlace. Resolve the IDs through the same scoped
+        # catalog and keep every duplicate so country filtering and ambiguity
+        # remain explicit.
+        label_ids = city_ids_for_name_zh(term)
+        label_places: Sequence[Any] = ()
+        get_places = getattr(store, "get_places", None)
+        if label_ids and callable(get_places):
+            label_places = get_places("city", label_ids)
+        elif label_ids:
+            get_place = getattr(store, "get_place", None)
+            if callable(get_place):
+                label_places = tuple(
+                    place for place in (get_place("city", city_id) for city_id in label_ids)
+                    if place is not None
+                )
+        for place in label_places:
+            city = self._exact_city(
+                place,
+                term,
+                canonical_country,
+                source_isos,
+                extra_names=(term,),
+            )
+            if city is not None:
+                found.setdefault((city.row.iso, city.row.city_id), city)
+
+        # Keep the existing catalog-name/alias path and use it as the fallback
+        # when a label ID is absent from the current catalog snapshot.
+        queries = list(source_isos) if source_isos else [None]
         for source_iso in queries:
             page = store.query_places(
                 "city",
@@ -284,28 +408,11 @@ class PlaceResolutionService:
                 coordinates_only=True,
             )
             for place in page.get("rows") or []:
-                row = _city_row(place)
-                if row is None:
-                    continue
-                names = tuple(
-                    item for item in (
-                        str(getattr(place, "name", "") or ""),
-                        str(getattr(place, "ascii_name", "") or ""),
-                        str(getattr(place, "name_zh", "") or ""),
-                        *(getattr(place, "aliases", ()) or ()),
-                    ) if item
+                city = self._exact_city(
+                    place, term, canonical_country, source_isos
                 )
-                normalized = _normalize_text(term)
-                if not any(_normalize_text(name) == normalized for name in names):
-                    continue
-                country = canonical_country_iso(row.iso)
-                if canonical_country and country != canonical_country:
-                    continue
-                found[(row.iso, row.city_id)] = _ExactCity(
-                    row=row,
-                    canonical_country=country,
-                    names=names,
-                )
+                if city is not None:
+                    found.setdefault((city.row.iso, city.row.city_id), city)
         return tuple(found.values())
 
     def _local_decision(

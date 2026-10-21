@@ -3,6 +3,8 @@ import { computed } from 'vue'
 import type {
   RegionAnalysisRecord,
   AnalyzePointRequest,
+  ObservationAdoptionRequest,
+  ObservationAdoptionSubmission,
   RegionObservation,
   RegionReport,
   RegionQuestion,
@@ -17,6 +19,8 @@ const props = withDefaults(
     requests?: RegionAnalysisRecord[]
     analyzing?: boolean
     disabled?: boolean
+    observationAdoption?: ObservationAdoptionSubmission | null
+    observationAdoptionRetryable?: boolean
   }>(),
   {
     imageUrl: null,
@@ -25,6 +29,8 @@ const props = withDefaults(
     requests: () => [],
     analyzing: false,
     disabled: false,
+    observationAdoption: null,
+    observationAdoptionRetryable: false,
   },
 )
 
@@ -32,6 +38,8 @@ const emit = defineEmits<{
   'select-region': [reportId: string]
   'retry-region': [request: AnalyzePointRequest]
   'ask-question': [question: RegionQuestion]
+  'adopt-observation': [request: ObservationAdoptionRequest]
+  'retry-observation-adoption': []
 }>()
 
 const selectedReport = computed(() =>
@@ -106,7 +114,7 @@ const visibleObservations = computed(() => {
     // 像素统计只是测量信号，不是分析依据，不在报告中展示
     if (observation.kind === 'pixel_signal') return false
     if (observation.kind !== 'ocr_text') return true
-    return report.ocr.available && report.ocr.state.toLowerCase() !== 'mock' && Boolean(observation.text?.trim())
+    return canAdoptObservation(report, observation)
   })
 })
 
@@ -139,6 +147,74 @@ function bboxText(report: RegionReport | null): string {
 
 function observationHasBox(observation: RegionObservation): boolean {
   return observationBox(observation) !== null
+}
+
+/** Only real, available, non-mock OCR text can become an adoption request. */
+function canAdoptObservation(report: RegionReport, observation: RegionObservation): boolean {
+  return (
+    observation.kind === 'ocr_text' &&
+    report.ocr.available &&
+    report.ocr.state.toLowerCase() !== 'mock' &&
+    Boolean(observation.text?.trim())
+  )
+}
+
+function adoptionFor(
+  report: RegionReport,
+  observation: RegionObservation,
+): ObservationAdoptionSubmission | null {
+  const adoption = props.observationAdoption
+  if (!adoption) return null
+  return adoption.report_id === report.id && adoption.observation_id === observation.id
+    ? adoption
+    : null
+}
+
+function adoptionSettled(report: RegionReport, observation: RegionObservation): boolean {
+  const status = adoptionFor(report, observation)?.status
+  return status === 'applied' || status === 'unchanged'
+}
+
+function adoptionStatusText(adoption: ObservationAdoptionSubmission): string {
+  const summary = adoption.receipt?.summary?.trim()
+  if (adoption.status === 'pending') {
+    return '正在确认 OCR 原文并检索地点；不会自动确认地点。'
+  }
+  if (adoption.status === 'applied') {
+    return summary
+      ? `已确认文字；助手反馈：${summary}`
+      : '已确认 OCR 原文并提交地点检索；不会自动确认地点。'
+  }
+  if (adoption.status === 'unchanged') {
+    return summary
+      ? `这段 OCR 原文此前已确认；助手反馈：${summary}`
+      : '这段 OCR 原文此前已确认，无需重复提交。'
+  }
+  if (adoption.status === 'unconfirmed') {
+    return adoption.error?.trim() || '服务器未返回可识别的采用回执，请核对最新引导状态后再试。'
+  }
+  return adoption.error?.trim() || '确认文字失败，地点未被自动确认。'
+}
+
+function adoptionIsPending(report: RegionReport, observation: RegionObservation): boolean {
+  return adoptionFor(report, observation)?.status === 'pending'
+}
+
+function adoptionNeedsRetry(report: RegionReport, observation: RegionObservation): boolean {
+  return (
+    props.observationAdoptionRetryable &&
+    adoptionFor(report, observation)?.status === 'failed'
+  )
+}
+
+function adoptionTextFor(report: RegionReport, observation: RegionObservation): string {
+  const adoption = adoptionFor(report, observation)
+  return adoption ? adoptionStatusText(adoption) : ''
+}
+
+function adoptionClassFor(report: RegionReport, observation: RegionObservation): string {
+  const status = adoptionFor(report, observation)?.status
+  return status ? `is-${status}` : ''
 }
 </script>
 
@@ -256,6 +332,48 @@ function observationHasBox(observation: RegionObservation): boolean {
               </span>
               <span v-if="observationHasBox(observation)">图中已标出证据框</span>
             </div>
+            <div
+              v-if="canAdoptObservation(selectedReport, observation)"
+              class="region-adoption"
+            >
+              <div class="region-adoption-actions">
+                <button
+                  v-if="!adoptionSettled(selectedReport, observation) && !adoptionNeedsRetry(selectedReport, observation)"
+                  type="button"
+                  class="primary-btn region-adopt-btn"
+                  :disabled="waitReason || adoptionIsPending(selectedReport, observation)"
+                  @click="emit('adopt-observation', { report_id: selectedReport.id, observation_id: observation.id })"
+                >
+                  {{
+                    adoptionIsPending(selectedReport, observation)
+                      ? '正在确认文字…'
+                      : adoptionFor(selectedReport, observation)?.status === 'failed'
+                        ? '重新确认文字并用于定位'
+                        : '确认文字并用于定位'
+                  }}
+                </button>
+                <button
+                  v-if="adoptionNeedsRetry(selectedReport, observation)"
+                  type="button"
+                  class="ghost-btn region-adopt-retry"
+                  :disabled="waitReason"
+                  @click="emit('retry-observation-adoption')"
+                >
+                  重试上次采用（同一事件）
+                </button>
+              </div>
+              <p
+                v-if="adoptionFor(selectedReport, observation)"
+                class="region-adoption-status"
+                :class="adoptionClassFor(selectedReport, observation)"
+                :role="adoptionFor(selectedReport, observation)?.status === 'failed' ? 'alert' : 'status'"
+              >
+                {{ adoptionTextFor(selectedReport, observation) }}
+              </p>
+              <p class="region-adoption-hint">
+                仅提交报告 ID 与观察 ID；后端使用已保存的 OCR 原文检索，不会自动确认地点。
+              </p>
+            </div>
             <p v-if="observation.kind === 'scene_hypothesis'" class="region-scene-note">
               场景假设仅用于人工复核，不是拍摄地概率，也不参与引导确认。
             </p>
@@ -263,7 +381,7 @@ function observationHasBox(observation: RegionObservation): boolean {
         </section>
 
         <section v-if="selectedReport.question_suggestions.length" class="region-questions">
-          <div class="region-section-title">建议下一步核对问题</div>
+          <div class="region-section-title">建议追问（仅填入草稿）</div>
           <button
             v-for="question in selectedReport.question_suggestions"
             :key="question.id"
@@ -273,10 +391,61 @@ function observationHasBox(observation: RegionObservation): boolean {
             @click="emit('ask-question', question)"
           >
             <strong>{{ question.text }}</strong>
-            <small>{{ question.reason }} · 依据 {{ question.basis_observation_ids.length }} 条观察 · 仅填入草稿，不会自动确认</small>
+            <small>{{ question.reason }} · 依据 {{ question.basis_observation_ids.length }} 条观察 · 点击只填入追问草稿，不确认文字，也不会自动确认地点</small>
           </button>
         </section>
       </article>
     </template>
   </aside>
 </template>
+
+<style scoped>
+.region-adoption {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--line-faint);
+}
+.region-adoption-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.region-adopt-btn {
+  min-height: 34px;
+  padding: 6px 10px;
+  font-size: 13px;
+}
+.region-adopt-retry {
+  min-height: 34px;
+  padding: 6px 10px;
+  font-size: 13px;
+}
+.region-adoption-status {
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 20px;
+}
+.region-adoption-status.is-pending {
+  color: var(--amber);
+}
+.region-adoption-status.is-applied,
+.region-adoption-status.is-unchanged {
+  color: var(--sage);
+}
+.region-adoption-status.is-unconfirmed {
+  color: var(--warn);
+}
+.region-adoption-status.is-failed {
+  color: var(--coral);
+}
+.region-adoption-hint {
+  color: var(--faint);
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 18px;
+}
+</style>

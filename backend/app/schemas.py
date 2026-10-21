@@ -205,6 +205,7 @@ GuidedEventType = Literal[
     "retract",
     "backtrack",
     "free_text",
+    "adopt_observation",
 ]
 
 
@@ -344,8 +345,35 @@ class GuidedEventRequest(BaseModel):
     value: str | None = Field(default=None, max_length=500)
     text: str | None = Field(default=None, max_length=2000)
     level: GuidedLocationLevel | None = None
+    # Adopt-observation events carry identifiers only. The service reads the
+    # authoritative text/provenance from the current session's persisted AI
+    # report; client text/value fields are never used for this event type.
+    report_id: str | None = Field(default=None, min_length=1, max_length=120)
+    observation_id: str | None = Field(default=None, min_length=1, max_length=120)
 
     model_config = {"extra": "forbid"}
+
+    @field_validator("report_id", "observation_id")
+    @classmethod
+    def _normalise_observation_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        text = value.strip()
+        return text or None
+
+    @model_validator(mode="after")
+    def _require_observation_ids(self) -> "GuidedEventRequest":
+        if self.type == "adopt_observation":
+            missing = [
+                name for name in ("report_id", "observation_id")
+                if not getattr(self, name)
+            ]
+            if missing:
+                raise ValueError(
+                    "missing required field(s) for type=adopt_observation: "
+                    + ", ".join(missing)
+                )
+        return self
 
 
 class GuidedReceiptModel(BaseModel):

@@ -1,4 +1,5 @@
 import { computed, ref, watch, type ComputedRef, type Ref } from 'vue'
+import type { GuidedEventReceipt } from '@/types'
 
 export type GuidedFreeTextSubmissionStatus =
   | 'pending'
@@ -12,6 +13,8 @@ export interface GuidedFreeTextSubmission {
   text: string
   status: GuidedFreeTextSubmissionStatus
   error?: string | null
+  /** Receipt snapshot for this exact submission, never the latest global receipt. */
+  receipt?: GuidedEventReceipt | null
 }
 
 export interface UseGuidedComposerOptions {

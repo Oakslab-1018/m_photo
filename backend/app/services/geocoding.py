@@ -41,7 +41,27 @@ class GeocodingError(RuntimeError):
 
 
 class GeocodingUnavailable(GeocodingError):
-    """The configured provider could not be used for this query."""
+    """A provider failure with a safe, structured diagnostic.
+
+    ``reason`` and ``status_code`` never contain the query, request URL or
+    credentials. The constructor keeps the historical one-argument form so
+    existing callers continue to work.
+    """
+
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        reason: str = "unavailable",
+        status_code: int | None = None,
+        retryable: bool = False,
+        cooldown: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.reason = str(reason or "unavailable")
+        self.status_code = status_code
+        self.retryable = bool(retryable)
+        self.cooldown = bool(cooldown)
 
 
 @dataclass(frozen=True)
@@ -66,6 +86,7 @@ class GeocodingConfig:
     result_limit: int = 5
     user_agent: str = "MPhoto/0.1 (bounded place search)"
     api_key: str = field(default="", repr=False)
+    failure_cooldown_seconds: float = 30.0
 
     def __post_init__(self) -> None:
         provider = str(self.provider or "none").strip().lower()
@@ -86,6 +107,11 @@ class GeocodingConfig:
             raise ValueError("geocoder cache TTLs must be positive")
         if not (1 <= int(self.result_limit) <= 10):
             raise ValueError("geocoder result limit must be between 1 and 10")
+        if (
+            self.failure_cooldown_seconds < 0
+            or not math.isfinite(self.failure_cooldown_seconds)
+        ):
+            raise ValueError("geocoder failure cooldown must be non-negative and finite")
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "GeocodingConfig":
@@ -195,6 +221,15 @@ class GeocodingConfig:
                 1,
                 10,
             )),
+            failure_cooldown_seconds=number(
+                get(
+                    "M_PHOTO_GEOCODER_FAILURE_COOLDOWN_SECONDS",
+                    "GEOCODER_FAILURE_COOLDOWN_SECONDS",
+                ),
+                30.0,
+                0.0,
+                300.0,
+            ),
             user_agent=get("M_PHOTO_GEOCODER_USER_AGENT", "GEOCODER_USER_AGENT")
             or "MPhoto/0.1 (bounded place search)",
             api_key=get("M_PHOTO_GEOCODER_API_KEY", "GEOCODER_API_KEY") or "",
@@ -207,7 +242,7 @@ class GeocoderRequest:
     quote: str = ""
     country_iso: str | None = None
     source_isos: tuple[str, ...] = ()
-    language: str = "en"
+    language: str = ""
     limit: int = 5
 
     def normalized_terms(self) -> tuple[str, ...]:
@@ -299,13 +334,17 @@ class _RateLimiter:
 def _validate_base_url(url: str) -> str:
     parts = urlsplit(str(url or "").strip())
     if parts.username or parts.password or parts.query or parts.fragment:
-        raise GeocodingUnavailable("geocoder URL contains unsupported components")
+        raise GeocodingUnavailable(
+            "geocoder URL contains unsupported components", reason="invalid_config"
+        )
     if parts.scheme == "https" and parts.hostname:
         return str(url).rstrip("/")
     loopback = parts.hostname in {"127.0.0.1", "localhost", "::1"}
     if parts.scheme == "http" and loopback:
         return str(url).rstrip("/")
-    raise GeocodingUnavailable("geocoder URL must use HTTPS (HTTP is loopback-only)")
+    raise GeocodingUnavailable(
+        "geocoder URL must use HTTPS (HTTP is loopback-only)", reason="invalid_config"
+    )
 
 
 def _bounded_text(value: object, limit: int = 200) -> str:
@@ -332,11 +371,57 @@ class _HttpGeocoder:
         self._cache = _TTLCache(config.cache_max_entries)
         self._limiter = _RateLimiter(config.min_interval_seconds)
         self._clock = clock or time.monotonic
+        self._cooldown_lock = threading.Lock()
+        self._cooldown_until = 0.0
+        self._cooldown_reason = "unavailable"
+        self._cooldown_status: int | None = None
+
+    def _effective_language(self, language: str) -> str:
+        return language
+
+    def _country_codes(self, request: GeocoderRequest) -> tuple[str, ...]:
+        codes = {request.country_iso} if request.country_iso else set()
+        codes.update(request.source_isos)
+        return tuple(sorted(code for code in codes if code))
+
+    def _raise_if_cooling_down(self) -> None:
+        with self._cooldown_lock:
+            if self._cooldown_until > self._clock():
+                raise GeocodingUnavailable(
+                    "geocoder request temporarily suppressed",
+                    reason=self._cooldown_reason,
+                    status_code=self._cooldown_status,
+                    retryable=True,
+                    cooldown=True,
+                )
+            self._cooldown_until = 0.0
+            self._cooldown_reason = "unavailable"
+            self._cooldown_status = None
+
+    def _mark_failure(self, error: GeocodingUnavailable) -> None:
+        if not error.retryable or self.config.failure_cooldown_seconds <= 0:
+            return
+        with self._cooldown_lock:
+            self._cooldown_until = max(
+                self._cooldown_until,
+                self._clock() + self.config.failure_cooldown_seconds,
+            )
+            self._cooldown_reason = error.reason
+            self._cooldown_status = error.status_code
+
+    def _clear_failure(self) -> None:
+        with self._cooldown_lock:
+            self._cooldown_until = 0.0
+            self._cooldown_reason = "unavailable"
+            self._cooldown_status = None
 
     def search(self, request: GeocoderRequest) -> tuple[GeocoderHit, ...]:
         terms = request.normalized_terms()
         if not terms:
             return ()
+        language = self._effective_language(
+            _bounded_text(request.language or self.config.language, 20)
+        )
         normalized = GeocoderRequest(
             terms=terms,
             quote=request.quote,
@@ -345,14 +430,13 @@ class _HttpGeocoder:
                 item for item in (_normalize_country(value) for value in request.source_isos)
                 if item
             ),
-            language=_bounded_text(request.language or self.config.language, 20),
+            language=language,
             limit=min(int(self.config.result_limit), max(1, int(request.limit or 5))),
         )
         key = "|".join((
             self.name,
             normalized.query().casefold(),
-            normalized.country_iso or "",
-            ",".join(sorted(set(normalized.source_isos))),
+            ",".join(self._country_codes(normalized)),
             normalized.language.casefold(),
             str(normalized.limit),
         ))
@@ -367,9 +451,17 @@ class _HttpGeocoder:
     def _search(self, request: GeocoderRequest) -> list[GeocoderHit]:
         raise NotImplementedError
 
-    def _get_json(self, url: str, params: Mapping[str, object]) -> object:
+    def _get_json(
+        self,
+        url: str,
+        params: Mapping[str, object] | Sequence[tuple[str, object]],
+    ) -> object:
         base = _validate_base_url(url)
+        self._raise_if_cooling_down()
         self._limiter.wait()
+        # Another concurrent request may have failed while this one waited for
+        # the shared rate limiter; re-check before opening the socket.
+        self._raise_if_cooling_down()
         headers = {
             "Accept": "application/json",
             "User-Agent": self.config.user_agent,
@@ -385,32 +477,119 @@ class _HttpGeocoder:
                 follow_redirects=False,
                 trust_env=False,
             ) as client:
-                response = client.get(base, params=params, headers=headers)
-                response.raise_for_status()
-                if len(response.content) > _MAX_RESPONSE_BYTES:
-                    raise GeocodingUnavailable("geocoder response exceeded size limit")
-                return response.json()
-        except GeocodingUnavailable:
+                with client.stream(
+                    "GET", base, params=params, headers=headers
+                ) as response:
+                    if not (200 <= response.status_code < 300):
+                        status = response.status_code
+                        reason = (
+                            "rate_limited" if status == 429
+                            else "unexpected_redirect" if 300 <= status < 400
+                            else "http_status"
+                        )
+                        raise GeocodingUnavailable(
+                            "geocoder returned an unsuccessful HTTP status",
+                            reason=reason,
+                            status_code=status,
+                            retryable=status in {408, 429} or status >= 500,
+                        )
+                    chunks: list[bytes] = []
+                    total = 0
+                    for chunk in response.iter_bytes():
+                        total += len(chunk)
+                        if total > _MAX_RESPONSE_BYTES:
+                            raise GeocodingUnavailable(
+                                "geocoder response exceeded size limit",
+                                reason="response_too_large",
+                            )
+                        chunks.append(chunk)
+                payload = json.loads(b"".join(chunks))
+                self._clear_failure()
+                return payload
+        except GeocodingUnavailable as exc:
+            self._mark_failure(exc)
+            logger.warning(
+                "Geocoder request failed provider=%s reason=%s status=%s",
+                self.name,
+                exc.reason,
+                exc.status_code,
+            )
             raise
-        except Exception as exc:
-            raise GeocodingUnavailable(type(exc).__name__) from exc
+        except httpx.ConnectTimeout:
+            error = GeocodingUnavailable(
+                "geocoder connect timed out",
+                reason="connect_timeout",
+                retryable=True,
+            )
+        except httpx.ReadTimeout:
+            error = GeocodingUnavailable(
+                "geocoder read timed out",
+                reason="read_timeout",
+                retryable=True,
+            )
+        except httpx.TimeoutException:
+            error = GeocodingUnavailable(
+                "geocoder request timed out",
+                reason="timeout",
+                retryable=True,
+            )
+        except httpx.ConnectError:
+            error = GeocodingUnavailable(
+                "geocoder connection failed",
+                reason="connect_error",
+                retryable=True,
+            )
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            error = GeocodingUnavailable(
+                "geocoder response was not valid JSON",
+                reason="invalid_json",
+            )
+        except httpx.HTTPError:
+            error = GeocodingUnavailable(
+                "geocoder transport failed",
+                reason="transport_error",
+                retryable=True,
+            )
+        except Exception:
+            error = GeocodingUnavailable(
+                "geocoder request failed unexpectedly",
+                reason="unexpected_error",
+            )
+        self._mark_failure(error)
+        logger.warning(
+            "Geocoder request failed provider=%s reason=%s status=%s",
+            self.name,
+            error.reason,
+            error.status_code,
+        )
+        raise error from None
 
 
 class PhotonGeocoder(_HttpGeocoder):
     name = "photon"
+    _SUPPORTED_LANGUAGES = frozenset({"de", "en", "fr"})
+
+    def _effective_language(self, language: str) -> str:
+        # Photon's public API accepts only de/en/fr. Keep the original query
+        # text untouched, but never forward an unsupported language value.
+        base = _bounded_text(language, 20).lower().split("-", 1)[0]
+        return base if base in self._SUPPORTED_LANGUAGES else "en"
 
     def _search(self, request: GeocoderRequest) -> list[GeocoderHit]:
-        payload = self._get_json(
-            self.config.base_url,
-            {
-                "q": request.query(),
-                "limit": request.limit,
-                "lang": request.language,
-            },
+        params: list[tuple[str, object]] = [
+            ("q", request.query()),
+            ("limit", request.limit),
+            ("lang", request.language),
+        ]
+        params.extend(
+            ("countrycode", code) for code in self._country_codes(request)
         )
+        payload = self._get_json(self.config.base_url, params)
         features = payload.get("features") if isinstance(payload, dict) else None
         if not isinstance(features, list):
-            raise GeocodingUnavailable("unexpected Photon response")
+            raise GeocodingUnavailable(
+                "unexpected Photon response", reason="malformed_response"
+            )
         hits: list[GeocoderHit] = []
         for feature in features[: request.limit]:
             if not isinstance(feature, dict):
@@ -464,9 +643,14 @@ class NominatimGeocoder(_HttpGeocoder):
             "limit": request.limit,
             "accept-language": request.language,
         }
+        country_codes = self._country_codes(request)
+        if country_codes:
+            params["countrycodes"] = ",".join(code.lower() for code in country_codes)
         payload = self._get_json(self.config.base_url, params)
         if not isinstance(payload, list):
-            raise GeocodingUnavailable("unexpected Nominatim response")
+            raise GeocodingUnavailable(
+                "unexpected Nominatim response", reason="malformed_response"
+            )
         hits: list[GeocoderHit] = []
         for item in payload[: request.limit]:
             if not isinstance(item, dict):

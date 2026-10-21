@@ -182,6 +182,11 @@ class CityClueReasoner:
             if not isinstance(clue, Clue):
                 continue
             extra = clue.extra if isinstance(clue.extra, dict) else {}
+            # Display-only observations must not be promoted from literal text
+            # into a city match. Resolver-validated CityEvidence below remains
+            # an independent, catalog-scoped path.
+            if extra.get("display_only") is True or extra.get("affects_ranking") is False:
+                continue
             dimension = clue.dimension
             if dimension == "place_name":
                 allowed = clue.source == "user" or extra.get("validated") is True

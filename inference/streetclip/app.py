@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hmac
+import json
 import logging
 from contextlib import asynccontextmanager
 from typing import Any
@@ -26,9 +27,12 @@ from .schema import (
     ImageValidationError,
     InvalidCountryError,
 )
-from .service import StreetClipService
+from .service import InvalidCityIdsError, StreetClipService
 
 logger = logging.getLogger(__name__)
+
+MAX_TARGET_CITY_IDS = 10
+MAX_CITY_IDS_JSON_LENGTH = 4096
 
 
 def _sanitize_error_detail(detail: str) -> str:
@@ -49,6 +53,35 @@ def _bearer_token(authorization: str | None) -> str | None:
         token = parts[1].strip()
         return token or None
     return value
+
+
+def _parse_city_ids(value: str) -> tuple[int, ...]:
+    """Parse the optional targeted-city form field without trusting JSON types."""
+    if len(value) > MAX_CITY_IDS_JSON_LENGTH:
+        raise HTTPException(status_code=400, detail="city_ids is too long")
+    try:
+        decoded = json.loads(value)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="city_ids must be a JSON array") from exc
+    if not isinstance(decoded, list) or not 1 <= len(decoded) <= MAX_TARGET_CITY_IDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"city_ids must contain 1 to {MAX_TARGET_CITY_IDS} unique positive integers",
+        )
+
+    city_ids: list[int] = []
+    seen: set[int] = set()
+    for city_id in decoded:
+        if isinstance(city_id, bool) or not isinstance(city_id, int) or city_id <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail="city_ids must contain positive integers",
+            )
+        if city_id in seen:
+            raise HTTPException(status_code=400, detail="city_ids must be unique")
+        seen.add(city_id)
+        city_ids.append(city_id)
+    return tuple(city_ids)
 
 
 async def require_api_key(
@@ -228,6 +261,10 @@ def create_app(
         _auth: None = Depends(api_key_dependency),
         file: UploadFile = File(..., description="single street-level image"),
         country_iso: str = Form(..., description="ISO-3166 alpha-2 country code"),
+        city_ids: str | None = Form(
+            default=None,
+            description="optional JSON array of 1-10 targeted catalog city IDs",
+        ),
     ) -> JSONResponse:
         service_impl: StreetClipService = application.state.service
         try:
@@ -237,11 +274,21 @@ def create_app(
         finally:
             await file.close()
 
+        targeted_city_ids = _parse_city_ids(city_ids) if city_ids is not None else None
         try:
-            result = await run_in_threadpool(
-                service_impl.predict_cities, country_iso, payload
-            )
-        except InvalidCountryError as exc:
+            if targeted_city_ids is None:
+                # Preserve the legacy two-argument call for injected fake services.
+                result = await run_in_threadpool(
+                    service_impl.predict_cities, country_iso, payload
+                )
+            else:
+                result = await run_in_threadpool(
+                    service_impl.predict_cities,
+                    country_iso,
+                    payload,
+                    city_ids=targeted_city_ids,
+                )
+        except (InvalidCountryError, InvalidCityIdsError) as exc:
             raise HTTPException(status_code=400, detail=_sanitize_error_detail(str(exc))) from exc
         except ImageTooLargeError as exc:
             raise HTTPException(status_code=413, detail=_sanitize_error_detail(str(exc))) from exc
@@ -301,4 +348,10 @@ def create_app(
 app = create_app()
 
 
-__all__ = ["app", "create_app", "require_api_key"]
+__all__ = [
+    "MAX_CITY_IDS_JSON_LENGTH",
+    "MAX_TARGET_CITY_IDS",
+    "app",
+    "create_app",
+    "require_api_key",
+]

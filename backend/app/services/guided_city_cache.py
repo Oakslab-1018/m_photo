@@ -44,6 +44,7 @@ class CityRankingKey:
     catalog_revision: str
     source_iso: str
     endpoint: str
+    city_ids: tuple[int, ...] = ()
 
 
 class CityRankingCache:

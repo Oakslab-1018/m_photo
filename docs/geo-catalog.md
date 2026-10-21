@@ -94,7 +94,7 @@ uv run --frozen python -m backend.app.services.geo_catalog_import --force
 
 ## 城市中文显示名
 
-`data/city-names.zh-CN.json` 是独立的展示词表，按现有城市 GeoNames ID 关联；不改目录 ID、原始模型名称、坐标、分数或目录版本。数据来自 GeoNames `alternateNamesV2` 的中文语言标签，排除历史、俗称和已结束使用的名字，优先简体中文及首选名称。当前 GeoNames 词表覆盖 11286 / 34156 个城市；再读取 `data/city-names.wikidata.zh.json` 补充 Wikidata 中文标签，仍未收录时显示目录原名，不生成机器音译。
+`data/city-names.zh-CN.json` 是独立的中文名称词表，按现有城市 GeoNames ID 关联，也用于本地精确别名检索；同名城市保留歧义。词表不改目录 ID、原始模型名称、坐标、分数或目录版本。数据来自 GeoNames `alternateNamesV2` 的中文语言标签，排除历史、俗称和已结束使用的名字，优先简体中文及首选名称。当前 GeoNames 词表覆盖 11286 / 34156 个城市；再读取 `data/city-names.wikidata.zh.json` 补充 Wikidata 中文标签，仍未收录时显示目录原名，不生成机器音译。
 
 来源指纹、日期和 CC BY 4.0 署名保存在同目录 `.sources.json`。更新时将官方压缩包下载到本地缓存，然后运行：
 

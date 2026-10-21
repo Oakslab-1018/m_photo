@@ -56,6 +56,35 @@ from .schema import (
 logger = logging.getLogger(__name__)
 
 REFERENCE_TOP_K = 5
+MAX_TARGET_CITY_IDS = 10
+
+
+class InvalidCityIdsError(ValueError):
+    """Raised when targeted scoring IDs are malformed or outside the catalog."""
+
+
+def _normalize_target_city_ids(city_ids: Any) -> tuple[int, ...]:
+    """Validate unique positive target IDs in request order."""
+    if isinstance(city_ids, (str, bytes, bytearray)):
+        raise InvalidCityIdsError("city_ids must be an array of positive integers")
+    try:
+        values = tuple(city_ids)
+    except TypeError as exc:
+        raise InvalidCityIdsError("city_ids must be an array of positive integers") from exc
+    if not 1 <= len(values) <= MAX_TARGET_CITY_IDS:
+        raise InvalidCityIdsError(
+            f"city_ids must contain 1 to {MAX_TARGET_CITY_IDS} unique positive integers"
+        )
+    normalized: list[int] = []
+    seen: set[int] = set()
+    for city_id in values:
+        if isinstance(city_id, bool) or not isinstance(city_id, int) or city_id <= 0:
+            raise InvalidCityIdsError("city_ids must contain positive integers")
+        if city_id in seen:
+            raise InvalidCityIdsError("city_ids must be unique")
+        seen.add(city_id)
+        normalized.append(city_id)
+    return tuple(normalized)
 
 
 class StreetClipService:
@@ -475,7 +504,13 @@ class StreetClipService:
                 f"scene analysis returned invalid bounded results: {exc}"
             ) from exc
 
-    def predict_cities(self, country_iso: str, payload: bytes) -> dict[str, Any]:
+    def predict_cities(
+        self,
+        country_iso: str,
+        payload: bytes,
+        *,
+        city_ids: tuple[int, ...] | None = None,
+    ) -> dict[str, Any]:
         """Rank the selected country's top cities by real image/text CLIP.
 
         Image bytes are validated first (same limits as ``/predict``), the
@@ -483,18 +518,36 @@ class StreetClipService:
         shared image encoder invoked. City identity, region, representative
         coordinates and the top-N selection all come from the GeoNames city
         catalog; the score is a bounded similarity, not a probability.
+
+        When ``city_ids`` is supplied, the country-wide population limit is
+        bypassed and only those unique catalog rows are scored. This supports
+        verified cities outside the default top-N pool without inventing a
+        score for an unscored candidate.
         """
         iso = str(country_iso or "").strip().upper()
         if len(iso) != 2 or not iso.isalpha():
             raise InvalidCountryError("country_iso must be a two-letter ISO code")
         if iso not in self._country_by_iso:
             raise InvalidCountryError("unsupported country_iso")
+        targeted_city_ids = (
+            _normalize_target_city_ids(city_ids) if city_ids is not None else None
+        )
         validate_image_bytes(payload, max_bytes=self.settings.max_upload_bytes)
-        if self._predictor is None or not self._predictor.ready:
-            raise PredictorUnavailableError("model is not ready")
 
         limit = int(self.settings.city_limit_per_country)
-        cities = select_cities(self._cities, iso, limit=limit)
+        if targeted_city_ids is None:
+            cities = select_cities(self._cities, iso, limit=limit)
+        else:
+            catalog_cities = self._cities.get(iso, ())
+            city_by_id = {city.city_id: city for city in catalog_cities}
+            if any(city_id not in city_by_id for city_id in targeted_city_ids):
+                raise InvalidCityIdsError(
+                    "city_ids must reference catalog cities in the requested country"
+                )
+            cities = tuple(city_by_id[city_id] for city_id in targeted_city_ids)
+
+        if self._predictor is None or not self._predictor.ready:
+            raise PredictorUnavailableError("model is not ready")
         if not cities:
             return build_city_prediction(
                 country_iso=iso,
@@ -519,6 +572,9 @@ class StreetClipService:
             )
         if len(scores) != len(cities):
             raise PredictorUnavailableError("city score count does not match the selected cities")
+        expected_score_ids = tuple(city.city_id for city in cities)
+        if tuple(city_id for city_id, _ in scores) != expected_score_ids:
+            raise PredictorUnavailableError("city score IDs do not match the selected cities")
 
         reference_sidecar: dict[str, Any] | None = None
         if self._reference_index is not None:
@@ -551,6 +607,7 @@ __all__ = [
     "ExifGpsPresentError",
     "ImageTooLargeError",
     "ImageValidationError",
+    "InvalidCityIdsError",
     "InvalidCountryError",
     "SceneAnalysisUnavailableError",
     "StreetClipService",

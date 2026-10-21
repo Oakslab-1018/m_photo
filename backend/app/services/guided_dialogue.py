@@ -15,9 +15,10 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import re
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, List, Mapping, Sequence
@@ -66,7 +67,14 @@ from .geo_session import GeoSessionService
 from .geocoding import GeocodingConfig, get_shared_geocoder
 from .guided_city_cache import CITY_RANKING_CACHE, CityRankingKey
 from .place_resolution import CityEvidence, PlaceResolutionBatch, PlaceResolutionService
+from .region_observation import (
+    AdoptedOcrObservation,
+    ObservationAdoptionError,
+    find_persisted_ocr_observation,
+    is_user_confirmed_observation,
+)
 from .model_gateway import (
+    MAX_TARGET_CITY_IDS,
     MODEL_REVISION,
     PROMPT_VERSION,
     StreetClipGateway,
@@ -88,6 +96,10 @@ _STREET_SUFFIXES = ("大道", "路", "街", "巷", "弄")
 _CITY_ID_RE = re.compile(r"^[1-9][0-9]*$")
 _ADMIN1_ID_RE = re.compile(r"^([A-Z]{2})\.(.+)$")
 _UPPER_ISO_RE = re.compile(r"(?<![A-Za-z])([A-Z]{2})(?![A-Za-z])")
+_POI_SUFFIXES = (
+    "分店", "店", "馆", "大厦", "商厦", "商城", "市场", "商场",
+    "酒店", "宾馆", "餐厅", "医院", "学校", "大学", "中心",
+)
 _CLUE_PRIORITY = {
     "place_name": 0,
     "language": 1,
@@ -361,6 +373,15 @@ class _FreeTextPreflight:
     parsed: Any
     resolution: PlaceResolutionBatch | None = None
     notice: str | None = None
+    mentions: tuple[PlaceMention, ...] = ()
+
+
+@dataclass
+class _ObservationAdoptionPreflight:
+    observation: AdoptedOcrObservation
+    place_term: str
+    resolution: PlaceResolutionBatch | None = None
+    notice: str | None = None
 
 
 @dataclass
@@ -504,10 +525,23 @@ class GuidedDialogueService:
         state, evidence_changed = self._reconcile_session_evidence(state, session)
         if evidence_changed:
             raise GuidedConflict("底层证据已更新，请重新加载对话后再试")
-        preflight = (
-            self._preflight_free_text(state, session, event)
-            if event.type == "free_text" else None
-        )
+        preflight: _FreeTextPreflight | _ObservationAdoptionPreflight | None = None
+        if event.type == "free_text":
+            preflight = self._preflight_free_text(state, session, event)
+        elif event.type == "adopt_observation":
+            try:
+                observation = find_persisted_ocr_observation(
+                    self.geo.list_messages(session_id),
+                    report_id=event.report_id or "",
+                    observation_id=event.observation_id or "",
+                )
+            except ObservationAdoptionError as exc:
+                raise GuidedValidationError(str(exc)) from exc
+            preflight = self._preflight_observation_adoption(
+                state,
+                session,
+                observation,
+            )
         outcome = self._apply_event(state, session, event, preflight=preflight)
         query = None
         prepared = self._prepare(
@@ -534,17 +568,32 @@ class GuidedDialogueService:
             except GuidedValidationError:
                 audit_target = None
         event_payload = event.model_dump(mode="json", exclude_none=True)
+        adoption_audit = (
+            preflight.observation.audit_payload()
+            if isinstance(preflight, _ObservationAdoptionPreflight)
+            else None
+        )
+        event_clue_id = event.clue_id or outcome.get("adopted_clue_id")
         audit = {
             "payload": event_payload,
             "fingerprint": _event_fingerprint(event),
             "validated_target": audit_target,
-            "clue_id": event.clue_id,
+            "clue_id": event_clue_id,
             "level": event.level,
             "proposals": prepared.state.get("proposals") or [],
             "place_resolutions": prepared.state.get("place_resolutions") or [],
         }
+        if adoption_audit is not None:
+            adoption_audit = {**adoption_audit, "clue_id": event_clue_id}
+            audit["adopted_observation"] = adoption_audit
         if event.type == "free_text" and event.text:
             user_content = event.text.strip()
+        elif event.type == "adopt_observation" and isinstance(
+            preflight, _ObservationAdoptionPreflight
+        ):
+            # The user's turn is the authoritative stored OCR text, never the
+            # client-provided placeholder/summary.
+            user_content = preflight.observation.text
         elif event.type == "answer" and event.value:
             user_content = f"回答：{event.value.strip()}"
         else:
@@ -595,7 +644,8 @@ class GuidedDialogueService:
                         "event_type": event.type,
                         "event_payload": event_payload,
                         "validated_target": audit_target,
-                        "clue_id": event.clue_id,
+                        "clue_id": event_clue_id,
+                        "adopted_observation": adoption_audit,
                         "proposals": prepared.state.get("proposals") or [],
                         "receipt": receipt,
                     },
@@ -612,7 +662,8 @@ class GuidedDialogueService:
                         "dialogue_revision": new_revision,
                         "event_payload": event_payload,
                         "validated_target": audit_target,
-                        "clue_id": event.clue_id,
+                        "clue_id": event_clue_id,
+                        "adopted_observation": adoption_audit,
                     },
                 )
                 response = self._response(
@@ -677,11 +728,84 @@ class GuidedDialogueService:
                     type(exc).__name__,
                 )
 
-        mentions = list(parsed.place_mentions)
+        mentions = tuple(parsed.place_mentions)
         if not mentions:
             return _FreeTextPreflight(parsed=parsed)
-        if self._mentions_need_context(mentions):
-            mentions.extend(self._prior_unresolved_mentions(state))
+        resolution, notice = self._resolve_place_mentions(
+            state,
+            session,
+            mentions,
+            include_prior_context=True,
+        )
+        return _FreeTextPreflight(
+            parsed=parsed,
+            resolution=resolution,
+            notice=notice,
+            mentions=mentions,
+        )
+
+    def _preflight_observation_adoption(
+        self,
+        state: dict[str, Any],
+        session: GeoSession,
+        observation: AdoptedOcrObservation,
+    ) -> _ObservationAdoptionPreflight:
+        """Build literal place evidence from stored OCR text, before writes.
+
+        This path never invokes the free-text LLM extractor. It passes only the
+        adopted OCR string as a legal ``PlaceMention`` and reuses the same local
+        catalog/network resolver as guided free text.
+        """
+
+        compact = " ".join(observation.text.split())
+        place_term = compact[:60].strip()
+        if not place_term:
+            raise GuidedValidationError("OCR 观察没有可检索的文字")
+        preflight = _ObservationAdoptionPreflight(
+            observation=observation,
+            place_term=place_term,
+        )
+        # A different event id for the exact same confirmed observation is an
+        # acknowledged no-op and must not trigger another network lookup.
+        if self._confirmed_adoption_record(state, observation) is not None:
+            return preflight
+        mention = PlaceMention(
+            quote=observation.text[:200],
+            search_terms=(place_term,),
+            parser="ocr_adopted",
+        )
+        resolution, notice = self._resolve_place_mentions(
+            state,
+            session,
+            (mention,),
+            include_prior_context=True,
+        )
+        return _ObservationAdoptionPreflight(
+            observation=observation,
+            place_term=place_term,
+            resolution=resolution,
+            notice=notice,
+        )
+
+    def _resolve_place_mentions(
+        self,
+        state: dict[str, Any],
+        session: GeoSession,
+        mentions: Sequence[PlaceMention],
+        *,
+        include_prior_context: bool,
+    ) -> tuple[PlaceResolutionBatch | None, str | None]:
+        """Resolve literal mentions through the existing bounded resolver.
+
+        All provider I/O remains outside the CAS write transaction. Both
+        free-text parsing and observation adoption may combine a bounded set of
+        still-unresolved prior literal terms when the current term looks like a
+        partial POI or street reference.
+        """
+
+        resolved_mentions = list(mentions)
+        if include_prior_context and self._mentions_need_context(resolved_mentions):
+            resolved_mentions.extend(self._prior_unresolved_mentions(state))
         confirmed = state.get("confirmed") or {}
         country = confirmed.get("country") if isinstance(confirmed, Mapping) else None
         country_iso = normalize_iso(country.get("id")) if isinstance(country, Mapping) else ""
@@ -689,27 +813,26 @@ class GuidedDialogueService:
         try:
             resolution = self.place_resolver.resolve(
                 self._store(),
-                mentions,
+                resolved_mentions,
                 country_iso=country_iso or None,
                 source_isos=scopes,
                 between_local_and_network=self.geo.rollback,
             )
         except Exception as exc:
             logger.warning("Place resolution unavailable (%s)", type(exc).__name__)
-            return _FreeTextPreflight(
-                parsed=parsed,
-                notice="地名检索暂时不可用；文字线索已保留，请补充城市、区名或附近地标。",
+            return (
+                None,
+                "地名检索暂时不可用；文字线索已保留，请补充城市、区名或附近地标。",
             )
-        return _FreeTextPreflight(
-            parsed=parsed,
-            resolution=resolution,
-            notice=resolution.notice,
-        )
+        return resolution, resolution.notice
 
     @staticmethod
     def _mentions_need_context(mentions: Sequence[PlaceMention]) -> bool:
         markers = ("路牌", "门牌", "招牌", "标牌", "指示牌", "旁边", "附近", "对面", "隔壁", "周围")
-        suffixes = ("大道", "大街", "路", "街", "巷", "弄", "胡同", "广场", "公园", "站", "桥")
+        suffixes = (
+            "大道", "大街", "路", "街", "巷", "弄", "胡同", "广场", "公园", "站", "桥",
+            *_POI_SUFFIXES,
+        )
         for mention in mentions:
             quote = str(getattr(mention, "quote", "") or "")
             if any(marker in quote for marker in markers):
@@ -756,14 +879,24 @@ class GuidedDialogueService:
 
     @staticmethod
     def _active_guided_clue_ids(state: Mapping[str, Any]) -> set[str]:
-        return {
-            str(record.get("id"))
-            for record in state.get("clues") or []
-            if isinstance(record, Mapping)
-            and record.get("id")
-            and str(record.get("_origin") or "") == "guided_user"
-            and str(record.get("status") or "pending") in {"pending", "confirmed"}
-        }
+        active: set[str] = set()
+        for record in state.get("clues") or []:
+            if not isinstance(record, Mapping) or not record.get("id"):
+                continue
+            origin_user = str(record.get("_origin") or "") == "guided_user"
+            adopted_observation = is_user_confirmed_observation(record.get("_extra"))
+            if not origin_user and not adopted_observation:
+                continue
+            status = str(record.get("status") or "pending")
+            if adopted_observation:
+                # A retracted/uncertain adopted observation must stop keeping
+                # its catalog resolution active; confirming can re-enable it
+                # within the existing TTL.
+                if status == "confirmed":
+                    active.add(str(record.get("id")))
+            elif status in {"pending", "confirmed"}:
+                active.add(str(record.get("id")))
+        return active
 
     # ----------------------------------------------------------- persistence
     def _event_by_id(self, session_id: int, event_id: str) -> GuidedEvent | None:
@@ -1161,6 +1294,12 @@ class GuidedDialogueService:
                 preserved = dict(record)
                 preserved["status"] = str(previous.get("status") or "pending")
                 preserved["_origin"] = "session"
+                previous_extra = previous.get("_extra")
+                if is_user_confirmed_observation(previous_extra):
+                    # Immutable machine evidence is rebuilt from the session,
+                    # but user-confirmed observation provenance belongs to the
+                    # review layer and must survive later reconciliation.
+                    preserved["_extra"] = dict(previous_extra)
                 reconciled_session.append(preserved)
             else:
                 reconciled_session.append(record)
@@ -1452,15 +1591,29 @@ class GuidedDialogueService:
         image_path: Path,
         source_iso: str,
         cache_key: CityRankingKey | None,
+        *,
+        city_ids: tuple[int, ...] | None = None,
     ) -> Mapping[str, Any] | None:
         """Load one validated raw city payload without holding locks over I/O."""
 
+        requested_city_ids = tuple(city_ids or ())
+        if cache_key is not None and cache_key.city_ids != requested_city_ids:
+            # Ordinary and targeted requests are distinct provider operations.
+            cache_key = replace(cache_key, city_ids=requested_city_ids)
         if cache_key is not None:
             hit, cached = CITY_RANKING_CACHE.get(cache_key)
             if hit:
                 return cached
         try:
-            result = self.gateway.rank_cities(image_path, source_iso)
+            if requested_city_ids:
+                result = self.gateway.rank_cities(
+                    image_path,
+                    source_iso,
+                    city_ids=requested_city_ids,
+                )
+            else:
+                # Keep old fake gateways compatible on the default path.
+                result = self.gateway.rank_cities(image_path, source_iso)
         except Exception:
             result = None
         if cache_key is not None:
@@ -1511,18 +1664,83 @@ class GuidedDialogueService:
                 else None
             )
             result = self._cached_city_ranking(image_path, source_iso, cache_key)
-            if not result:
-                continue
             rows = [
                 dict(row)
-                for row in result.get("city_scores") or []
+                for row in (result.get("city_scores") if result else []) or []
                 if isinstance(row, Mapping)
             ]
             scoped_rows = self._city_rows_for_source(source_iso)
             scoped_evidence = [
                 item for item in self._place_city_evidence(state)
-                if item.source_iso == source_iso
+                if normalize_iso(item.source_iso) == source_iso
+                and item.city_id in scoped_rows
             ]
+
+            raw_scored_ids: set[int] = set()
+            for row in rows:
+                try:
+                    city_id = int(str(row.get("city_id") or ""))
+                    score = float(row.get("score"))
+                except (TypeError, ValueError):
+                    continue
+                if (
+                    city_id in scoped_rows
+                    and normalize_iso(row.get("iso")) == source_iso
+                    and math.isfinite(score)
+                ):
+                    raw_scored_ids.add(city_id)
+
+            best_missing_evidence: dict[int, tuple[float, CityEvidence]] = {}
+            for item in scoped_evidence:
+                if item.city_id in raw_scored_ids:
+                    continue
+                try:
+                    confidence = float(item.confidence)
+                except (TypeError, ValueError):
+                    confidence = 0.0
+                if not math.isfinite(confidence):
+                    confidence = 0.0
+                current = best_missing_evidence.get(item.city_id)
+                if current is None or confidence > current[0]:
+                    best_missing_evidence[item.city_id] = (confidence, item)
+
+            target_ids = tuple(
+                city_id
+                for city_id, _ in sorted(
+                    best_missing_evidence.items(),
+                    key=lambda item: (-item[1][0], item[0]),
+                )[:MAX_TARGET_CITY_IDS]
+            )
+            if target_ids:
+                targeted_key = (
+                    replace(cache_key, city_ids=target_ids)
+                    if cache_key is not None
+                    else None
+                )
+                targeted = self._cached_city_ranking(
+                    image_path,
+                    source_iso,
+                    targeted_key,
+                    city_ids=target_ids,
+                )
+                seen_ids = {str(row.get("city_id") or "") for row in rows}
+                for row in (targeted.get("city_scores") if targeted else []) or []:
+                    if not isinstance(row, Mapping):
+                        continue
+                    city_id = str(row.get("city_id") or "")
+                    try:
+                        city_key = int(city_id)
+                    except (TypeError, ValueError):
+                        continue
+                    if city_id in seen_ids or city_key not in scoped_rows:
+                        continue
+                    if normalize_iso(row.get("iso")) != source_iso:
+                        continue
+                    rows.append(dict(row))
+                    seen_ids.add(city_id)
+
+            if not rows:
+                continue
             if scoped_rows and (clues or scoped_evidence) and rows:
                 try:
                     reranked = CityClueReasoner({source_iso: scoped_rows}).rerank(
@@ -1593,11 +1811,15 @@ class GuidedDialogueService:
                 return
             for field in ("score", "score_type", "reason", "selection_basis", "place_match"):
                 value = kwargs.get(field)
-                if value is not None and existing.get(field) is None:
+                if value is not None and (
+                    existing.get(field) is None
+                    or (field == "reason" and kwargs.get("score") is not None)
+                ):
                     existing[field] = value
 
-        # User-verified proposal targets are kept ahead of model scores by the
-        # frontend via selection_basis, even when the model has ten scored rows.
+        # Explicit proposal provenance is retained, but real scores determine
+        # city-stage ordering. An unscored proposal is displayed after scored
+        # rows rather than being allowed to masquerade above the model.
         for raw in proposals:
             if not isinstance(raw, Mapping) or raw.get("level") != "city":
                 continue
@@ -1619,6 +1841,12 @@ class GuidedDialogueService:
                     selection_basis="catalog_search",
                 )
 
+        evidence_city_ids = {
+            str(item.city_id)
+            for item in self._place_city_evidence(state)
+            if normalize_iso(item.source_iso) in country_scopes
+            and item.city_id in rows
+        }
         for city_id, ranked in ranks.items():
             try:
                 row = rows[int(city_id)]
@@ -1628,7 +1856,15 @@ class GuidedDialogueService:
                 self._city_target(row),
                 score=ranked.get("score"),
                 score_type=ranked.get("score_type"),
-                reason="图片城市排序",
+                reason=(
+                    "图片+文字地点证据"
+                    if (
+                        str(city_id) in evidence_city_ids
+                        or ranked.get("matched_clues")
+                        or ranked.get("fusion") is not None
+                    )
+                    else "图片城市排序"
+                ),
             )
 
         fallback = sorted(
@@ -1648,8 +1884,6 @@ class GuidedDialogueService:
             original_name_key = normalize_place_text(row.name) if row is not None else ""
             basis = str(item.get("selection_basis") or "")
             basis_rank = 0 if basis == "user_text" else 1 if basis == "catalog_search" else 2
-            if item.get("score") is None and basis_rank == 2:
-                basis_rank = 3
             # Display labels are localized, while exact matching must continue
             # to recognize the original catalog/model name.
             exact = (
@@ -1657,21 +1891,25 @@ class GuidedDialogueService:
                 else 1
             )
             try:
-                score = -float(item.get("score"))
+                raw_score = float(item.get("score"))
             except (TypeError, ValueError):
-                score = 1.0
+                raw_score = None
+            if raw_score is not None and not math.isfinite(raw_score):
+                raw_score = None
             meta = (state.get("proposal_meta") or {}).get(
                 f"city:{target.get('id')}"
             )
             ambiguous = bool(
                 isinstance(meta, Mapping) and meta.get("ambiguous")
             )
-            if ambiguous:
-                score = 1.0
             population = 0 if ambiguous or row is None else -row.population
             label_order = label_key if ambiguous else ""
             return (
-                basis_rank, exact, score, 0 if ambiguous else 1,
+                0 if raw_score is not None else 1,
+                -raw_score if raw_score is not None else 0.0,
+                basis_rank,
+                exact,
+                0 if ambiguous else 1,
                 label_order, population, str(target.get("id") or ""),
             )
 
@@ -2629,6 +2867,8 @@ class GuidedDialogueService:
             return self._apply_backtrack(state, event)
         if event_type == "free_text":
             return self._apply_free_text(state, session, event, preflight=preflight)
+        if event_type == "adopt_observation":
+            return self._apply_adopted_observation(state, event, preflight=preflight)
         if event_type == "answer":
             return self._apply_answer(state, event)
         if event_type == "unknown":
@@ -3096,6 +3336,237 @@ class GuidedDialogueService:
             summary = f"{preflight.notice} {summary}".strip()
         return self._outcome(state, True, "applied", summary)
 
+    @staticmethod
+    def _literal_ocr_text(record: Mapping[str, Any]) -> str:
+        extra = record.get("_extra") if isinstance(record.get("_extra"), Mapping) else {}
+        for value in (extra.get("adopted_text"), extra.get("literal"), record.get("value")):
+            text = str(value or "").strip()
+            if text:
+                return text
+        return ""
+
+    @staticmethod
+    def _is_literal_ocr_record(record: Mapping[str, Any]) -> bool:
+        if str(record.get("dimension") or "") == "signage":
+            return True
+        extra = record.get("_extra") if isinstance(record.get("_extra"), Mapping) else {}
+        return bool(
+            extra.get("observation_kind") == "ocr_text"
+            or extra.get("literal_kind") in {
+                "adopted_ocr_observation",
+                "reported_signage",
+                "standalone_street_label",
+            }
+        )
+
+    @classmethod
+    def _confirmed_adoption_record(
+        cls,
+        state: Mapping[str, Any],
+        observation: AdoptedOcrObservation,
+    ) -> Mapping[str, Any] | None:
+        for record in state.get("clues") or []:
+            if not isinstance(record, Mapping):
+                continue
+            if str(record.get("status") or "") != "confirmed":
+                continue
+            extra = record.get("_extra")
+            if is_user_confirmed_observation(extra) and observation.matches_extra(extra):
+                return record
+        return None
+
+    @classmethod
+    def _find_literal_ocr_record(
+        cls,
+        state: Mapping[str, Any],
+        observation: AdoptedOcrObservation,
+    ) -> Mapping[str, Any] | None:
+        assert_key = normalize_place_text(observation.text) or observation.text.casefold()
+        matches: list[tuple[tuple[Any, ...], Mapping[str, Any]]] = []
+        for index, record in enumerate(state.get("clues") or []):
+            if not isinstance(record, Mapping) or not cls._is_literal_ocr_record(record):
+                continue
+            candidates = {
+                normalize_place_text(cls._literal_ocr_text(record)),
+                normalize_place_text(record.get("value")),
+            }
+            candidates.discard("")
+            if assert_key not in candidates:
+                continue
+            extra = record.get("_extra") if isinstance(record.get("_extra"), Mapping) else {}
+            status = str(record.get("status") or "pending")
+            matches.append((
+                (
+                    0 if observation.matches_extra(extra) else 1,
+                    0 if status == "pending" else 1 if status == "confirmed" else 2,
+                    0 if str(record.get("_origin") or "") == "guided_user" else 1,
+                    index,
+                ),
+                record,
+            ))
+        return min(matches, key=lambda item: item[0])[1] if matches else None
+
+    def _apply_adopted_observation(
+        self,
+        state: dict[str, Any],
+        event: GuidedEventRequest,
+        *,
+        preflight: _FreeTextPreflight | _ObservationAdoptionPreflight | None = None,
+    ) -> dict[str, Any]:
+        if not isinstance(preflight, _ObservationAdoptionPreflight):
+            raise GuidedValidationError("缺少已校验的 OCR 观察")
+        observation = preflight.observation
+        existing = self._confirmed_adoption_record(state, observation)
+        if existing is not None:
+            outcome = self._outcome(
+                state,
+                False,
+                "unchanged",
+                "该 OCR 文字及来源此前已经采用，无需重复操作。",
+            )
+            outcome["adopted_clue_id"] = str(existing.get("id") or "")
+            return outcome
+
+        record = self._find_literal_ocr_record(state, observation)
+        clue_id = str(record.get("id") or "") if isinstance(record, Mapping) else ""
+        status_changed = False
+        provenance_changed = False
+        if record is not None:
+            updated = dict(record)
+            extra, provenance_changed = observation.merge_into_extra(
+                updated.get("_extra"),
+                event_id=event.event_id,
+                place_term=preflight.place_term,
+            )
+            status_changed = str(updated.get("status") or "pending") != "confirmed"
+            updated["status"] = "confirmed"
+            updated["_extra"] = extra
+            state["clues"] = [
+                updated
+                if isinstance(item, Mapping) and str(item.get("id") or "") == clue_id
+                else item
+                for item in state.get("clues") or []
+            ]
+        else:
+            extra, provenance_changed = observation.merge_into_extra(
+                {},
+                event_id=event.event_id,
+                place_term=preflight.place_term,
+            )
+            evidence = observation.evidence or (
+                f"用户确认局部 OCR 文字「{observation.text[:160]}」。"
+            )
+            raw = {
+                "dimension": "signage",
+                "value": observation.text[:256],
+                "confidence": observation.confidence if observation.confidence is not None else 0.8,
+                "evidence": evidence,
+                "source": "user",
+                "extra": extra,
+            }
+            updated = _reviewed_record(raw)
+            updated["status"] = "confirmed"
+            updated["_origin"] = "guided_user"
+            clue_id = str(updated.get("id") or "")
+            state.setdefault("clues", []).append(updated)
+            status_changed = True
+        final_extra = dict(updated.get("_extra") or {})
+        final_extra.update({
+            "literal_kind": str(final_extra.get("literal_kind") or "adopted_ocr_observation"),
+            "display_only": True,
+            "affects_ranking": False,
+            "reliable": True,
+            "validated": True,
+        })
+        updated["_extra"] = final_extra
+        if record is not None:
+            state["clues"] = [
+                updated
+                if isinstance(item, Mapping) and str(item.get("id") or "") == clue_id
+                else item
+                for item in state.get("clues") or []
+            ]
+
+        resolution_added = False
+        if preflight.resolution is not None:
+            resolution_added = self._record_place_resolution(state, preflight.resolution)
+        self._refresh_derived_proposals(state)
+        state["pending_question"] = None
+        self._refresh_conflict(state)
+        effective = bool(status_changed or provenance_changed or resolution_added)
+        if not effective:
+            outcome = self._outcome(
+                state,
+                False,
+                "unchanged",
+                "该 OCR 文字及来源此前已经采用，无需重复操作。",
+            )
+        else:
+            outcome = self._outcome(
+                state,
+                True,
+                "applied",
+                self._adoption_summary(
+                    state,
+                    observation,
+                    preflight,
+                    preflight.resolution,
+                ),
+            )
+        outcome["adopted_clue_id"] = clue_id
+        return outcome
+
+    def _adoption_summary(
+        self,
+        state: Mapping[str, Any],
+        observation: AdoptedOcrObservation,
+        preflight: _ObservationAdoptionPreflight,
+        resolution: PlaceResolutionBatch | None,
+    ) -> str:
+        text = observation.text if len(observation.text) <= 80 else observation.text[:77] + "…"
+        prefix = f"文字已采用（OCR 原文「{text}」，来源已记录）"
+        if resolution is None:
+            notice = str(preflight.notice or "地点检索暂时不可用。").strip()
+            return (
+                f"{prefix}；地点检索失败：{notice} "
+                "文字已保存，但尚无地点检索结果，不声称已影响排序。"
+            )
+        status = str(resolution.status or "")
+        if status == "resolved":
+            labels = [
+                str(item.get("label") or item.get("id") or "")
+                for item in state.get("proposals") or []
+                if isinstance(item, Mapping) and item.get("level") == "city"
+            ]
+            suffix = f"命中目录城市候选{'、'.join(labels)}" if labels else "已产生可核验目录候选"
+            return (
+                f"{prefix}；地点检索成功，{suffix}。"
+                "已进入既有地点候选/统一评分链，仍需你明确确认，不会自动确认城市或坐标。"
+            )
+        if status == "ambiguous":
+            notice = str(resolution.notice or "命中的地点不唯一。").strip()
+            return (
+                f"{prefix}；地点检索结果有歧义：{notice} "
+                "文字已保存，需补充城市、区名或附近地标，不会自动选择。"
+            )
+        if status == "unavailable":
+            notice = str(resolution.notice or "地名检索暂时不可用。").strip()
+            return (
+                f"{prefix}；地点检索失败：{notice} "
+                "文字已保存，但尚无地点检索结果，不声称已影响排序。"
+            )
+        if status == "foreign_conflict":
+            notice = str(resolution.notice or "检索结果与当前国家不一致。").strip()
+            return (
+                f"{prefix}；地点检索结果与当前国家冲突：{notice} "
+                "文字已保存，未自动改变已确认路径。"
+            )
+        notice = str(resolution.notice or "未找到可核验的城市结果。").strip()
+        return (
+            f"{prefix}；地点检索无结果：{notice} "
+            "文字已保存，尚未产生地点候选，不声称已影响排序。"
+        )
+
     def _apply_answer(
         self,
         state: dict[str, Any],
@@ -3488,11 +3959,14 @@ class GuidedDialogueService:
         for record in state.get("clues") or []:
             if not isinstance(record, Mapping):
                 continue
-            if str(record.get("_origin") or "") != "guided_user":
+            extra = record.get("_extra") if isinstance(record.get("_extra"), Mapping) else {}
+            if (
+                str(record.get("_origin") or "") != "guided_user"
+                and not is_user_confirmed_observation(extra)
+            ):
                 continue
             if str(record.get("status") or "pending") not in {"pending", "confirmed"}:
                 continue
-            extra = record.get("_extra") if isinstance(record.get("_extra"), Mapping) else {}
             record_terms = {
                 normalize_place_text(item)
                 for item in extra.get("place_terms", [])
@@ -3905,6 +4379,27 @@ class GuidedDialogueService:
             seen.add(key)
             rows.append(dict(row))
 
+        # User-confirmed observation provenance may belong to an otherwise
+        # immutable session clue. Surface the review-layer copy first so the
+        # public clue carries the adopted source instead of losing it in the
+        # duplicate-key check against the raw machine row.
+        for record in state.get("clues") or []:
+            if not isinstance(record, Mapping):
+                continue
+            if not is_user_confirmed_observation(record.get("_extra")):
+                continue
+            clue = _reviewed_to_clue(record)
+            if clue is None:
+                continue
+            row = clue.to_dict()
+            extra = dict(row.get("extra") or {})
+            extra.update({
+                "guided": True,
+                "guided_clue_id": str(record.get("id") or ""),
+                "guided_status": str(record.get("status") or "pending"),
+            })
+            row["extra"] = extra
+            add(row)
         for item in session.clues or []:
             if isinstance(item, Mapping):
                 add(item)

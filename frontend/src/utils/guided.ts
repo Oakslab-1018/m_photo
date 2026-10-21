@@ -464,9 +464,11 @@ function mergeGuidedCandidate(
 }
 
 /**
- * Deduplicate and rank guided candidates without inventing confidence:
- * authorized user/catalog matches first, then real finite model scores, then
- * unscored catalog rows. Legacy admin1 candidates never enter a public stage.
+ * Deduplicate and rank guided candidates without inventing confidence. At the
+ * country stage, authorized user/catalog matches retain their explicit
+ * priority. At the city stage, every real finite score sorts together in
+ * descending order; selection basis only breaks score ties or orders unscored
+ * catalog rows. Legacy admin1 candidates never enter a public stage.
  */
 export function selectTopGuidedCandidates(
   candidates: readonly LocationCandidate[],
@@ -492,6 +494,26 @@ export function selectTopGuidedCandidates(
   }
 
   const unique = [...uniqueByKey.values()]
+  if (stage === 'city') {
+    const scored = unique
+      .filter((entry) => entry.score !== null)
+      .sort(
+        (left, right) =>
+          (right.score as number) - (left.score as number) ||
+          left.basisRank - right.basisRank ||
+          left.index - right.index,
+      )
+    const unscored = unique
+      .filter((entry) => entry.score === null)
+      .sort(
+        (left, right) =>
+          left.basisRank - right.basisRank || left.index - right.index,
+      )
+    return [...scored, ...unscored]
+      .slice(0, GUIDED_CANDIDATE_LIMIT)
+      .map(({ candidate }) => candidate)
+  }
+
   const explicit = unique
     .filter((entry) => entry.basisRank < 2)
     .sort(

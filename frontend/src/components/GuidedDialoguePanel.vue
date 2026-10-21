@@ -373,15 +373,18 @@ const composerHint = computed(() => {
   }
   return `可直接输入${candidateLevelName.value}名称检索目录；提交不会自动确认地点。`
 })
-const composerReceiptText = computed(() => safeGuidedReceipt(props.receipt?.summary))
+const latestReceiptText = computed(() => safeGuidedReceipt(props.receipt?.summary))
 const receiptStatusText = computed(() => {
-  const summary = composerReceiptText.value
+  const summary = latestReceiptText.value
   if (summary) return summary
   const status = props.receipt?.status?.trim().toLowerCase()
   if (status === 'unchanged') return '这条线索此前已保存，无需重复提交。'
   if (status === 'unrecognized') return '没有识别到新的线索。'
   return '操作已应用'
 })
+const submissionReceiptText = computed(() =>
+  safeGuidedReceipt(props.freeTextSubmission?.receipt?.summary),
+)
 const composerStatusText = computed(() => {
   const submission = props.freeTextSubmission
   if (!submission) return ''
@@ -397,8 +400,8 @@ const composerStatusText = computed(() => {
   if (submission.status === 'unchanged') {
     return '这条线索已记录，无需重复添加。'
   }
-  return composerReceiptText.value
-    ? `助手反馈：${composerReceiptText.value}`
+  return submissionReceiptText.value
+    ? `助手反馈：${submissionReceiptText.value}`
     : '已收到，助手会继续核对。'
 })
 

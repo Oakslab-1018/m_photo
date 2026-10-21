@@ -76,6 +76,7 @@ SCENE_DIMENSIONS = frozenset(SCENE_GROUP_VALUES)
 # The city contract mirrors the inference service: at most CITY_TOP_N rows are
 # returned, and the reference sidecar is bounded at 10 matches / 20 region rows.
 MAX_CITY_ROWS = 10
+MAX_TARGET_CITY_IDS = 10
 MAX_REFERENCE_MATCHES = 10
 MAX_REFERENCE_REGIONS = 20
 CITY_SCORE_TYPES = {"city_text_cosine", "city_reference_hybrid"}
@@ -89,6 +90,28 @@ _REFERENCE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _REGION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _SCENE_VALUE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 logger = logging.getLogger(__name__)
+
+
+def _normalize_target_city_ids(city_ids: object) -> tuple[int, ...]:
+    """Validate a bounded, unique target-city ID sequence."""
+    if isinstance(city_ids, (str, bytes, bytearray)):
+        raise ValueError("city_ids must be an integer sequence")
+    try:
+        values = tuple(city_ids)  # type: ignore[arg-type]
+    except TypeError as exc:
+        raise ValueError("city_ids must be an integer sequence") from exc
+    if not 1 <= len(values) <= MAX_TARGET_CITY_IDS:
+        raise ValueError("invalid city_ids length")
+    normalized: list[int] = []
+    seen: set[int] = set()
+    for city_id in values:
+        if isinstance(city_id, bool) or not isinstance(city_id, int) or city_id <= 0:
+            raise ValueError("invalid city id")
+        if city_id in seen:
+            raise ValueError("duplicate city id")
+        seen.add(city_id)
+        normalized.append(city_id)
+    return tuple(normalized)
 
 
 def _finite_cosine(value: object, label: str) -> float:
@@ -251,27 +274,47 @@ class StreetClipGateway:
             logger.warning("StreetCLIP unavailable; using rules (%s)", type(exc).__name__)
             return None
 
-    def rank_cities(self, path: str | Path, iso: str) -> dict | None:
+    def rank_cities(
+        self,
+        path: str | Path,
+        iso: str,
+        *,
+        city_ids: tuple[int, ...] | None = None,
+    ) -> dict | None:
         """Rank ``iso``'s catalog cities for the image at ``path``.
 
         Returns the validated payload, or ``None`` whenever the model service
         is disabled, unreachable or answered outside the contract: city
         candidates are an optional enrichment, so every failure degrades to
         "no city candidates" and never to an error the user cannot act on.
+
+        ``city_ids`` switches to targeted scoring. The service must echo real
+        scores for exactly those bounded catalog IDs; a legacy service that
+        ignores the field and returns its ordinary top-N pool is rejected.
         """
         if not self.settings.streetclip_enabled:
             return None
         requested = str(iso or "").strip().upper()
         try:
+            targeted_city_ids = (
+                _normalize_target_city_ids(city_ids) if city_ids is not None else None
+            )
             url, timeout = self._endpoint()
             payload = clean_image(path)
+            data = {"country_iso": requested}
+            if targeted_city_ids is not None:
+                data["city_ids"] = json.dumps(
+                    list(targeted_city_ids), separators=(",", ":")
+                )
             with httpx.Client(transport=self.transport, timeout=httpx.Timeout(timeout, connect=min(timeout, 3)),
                               follow_redirects=False, trust_env=False) as client:
                 response = client.post(url + "/predict-cities", headers=self._headers(),
                                        files={"file": ("image.jpg", payload, "image/jpeg")},
-                                       data={"country_iso": requested})
+                                       data=data)
                 response.raise_for_status()
                 result = self.validate_city_ranking(response.json(), requested)
+                if targeted_city_ids is not None:
+                    self._validate_targeted_city_ranking(result, targeted_city_ids)
             return {**result, "schema_version": 1, "provider_status": "ok",
                     "image_sha256": hashlib.sha256(payload).hexdigest()}
         except Exception as exc:
@@ -773,6 +816,26 @@ class StreetClipGateway:
             "status": status,
             "city_scores": cities,
         }
+
+    @staticmethod
+    def _validate_targeted_city_ranking(
+        result: dict,
+        requested_city_ids: tuple[int, ...],
+    ) -> None:
+        """Reject an ordinary top-N response masquerading as targeted scoring."""
+        if result.get("status") != "ok":
+            raise ValueError("targeted city ranking is incomplete")
+        scope = result.get("scope")
+        if not isinstance(scope, dict):
+            raise ValueError("targeted city scope is missing")
+        if scope.get("cities_considered") != len(requested_city_ids):
+            raise ValueError("targeted city count is misleading")
+        rows = result.get("city_scores")
+        if not isinstance(rows, list) or len(rows) != len(requested_city_ids):
+            raise ValueError("targeted city ranking is incomplete")
+        returned_ids = {int(row["city_id"]) for row in rows if isinstance(row, dict)}
+        if len(returned_ids) != len(rows) or returned_ids != set(requested_city_ids):
+            raise ValueError("targeted city IDs do not match")
 
     def validate_crop(self, data: object, region: dict) -> dict:
         """Build a validated crop record (ranking + click region) for storage."""

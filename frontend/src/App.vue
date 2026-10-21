@@ -11,9 +11,14 @@ import type {
   Clue,
   FeedbackPayload,
   FeedbackResponse,
+  GuidedEventReceipt,
   LocationTarget,
+  ObservationAdoptionRequest,
+  ObservationAdoptionStatus,
+  ObservationAdoptionSubmission,
   PendingChatMessage,
   RegionAnalysisRecord,
+  RegionObservation,
   RegionQuestion,
   RegionReport,
 } from '@/types'
@@ -103,6 +108,7 @@ const immediateRegionReports = ref<RegionReport[]>([])
 const selectedRegionReportId = ref<string | null>(null)
 const guidedDraftText = ref<string | null>(null)
 const guidedFreeTextSubmission = ref<GuidedFreeTextSubmission | null>(null)
+const observationAdoption = ref<ObservationAdoptionSubmission | null>(null)
 
 type FocusMode = 'collab' | 'map' | 'photo'
 type MobileSheetState = 'peek' | 'half' | 'full'
@@ -151,6 +157,7 @@ let cityRequestNonce = 0
 let pendingNonce = 0
 let regionRequestNonce = 0
 let guidedFreeTextNonce = 0
+let observationAdoptionNonce = 0
 
 const regionReports = computed(() =>
   mergeRegionReports(regionReportsFromMessages(session.messages.value), immediateRegionReports.value),
@@ -199,6 +206,14 @@ const guidedRankingsUnlocked = computed(() => guided.rankingsUnlocked.value)
 const guidedCandidatesVisible = computed(() => guided.candidatesVisible.value)
 const guidedConfirmationReady = computed(() => guided.locationConfirmationReady.value)
 const guidedDataReady = computed(() => guided.dialogue.value !== null)
+const observationAdoptionRetryable = computed(() => {
+  const adoption = observationAdoption.value
+  return Boolean(
+    adoption &&
+    adoption.status === 'failed' &&
+    guided.isRetryableAdoption(adoption.report_id, adoption.observation_id),
+  )
+})
 const guidedVisibleCandidates = computed(() =>
   guided.confidenceShortcut.value
     ? guided.confidenceCandidates.value
@@ -641,6 +656,11 @@ function resetGuidedFreeTextSubmission(): void {
   guidedFreeTextSubmission.value = null
 }
 
+function resetObservationAdoption(): void {
+  observationAdoptionNonce += 1
+  observationAdoption.value = null
+}
+
 function resetTransientUi(): void {
   viewerOpen.value = false
   focusedClue.value = null
@@ -656,6 +676,7 @@ function resetTransientUi(): void {
   pointStatus.value = '点选或框选区域后，点击“分析选定区域”；分析结果只作为线索。'
   pointStatusKind.value = 'idle'
   resetGuidedFreeTextSubmission()
+  resetObservationAdoption()
   resetRegionAnalysisState()
 }
 
@@ -1315,7 +1336,7 @@ async function onGuidedFreeText(text: string): Promise<void> {
   if (!submitted) return
   const nonce = ++guidedFreeTextNonce
   const sessionId = session.sessionId.value
-  guidedFreeTextSubmission.value = { text: submitted, status: 'pending' }
+  guidedFreeTextSubmission.value = { text: submitted, status: 'pending', receipt: null }
   const applied = await guided.freeText(submitted)
   if (nonce !== guidedFreeTextNonce || session.sessionId.value !== sessionId) return
   if (!applied) {
@@ -1323,16 +1344,21 @@ async function onGuidedFreeText(text: string): Promise<void> {
       text: submitted,
       status: 'failed',
       error: guided.error.value ?? guided.conflict.value ?? '提交失败，请重试。',
+      receipt: null,
     }
     return
   }
 
-  const outcome = guidedFreeTextReceiptOutcome(guided.receipt.value)
+  // Snapshot the receipt produced by this exact event before any later guided
+  // action can replace the shared latest receipt.
+  const receipt = guided.receipt.value ? { ...guided.receipt.value } : null
+  const outcome = guidedFreeTextReceiptOutcome(receipt)
   if (outcome.status === 'failed') {
     guidedFreeTextSubmission.value = {
       text: submitted,
       status: 'failed',
       error: outcome.error ?? '没有识别到新的线索，请修改后重试。',
+      receipt,
     }
     return
   }
@@ -1340,7 +1366,154 @@ async function onGuidedFreeText(text: string): Promise<void> {
   guidedDraftText.value = null
   // Preserve the server's distinction between an applied mutation and an
   // acknowledged pre-existing clue; never relabel unchanged as applied.
-  guidedFreeTextSubmission.value = { text: submitted, status: outcome.status }
+  guidedFreeTextSubmission.value = { text: submitted, status: outcome.status, receipt }
+}
+
+function findRegionObservation(
+  reportId: string,
+  observationId: string,
+): { report: RegionReport; observation: RegionObservation } | null {
+  const report = regionReports.value.find((item) => item.id === reportId)
+  const observation = report?.observations.find((item) => item.id === observationId)
+  return report && observation ? { report, observation } : null
+}
+
+function canAdoptRegionObservation(report: RegionReport, observation: RegionObservation): boolean {
+  return (
+    observation.kind === 'ocr_text' &&
+    report.ocr.available &&
+    report.ocr.state.toLowerCase() !== 'mock' &&
+    Boolean(observation.text?.trim())
+  )
+}
+
+function observationAdoptionOutcome(
+  receipt: GuidedEventReceipt | null,
+): { status: Exclude<ObservationAdoptionStatus, 'pending'>; error?: string | null } {
+  const status = receipt?.status?.trim().toLowerCase() ?? ''
+  if (status === 'applied') return { status: 'applied' }
+  if (status === 'unchanged') return { status: 'unchanged' }
+  if (status === 'unrecognized') {
+    return {
+      status: 'failed',
+      error: receipt?.summary?.trim() || '后端未能确认该 OCR 观察，地点未被自动确认。',
+    }
+  }
+  return {
+    status: 'unconfirmed',
+    error: '服务器未返回可识别的采用回执，请核对最新引导状态后再试。',
+  }
+}
+
+function completeObservationAdoption(
+  base: ObservationAdoptionSubmission,
+  applied: boolean,
+): void {
+  if (!applied) {
+    observationAdoption.value = {
+      ...base,
+      status: 'failed',
+      receipt: null,
+      error: guided.error.value ?? guided.conflict.value ?? '确认文字失败，请重试。',
+    }
+    return
+  }
+  const receipt = guided.receipt.value ? { ...guided.receipt.value } : null
+  const outcome = observationAdoptionOutcome(receipt)
+  observationAdoption.value = {
+    ...base,
+    status: outcome.status,
+    receipt,
+    error: outcome.error ?? null,
+  }
+}
+
+async function onAdoptObservation(request: ObservationAdoptionRequest): Promise<void> {
+  if (busy.value) return
+  const reportId = request.report_id.trim()
+  const observationId = request.observation_id.trim()
+  if (!reportId || !observationId) return
+
+  const match = findRegionObservation(reportId, observationId)
+  if (!match || !canAdoptRegionObservation(match.report, match.observation)) {
+    observationAdoption.value = {
+      report_id: reportId,
+      observation_id: observationId,
+      text: match?.observation.text?.trim() ?? '',
+      status: 'failed',
+      receipt: null,
+      error: '该 OCR 观察当前不可采用，请重新分析区域后重试。',
+    }
+    return
+  }
+
+  const sessionId = session.sessionId.value
+  if (sessionId === null) return
+  const epoch = sessionEpoch.value
+  const nonce = ++observationAdoptionNonce
+  const base: ObservationAdoptionSubmission = {
+    report_id: reportId,
+    observation_id: observationId,
+    text: match.observation.text!.trim(),
+    status: 'pending',
+    receipt: null,
+    error: null,
+  }
+  observationAdoption.value = base
+  const applied = await guided.adoptObservation(reportId, observationId)
+  if (
+    nonce !== observationAdoptionNonce ||
+    session.sessionId.value !== sessionId ||
+    epoch !== sessionEpoch.value
+  ) {
+    return
+  }
+  completeObservationAdoption(base, applied)
+}
+
+async function retryObservationAdoption(): Promise<void> {
+  if (busy.value) return
+  const current = observationAdoption.value
+  if (
+    !current ||
+    current.status !== 'failed' ||
+    !guided.isRetryableAdoption(current.report_id, current.observation_id)
+  ) {
+    return
+  }
+
+  const sessionId = session.sessionId.value
+  if (sessionId === null) return
+  const epoch = sessionEpoch.value
+  const nonce = ++observationAdoptionNonce
+  const base: ObservationAdoptionSubmission = {
+    ...current,
+    status: 'pending',
+    receipt: null,
+    error: null,
+  }
+  observationAdoption.value = base
+  const applied = await guided.retry()
+  if (
+    nonce !== observationAdoptionNonce ||
+    session.sessionId.value !== sessionId ||
+    epoch !== sessionEpoch.value
+  ) {
+    return
+  }
+  completeObservationAdoption(base, applied)
+}
+
+async function retryGuidedOperation(): Promise<void> {
+  const current = observationAdoption.value
+  if (
+    current?.status === 'failed' &&
+    guided.isRetryableAdoption(current.report_id, current.observation_id)
+  ) {
+    await retryObservationAdoption()
+    return
+  }
+  await guided.retry()
 }
 
 async function requestCities(iso: string, sourceIso?: string | null): Promise<void> {
@@ -1847,7 +2020,7 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
                 @back-to-review="guided.returnToReview()"
                 @review-back="guided.reviewBack()"
                 @free-text="onGuidedFreeText"
-                @retry="guided.retry"
+                @retry="retryGuidedOperation"
               />
 
               <div v-else class="legacy-reasoning">
@@ -2003,10 +2176,14 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
       :region-requests="regionRequests"
       :disabled="!hasSession || busy"
       :focused-clue="focusedClue"
+      :observation-adoption="observationAdoption"
+      :observation-adoption-retryable="observationAdoptionRetryable"
       @analyze="analyzeRegionRequest"
       @select-region="selectedRegionReportId = $event"
       @retry-region="retryRegionRequest"
       @ask-question="useRegionQuestion"
+      @adopt-observation="onAdoptObservation"
+      @retry-observation-adoption="retryObservationAdoption"
       @selection-change="onRegionSelectionChange"
       @close="viewerOpen = false"
     />

@@ -5,6 +5,8 @@ import type {
   AnalyzePurpose,
   Clue,
   ImageRegion,
+  ObservationAdoptionRequest,
+  ObservationAdoptionSubmission,
   Point,
   RegionAnalysisRecord,
   RegionQuestion,
@@ -27,6 +29,8 @@ const props = withDefaults(
     statusKind: 'idle' | 'loading' | 'success' | 'error'
     disabled?: boolean
     focusedClue?: Clue | null
+    observationAdoption?: ObservationAdoptionSubmission | null
+    observationAdoptionRetryable?: boolean
   }>(),
   {
     clickPoints: () => [],
@@ -35,6 +39,8 @@ const props = withDefaults(
     regionRequests: () => [],
     disabled: false,
     focusedClue: null,
+    observationAdoption: null,
+    observationAdoptionRetryable: false,
   },
 )
 
@@ -43,6 +49,8 @@ const emit = defineEmits<{
   'select-region': [reportId: string]
   'retry-region': [request: AnalyzePointRequest]
   'ask-question': [question: RegionQuestion]
+  'adopt-observation': [request: ObservationAdoptionRequest]
+  'retry-observation-adoption': []
   'selection-change': []
   close: []
 }>()
@@ -349,6 +357,14 @@ function askQuestion(question: RegionQuestion): void {
   if (!interactionDisabled.value) emit('ask-question', question)
 }
 
+function adoptObservation(request: ObservationAdoptionRequest): void {
+  if (!interactionDisabled.value) emit('adopt-observation', request)
+}
+
+function retryObservationAdoption(): void {
+  if (!interactionDisabled.value) emit('retry-observation-adoption')
+}
+
 function selectReport(reportId: string): void {
   emit('select-region', reportId)
 }
@@ -524,9 +540,13 @@ onBeforeUnmount(() => {
             :requests="regionRequests"
             :analyzing="analyzing"
             :disabled="disabled"
+            :observation-adoption="observationAdoption"
+            :observation-adoption-retryable="observationAdoptionRetryable"
             @select-region="selectReport"
             @retry-region="retryRequest"
             @ask-question="askQuestion"
+            @adopt-observation="adoptObservation"
+            @retry-observation-adoption="retryObservationAdoption"
           />
           <div v-else class="viewer-report-empty">
             <strong>分析报告</strong>
