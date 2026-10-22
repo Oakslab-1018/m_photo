@@ -20,7 +20,7 @@ import time
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Callable, Mapping, Protocol, Sequence
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import httpx
 
@@ -28,12 +28,26 @@ logger = logging.getLogger(__name__)
 
 PHOTON_DEFAULT_URL = "https://photon.komoot.io/api"
 NOMINATIM_DEFAULT_URL = "https://nominatim.openstreetmap.org/search"
+MAPTILER_DEFAULT_URL = "https://api.maptiler.com/geocoding"
 OSM_ATTRIBUTION = "© OpenStreetMap contributors"
+MAPTILER_ATTRIBUTION = "© MapTiler © OpenStreetMap contributors"
 OSM_LICENSE = "ODbL"
 
 _MAX_RESPONSE_BYTES = 512 * 1024
 _MAX_TERMS = 4
 _MAX_TERM_LENGTH = 60
+
+# Only transport-level failures are retried inside one logical lookup. HTTP
+# status failures keep their existing semantics: 429/5xx are retryable for
+# cooldown purposes, but an immediate retry would just add load to a provider
+# that already asked us to back off.
+_RETRYABLE_NETWORK_REASONS = frozenset({
+    "connect_timeout",
+    "read_timeout",
+    "timeout",
+    "connect_error",
+    "transport_error",
+})
 
 
 class GeocodingError(RuntimeError):
@@ -79,6 +93,9 @@ class GeocodingConfig:
     language: str = "en"
     timeout_seconds: float = 4.0
     connect_timeout_seconds: float = 1.5
+    max_attempts: int = 3
+    retry_backoff_seconds: float = 0.5
+    keepalive_seconds: float = 60.0
     min_interval_seconds: float = 1.0
     cache_max_entries: int = 512
     cache_ttl_seconds: float = 24 * 60 * 60
@@ -86,19 +103,40 @@ class GeocodingConfig:
     result_limit: int = 5
     user_agent: str = "MPhoto/0.1 (bounded place search)"
     api_key: str = field(default="", repr=False)
+    referer: str = field(default="", repr=False)
     failure_cooldown_seconds: float = 30.0
 
     def __post_init__(self) -> None:
         provider = str(self.provider or "none").strip().lower()
         object.__setattr__(self, "provider", provider)
-        if provider not in {"photon", "nominatim", "none"}:
-            raise ValueError("geocoder provider must be photon, nominatim, or none")
+        if provider not in {"photon", "nominatim", "maptiler", "none"}:
+            raise ValueError(
+                "geocoder provider must be photon, nominatim, maptiler, or none"
+            )
         if provider == "nominatim" and self.base_url == PHOTON_DEFAULT_URL:
             object.__setattr__(self, "base_url", NOMINATIM_DEFAULT_URL)
+        if provider == "maptiler" and self.base_url in {
+            PHOTON_DEFAULT_URL,
+            NOMINATIM_DEFAULT_URL,
+        }:
+            object.__setattr__(self, "base_url", MAPTILER_DEFAULT_URL)
+        referer = str(self.referer or "").strip()
+        if "\r" in referer or "\n" in referer:
+            raise ValueError("geocoder referer must not contain line breaks")
+        object.__setattr__(self, "referer", referer[:500])
         if self.timeout_seconds <= 0 or not math.isfinite(self.timeout_seconds):
             raise ValueError("geocoder timeout must be positive and finite")
         if self.connect_timeout_seconds <= 0 or not math.isfinite(self.connect_timeout_seconds):
             raise ValueError("geocoder connect timeout must be positive and finite")
+        if not (1 <= int(self.max_attempts) <= 5):
+            raise ValueError("geocoder attempts must be between 1 and 5")
+        if (
+            self.retry_backoff_seconds < 0
+            or not math.isfinite(self.retry_backoff_seconds)
+        ):
+            raise ValueError("geocoder retry backoff must be non-negative and finite")
+        if self.keepalive_seconds < 0 or not math.isfinite(self.keepalive_seconds):
+            raise ValueError("geocoder keepalive must be non-negative and finite")
         if self.min_interval_seconds < 1.0 or not math.isfinite(self.min_interval_seconds):
             raise ValueError("public geocoder interval must be at least one second")
         if not (1 <= int(self.cache_max_entries) <= 4096):
@@ -137,6 +175,7 @@ class GeocodingConfig:
             return min(high, max(low, parsed))
 
         provider = (get("M_PHOTO_GEOCODER_PROVIDER", "GEOCODER_PROVIDER") or "photon").lower()
+        api_key = get("M_PHOTO_GEOCODER_API_KEY", "GEOCODER_API_KEY") or ""
         explicit_enabled = get("M_PHOTO_GEOCODER_ENABLED", "GEOCODER_ENABLED")
         enabled = True if explicit_enabled is None else truthy(explicit_enabled)
         disabled = truthy(get("M_PHOTO_GEOCODER_DISABLED", "GEOCODER_DISABLED"))
@@ -155,11 +194,20 @@ class GeocodingConfig:
             enabled = False
 
         configured_url = get("M_PHOTO_GEOCODER_BASE_URL", "GEOCODER_BASE_URL")
-        if provider == "nominatim" and not configured_url:
-            # Only the default Photon public endpoint is pre-approved. Nominatim
-            # is enabled here as a self-host/explicit-URL adapter.
+        if provider in {"nominatim", "maptiler"} and not configured_url:
+            # Only the default Photon public endpoint is pre-approved.
+            # Nominatim and MapTiler are self-host/explicit-URL adapters;
+            # MapTiler additionally requires an API key.
             enabled = False
-        default_url = NOMINATIM_DEFAULT_URL if provider == "nominatim" else PHOTON_DEFAULT_URL
+        if provider == "maptiler" and not api_key:
+            enabled = False
+        default_url = (
+            NOMINATIM_DEFAULT_URL
+            if provider == "nominatim"
+            else MAPTILER_DEFAULT_URL
+            if provider == "maptiler"
+            else PHOTON_DEFAULT_URL
+        )
         base_url = configured_url or default_url
         timeout = number(
             get("M_PHOTO_GEOCODER_TIMEOUT_SECONDS", "GEOCODER_TIMEOUT_SECONDS"),
@@ -178,6 +226,27 @@ class GeocodingConfig:
                 0.25,
                 timeout,
             ),
+        )
+        max_attempts = int(number(
+            get("M_PHOTO_GEOCODER_MAX_ATTEMPTS", "GEOCODER_MAX_ATTEMPTS"),
+            3,
+            1,
+            5,
+        ))
+        retry_backoff = number(
+            get(
+                "M_PHOTO_GEOCODER_RETRY_BACKOFF_SECONDS",
+                "GEOCODER_RETRY_BACKOFF_SECONDS",
+            ),
+            0.5,
+            0.0,
+            5.0,
+        )
+        keepalive = number(
+            get("M_PHOTO_GEOCODER_KEEPALIVE_SECONDS", "GEOCODER_KEEPALIVE_SECONDS"),
+            60.0,
+            0.0,
+            600.0,
         )
         min_interval = number(
             get("M_PHOTO_GEOCODER_MIN_INTERVAL_SECONDS", "GEOCODER_MIN_INTERVAL_SECONDS"),
@@ -198,6 +267,9 @@ class GeocodingConfig:
             language=get("M_PHOTO_GEOCODER_LANGUAGE", "GEOCODER_LANGUAGE") or "en",
             timeout_seconds=timeout,
             connect_timeout_seconds=connect_timeout,
+            max_attempts=max_attempts,
+            retry_backoff_seconds=retry_backoff,
+            keepalive_seconds=keepalive,
             min_interval_seconds=min_interval,
             cache_max_entries=cache_size,
             cache_ttl_seconds=number(
@@ -232,7 +304,8 @@ class GeocodingConfig:
             ),
             user_agent=get("M_PHOTO_GEOCODER_USER_AGENT", "GEOCODER_USER_AGENT")
             or "MPhoto/0.1 (bounded place search)",
-            api_key=get("M_PHOTO_GEOCODER_API_KEY", "GEOCODER_API_KEY") or "",
+            api_key=api_key,
+            referer=get("M_PHOTO_GEOCODER_REFERER", "GEOCODER_REFERER") or "",
         )
 
 
@@ -370,6 +443,23 @@ class _HttpGeocoder:
         self.transport = transport
         self._cache = _TTLCache(config.cache_max_entries)
         self._limiter = _RateLimiter(config.min_interval_seconds)
+        # Keep one pooled client for the geocoder's lifetime. Reusing a
+        # connection established during a good window avoids paying a new TLS
+        # handshake on every clue while egress is intermittent.
+        self._client = httpx.Client(
+            transport=transport,
+            timeout=httpx.Timeout(
+                config.timeout_seconds,
+                connect=config.connect_timeout_seconds,
+            ),
+            follow_redirects=False,
+            trust_env=False,
+            limits=httpx.Limits(
+                max_connections=4,
+                max_keepalive_connections=2 if config.keepalive_seconds > 0 else 0,
+                keepalive_expiry=config.keepalive_seconds or None,
+            ),
+        )
         self._clock = clock or time.monotonic
         self._cooldown_lock = threading.Lock()
         self._cooldown_until = 0.0
@@ -457,6 +547,51 @@ class _HttpGeocoder:
         params: Mapping[str, object] | Sequence[tuple[str, object]],
     ) -> object:
         base = _validate_base_url(url)
+        attempts = max(1, int(self.config.max_attempts))
+        last_error: GeocodingUnavailable | None = None
+        attempt = 0
+        for attempt in range(1, attempts + 1):
+            try:
+                return self._get_json_once(base, params)
+            except GeocodingUnavailable as exc:
+                last_error = exc
+                if (
+                    exc.cooldown
+                    or exc.reason not in _RETRYABLE_NETWORK_REASONS
+                    or attempt >= attempts
+                ):
+                    break
+                # A fresh connection is cheap; public providers commonly drop
+                # or throttle the first TLS handshake on congested routes.
+                logger.info(
+                    "Geocoder request retrying provider=%s reason=%s attempt=%s/%s",
+                    self.name,
+                    exc.reason,
+                    attempt,
+                    attempts,
+                )
+                backoff = self.config.retry_backoff_seconds * attempt
+                if backoff > 0:
+                    time.sleep(backoff)
+        assert last_error is not None  # _get_json_once only raises GeocodingUnavailable
+        # Cooldown starts after the last attempt, never between retries: a
+        # transient timeout must not suppress its own retry or the next clue.
+        if not last_error.cooldown:
+            self._mark_failure(last_error)
+        logger.warning(
+            "Geocoder request failed provider=%s reason=%s status=%s attempts=%s",
+            self.name,
+            last_error.reason,
+            last_error.status_code,
+            attempt,
+        )
+        raise last_error
+
+    def _get_json_once(
+        self,
+        base: str,
+        params: Mapping[str, object] | Sequence[tuple[str, object]],
+    ) -> object:
         self._raise_if_cooling_down()
         self._limiter.wait()
         # Another concurrent request may have failed while this one waited for
@@ -466,54 +601,45 @@ class _HttpGeocoder:
             "Accept": "application/json",
             "User-Agent": self.config.user_agent,
         }
+        if self.config.referer:
+            # MapTiler restricts frontend keys by HTTP referrer; deployments
+            # must mirror the browser origin the key was issued for.
+            headers["Referer"] = self.config.referer
         timeout = httpx.Timeout(
             self.config.timeout_seconds,
             connect=self.config.connect_timeout_seconds,
         )
         try:
-            with httpx.Client(
-                transport=self.transport,
-                timeout=timeout,
-                follow_redirects=False,
-                trust_env=False,
-            ) as client:
-                with client.stream(
-                    "GET", base, params=params, headers=headers
-                ) as response:
-                    if not (200 <= response.status_code < 300):
-                        status = response.status_code
-                        reason = (
-                            "rate_limited" if status == 429
-                            else "unexpected_redirect" if 300 <= status < 400
-                            else "http_status"
-                        )
+            with self._client.stream(
+                "GET", base, params=params, headers=headers, timeout=timeout
+            ) as response:
+                if not (200 <= response.status_code < 300):
+                    status = response.status_code
+                    reason = (
+                        "rate_limited" if status == 429
+                        else "unexpected_redirect" if 300 <= status < 400
+                        else "http_status"
+                    )
+                    raise GeocodingUnavailable(
+                        "geocoder returned an unsuccessful HTTP status",
+                        reason=reason,
+                        status_code=status,
+                        retryable=status in {408, 429} or status >= 500,
+                    )
+                chunks: list[bytes] = []
+                total = 0
+                for chunk in response.iter_bytes():
+                    total += len(chunk)
+                    if total > _MAX_RESPONSE_BYTES:
                         raise GeocodingUnavailable(
-                            "geocoder returned an unsuccessful HTTP status",
-                            reason=reason,
-                            status_code=status,
-                            retryable=status in {408, 429} or status >= 500,
+                            "geocoder response exceeded size limit",
+                            reason="response_too_large",
                         )
-                    chunks: list[bytes] = []
-                    total = 0
-                    for chunk in response.iter_bytes():
-                        total += len(chunk)
-                        if total > _MAX_RESPONSE_BYTES:
-                            raise GeocodingUnavailable(
-                                "geocoder response exceeded size limit",
-                                reason="response_too_large",
-                            )
-                        chunks.append(chunk)
-                payload = json.loads(b"".join(chunks))
-                self._clear_failure()
-                return payload
-        except GeocodingUnavailable as exc:
-            self._mark_failure(exc)
-            logger.warning(
-                "Geocoder request failed provider=%s reason=%s status=%s",
-                self.name,
-                exc.reason,
-                exc.status_code,
-            )
+                    chunks.append(chunk)
+            payload = json.loads(b"".join(chunks))
+            self._clear_failure()
+            return payload
+        except GeocodingUnavailable:
             raise
         except httpx.ConnectTimeout:
             error = GeocodingUnavailable(
@@ -555,13 +681,6 @@ class _HttpGeocoder:
                 "geocoder request failed unexpectedly",
                 reason="unexpected_error",
             )
-        self._mark_failure(error)
-        logger.warning(
-            "Geocoder request failed provider=%s reason=%s status=%s",
-            self.name,
-            error.reason,
-            error.status_code,
-        )
         raise error from None
 
 
@@ -687,6 +806,91 @@ class NominatimGeocoder(_HttpGeocoder):
         return hits
 
 
+class MapTilerGeocoder(_HttpGeocoder):
+    name = "maptiler"
+
+    def _effective_language(self, language: str) -> str:
+        base = _bounded_text(language, 20).lower().split("-", 1)[0]
+        return base or "en"
+
+    def _search(self, request: GeocoderRequest) -> list[GeocoderHit]:
+        if not self.config.api_key.strip():
+            raise GeocodingUnavailable(
+                "maptiler geocoder requires an API key", reason="invalid_config"
+            )
+        base = self.config.base_url.rstrip("/")
+        url = f"{base}/{quote(request.query(), safe='')}.json"
+        params: list[tuple[str, object]] = [
+            ("key", self.config.api_key),
+            ("limit", request.limit),
+            ("language", request.language),
+        ]
+        country_codes = self._country_codes(request)
+        if country_codes:
+            params.append(("country", ",".join(code.lower() for code in country_codes)))
+        payload = self._get_json(url, params)
+        features = payload.get("features") if isinstance(payload, dict) else None
+        if not isinstance(features, list):
+            raise GeocodingUnavailable(
+                "unexpected MapTiler response", reason="malformed_response"
+            )
+        hits: list[GeocoderHit] = []
+        for feature in features[: request.limit]:
+            if not isinstance(feature, dict):
+                continue
+            properties = feature.get("properties")
+            if not isinstance(properties, dict):
+                properties = {}
+            raw_context = feature.get("context")
+            context = (
+                [item for item in raw_context if isinstance(item, dict)]
+                if isinstance(raw_context, list)
+                else []
+            )
+            country_code = _normalize_country(properties.get("country_code"))
+            admin1_name: str | None = None
+            locality_names: list[str] = []
+            for item in context:
+                item_id = _bounded_text(item.get("id"), 40)
+                if country_code is None and item_id.startswith("country."):
+                    country_code = _normalize_country(item.get("country_code"))
+                if admin1_name is None and item_id.startswith("region."):
+                    admin1_name = _bounded_text(item.get("text")) or None
+                value = (
+                    _bounded_text(item.get("text"))
+                    or _bounded_text(item.get("text_zh"))
+                )
+                if value and value not in locality_names:
+                    locality_names.append(value)
+            text = _bounded_text(feature.get("text"))
+            if text and text not in locality_names:
+                locality_names.insert(0, text)
+            if country_code is None:
+                for item in context:
+                    country_code = _normalize_country(item.get("country_code"))
+                    if country_code:
+                        break
+            provider_id = (
+                _bounded_text(feature.get("id"), 80)
+                or _bounded_text(properties.get("ref"), 80)
+                or None
+            )
+            display_name = _bounded_text(feature.get("place_name"), 400)
+            hits.append(GeocoderHit(
+                provider=self.name,
+                provider_place_id=provider_id,
+                name=text or request.query(),
+                display_name=display_name or text or request.query(),
+                locality_names=tuple(locality_names[:6]),
+                admin1_name=admin1_name,
+                country_code=country_code,
+                attribution=MAPTILER_ATTRIBUTION,
+                license=OSM_LICENSE,
+                query=request.query(),
+            ))
+        return hits
+
+
 class DisabledGeocoder:
     name = "disabled"
 
@@ -702,6 +906,8 @@ def _shared_geocoder(config: GeocodingConfig) -> PlaceGeocoder:
         return PhotonGeocoder(config)
     if config.provider == "nominatim":
         return NominatimGeocoder(config)
+    if config.provider == "maptiler":
+        return MapTilerGeocoder(config)
     return DisabledGeocoder()
 
 
@@ -730,6 +936,8 @@ def build_geocoder(
         return PhotonGeocoder(config, transport=transport)
     if config.provider == "nominatim":
         return NominatimGeocoder(config, transport=transport)
+    if config.provider == "maptiler":
+        return MapTilerGeocoder(config, transport=transport)
     return DisabledGeocoder()
 
 
@@ -740,6 +948,9 @@ __all__ = [
     "GeocodingConfig",
     "GeocodingError",
     "GeocodingUnavailable",
+    "MAPTILER_ATTRIBUTION",
+    "MAPTILER_DEFAULT_URL",
+    "MapTilerGeocoder",
     "NOMINATIM_DEFAULT_URL",
     "NominatimGeocoder",
     "OSM_ATTRIBUTION",
