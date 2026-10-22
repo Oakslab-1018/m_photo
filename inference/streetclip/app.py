@@ -27,12 +27,22 @@ from .schema import (
     ImageValidationError,
     InvalidCountryError,
 )
-from .service import InvalidCityIdsError, StreetClipService
+from services.city_scene_contract import (
+    MAX_CITY_SCENE_CITIES,
+    MAX_CITY_SCENE_CLUES,
+    validate_city_scene_clues,
+)
+from .service import (
+    InvalidCityIdsError,
+    InvalidCitySceneCluesError,
+    StreetClipService,
+)
 
 logger = logging.getLogger(__name__)
 
 MAX_TARGET_CITY_IDS = 10
 MAX_CITY_IDS_JSON_LENGTH = 4096
+MAX_CITY_SCENE_JSON_LENGTH = 8192
 
 
 def _sanitize_error_detail(detail: str) -> str:
@@ -82,6 +92,52 @@ def _parse_city_ids(value: str) -> tuple[int, ...]:
         seen.add(city_id)
         city_ids.append(city_id)
     return tuple(city_ids)
+
+
+def _parse_city_scene_city_ids(value: str) -> tuple[int, ...]:
+    """Parse the required 1..20 unique positive city IDs for scene scoring."""
+    if len(value) > MAX_CITY_SCENE_JSON_LENGTH:
+        raise HTTPException(status_code=400, detail="city_ids is too long")
+    try:
+        decoded = json.loads(value)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="city_ids must be a JSON array") from exc
+    if not isinstance(decoded, list) or not 1 <= len(decoded) <= MAX_CITY_SCENE_CITIES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"city_ids must contain 1 to {MAX_CITY_SCENE_CITIES} "
+                "unique positive integers"
+            ),
+        )
+    city_ids: list[int] = []
+    seen: set[int] = set()
+    for city_id in decoded:
+        if isinstance(city_id, bool) or not isinstance(city_id, int) or city_id <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail="city_ids must contain positive integers",
+            )
+        if city_id in seen:
+            raise HTTPException(status_code=400, detail="city_ids must be unique")
+        seen.add(city_id)
+        city_ids.append(city_id)
+    return tuple(city_ids)
+
+
+def _parse_city_scene_clues(value: str) -> tuple[tuple[str, str], ...]:
+    """Parse fixed dimension/value clues; never accept prompt text."""
+    if len(value) > MAX_CITY_SCENE_JSON_LENGTH:
+        raise HTTPException(status_code=400, detail="clues is too long")
+    try:
+        decoded = json.loads(value)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="clues must be a JSON array") from exc
+    try:
+        return validate_city_scene_clues(decoded)
+    except ValueError as exc:
+        detail = f"clues must contain 1 to {MAX_CITY_SCENE_CLUES} fixed dimension/value entries"
+        raise HTTPException(status_code=400, detail=detail) from exc
 
 
 async def require_api_key(
@@ -305,6 +361,62 @@ def create_app(
             raise HTTPException(status_code=500, detail="internal inference error") from None
         return JSONResponse(status_code=200, content=result)
 
+    @application.post("/city-clue-scores")
+    async def city_clue_scores(
+        _auth: None = Depends(api_key_dependency),
+        file: UploadFile = File(..., description="single street-level image"),
+        country_iso: str = Form(..., description="ISO-3166 alpha-2 country code"),
+        city_ids: str = Form(
+            ...,
+            description="required JSON array of 1-20 targeted catalog city IDs",
+        ),
+        clues: str = Form(
+            ...,
+            description="required JSON array of 1-6 fixed dimension/value clues",
+        ),
+    ) -> JSONResponse:
+        """Experimental scene-condition model matching, not city verification.
+
+        The request can only select catalog city IDs and contract-defined scene
+        conditions. The model service, not an LLM, owns image encoding and fixed
+        prompt matching; no city attributes or coordinates are inferred here.
+        """
+        service_impl: StreetClipService = application.state.service
+        try:
+            payload = await file.read(resolved.max_upload_bytes + 1)
+        except Exception as exc:  # pragma: no cover - Starlette read errors
+            raise HTTPException(status_code=400, detail="unable to read upload") from exc
+        finally:
+            await file.close()
+
+        targeted_city_ids = _parse_city_scene_city_ids(city_ids)
+        canonical_clues = _parse_city_scene_clues(clues)
+        try:
+            result = await run_in_threadpool(
+                service_impl.city_scene_scores,
+                country_iso,
+                payload,
+                city_ids=targeted_city_ids,
+                clues=canonical_clues,
+            )
+        except (InvalidCountryError, InvalidCityIdsError, InvalidCitySceneCluesError) as exc:
+            raise HTTPException(status_code=400, detail=_sanitize_error_detail(str(exc))) from exc
+        except ImageTooLargeError as exc:
+            raise HTTPException(status_code=413, detail=_sanitize_error_detail(str(exc))) from exc
+        except EmptyImageError as exc:
+            raise HTTPException(status_code=400, detail=_sanitize_error_detail(str(exc))) from exc
+        except ExifGpsPresentError as exc:
+            raise HTTPException(status_code=422, detail=_sanitize_error_detail(str(exc))) from exc
+        except (DecodeError, ImageValidationError) as exc:
+            raise HTTPException(status_code=400, detail=_sanitize_error_detail(str(exc))) from exc
+        except PredictorUnavailableError as exc:
+            logger.warning("city scene-condition scoring unavailable: %s", exc)
+            raise HTTPException(status_code=503, detail="model unavailable") from exc
+        except Exception:  # pragma: no cover - defensive sanitization
+            logger.exception("unhandled city scene-condition scoring failure")
+            raise HTTPException(status_code=500, detail="internal inference error") from None
+        return JSONResponse(status_code=200, content=result)
+
     @application.post("/analyze-region")
     async def analyze_region(
         _auth: None = Depends(api_key_dependency),
@@ -350,6 +462,7 @@ app = create_app()
 
 __all__ = [
     "MAX_CITY_IDS_JSON_LENGTH",
+    "MAX_CITY_SCENE_JSON_LENGTH",
     "MAX_TARGET_CITY_IDS",
     "app",
     "create_app",

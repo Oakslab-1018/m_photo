@@ -45,6 +45,9 @@ class CityRankingKey:
     source_iso: str
     endpoint: str
     city_ids: tuple[int, ...] = ()
+    # Scene-conditioned requests are a distinct operation over the same image.
+    scene_clues: tuple[tuple[str, str], ...] = ()
+    operation_version: str = ""
 
 
 class CityRankingCache:

@@ -32,6 +32,13 @@ import httpx
 from PIL import Image, ImageOps
 
 from ..config import Settings
+from services.city_scene_contract import (
+    CITY_SCENE_VERSION,
+    MAX_CITY_SCENE_CITIES,
+    MAX_CITY_SCENE_CLUES,
+    normalize_city_scene_clue,
+    validate_city_scene_clues,
+)
 from .catalog_access import catalog_for_settings
 from .city_catalog import CityCatalogError, load_city_index
 from .city_labels import city_name_zh
@@ -111,6 +118,56 @@ def _normalize_target_city_ids(city_ids: object) -> tuple[int, ...]:
             raise ValueError("duplicate city id")
         seen.add(city_id)
         normalized.append(city_id)
+    return tuple(normalized)
+
+
+def _normalize_city_scene_city_ids(city_ids: object) -> tuple[int, ...]:
+    """Validate 1..20 unique positive city IDs for scene-condition scoring."""
+    if isinstance(city_ids, (str, bytes, bytearray)):
+        raise ValueError("city_ids must be an integer sequence")
+    try:
+        values = tuple(city_ids)  # type: ignore[arg-type]
+    except TypeError as exc:
+        raise ValueError("city_ids must be an integer sequence") from exc
+    if not 1 <= len(values) <= MAX_CITY_SCENE_CITIES:
+        raise ValueError("invalid city_ids length")
+    normalized: list[int] = []
+    seen: set[int] = set()
+    for city_id in values:
+        if isinstance(city_id, bool) or not isinstance(city_id, int) or city_id <= 0:
+            raise ValueError("invalid city id")
+        if city_id in seen:
+            raise ValueError("duplicate city id")
+        seen.add(city_id)
+        normalized.append(city_id)
+    return tuple(normalized)
+
+
+def _normalize_city_scene_request_clues(
+    clues: object,
+) -> tuple[tuple[str, str], ...]:
+    """Normalize backend clue objects/pairs into the fixed shared contract."""
+    if not isinstance(clues, (list, tuple)):
+        raise ValueError("clues must be a bounded sequence")
+    if not 1 <= len(clues) <= MAX_CITY_SCENE_CLUES:
+        raise ValueError("invalid clue count")
+    if all(isinstance(clue, dict) for clue in clues):
+        raw = [
+            {
+                "dimension": clue.get("dimension"),
+                "value": clue.get("value"),
+            }
+            for clue in clues
+        ]
+        return validate_city_scene_clues(raw)
+    normalized: list[tuple[str, str]] = []
+    for clue in clues:
+        if not isinstance(clue, (list, tuple)) or len(clue) != 2:
+            raise ValueError("invalid clue entry")
+        pair = normalize_city_scene_clue(clue[0], clue[1])
+        if pair is None:
+            raise ValueError("unknown clue dimension or value")
+        normalized.append(pair)
     return tuple(normalized)
 
 
@@ -320,6 +377,85 @@ class StreetClipGateway:
         except Exception as exc:
             # Same discipline as rank_image: type only, never payload or path.
             logger.warning("StreetCLIP city ranking unavailable; none (%s)", type(exc).__name__)
+            return None
+
+    def rank_city_scenes(
+        self,
+        path: str | Path,
+        iso: str,
+        *,
+        city_ids: tuple[int, ...],
+        clues: object,
+    ) -> dict | None:
+        """Call experimental fixed city scene-condition scoring.
+
+        The response is accepted only when it echoes the requested country,
+        exact catalog city set, model revision, city-catalog revision and fixed
+        prompt version. Every clue must cover every requested city with finite
+        cosines. These values are model condition matches, not verified city
+        facts, probabilities or an accuracy claim. Any HTTP or contract failure
+        degrades to ``None`` and never synthesizes scores.
+        """
+        if not self.settings.streetclip_enabled:
+            return None
+        requested = str(iso or "").strip().upper()
+        try:
+            if len(requested) != 2 or not requested.isalpha():
+                raise ValueError("invalid country iso")
+            targeted_city_ids = _normalize_city_scene_city_ids(city_ids)
+            canonical_clues = _normalize_city_scene_request_clues(clues)
+            if requested not in self.country_isos():
+                raise ValueError("unsupported country iso")
+
+            try:
+                city_index = load_city_index(self._catalog().path).get(requested, {})
+            except CityCatalogError as exc:
+                raise ValueError("city catalog unavailable") from exc
+            if any(city_id not in city_index for city_id in targeted_city_ids):
+                raise ValueError("city outside the requested catalog scope")
+
+            url, timeout = self._endpoint()
+            payload = clean_image(path)
+            data = {
+                "country_iso": requested,
+                "city_ids": json.dumps(
+                    list(targeted_city_ids), separators=(",", ":")
+                ),
+                "clues": json.dumps(
+                    [
+                        {"dimension": dimension, "value": value}
+                        for dimension, value in canonical_clues
+                    ],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            }
+            with httpx.Client(
+                transport=self.transport,
+                timeout=httpx.Timeout(timeout, connect=min(timeout, 3)),
+                follow_redirects=False,
+                trust_env=False,
+            ) as client:
+                response = client.post(
+                    url + "/city-clue-scores",
+                    headers=self._headers(),
+                    files={"file": ("image.jpg", payload, "image/jpeg")},
+                    data=data,
+                )
+                response.raise_for_status()
+                result = self.validate_city_scene_scores(
+                    response.json(),
+                    requested,
+                    targeted_city_ids,
+                    canonical_clues,
+                )
+            return result
+        except Exception as exc:
+            # Never log paths, bodies, tokens or raw exception text.
+            logger.warning(
+                "StreetCLIP city scene-condition scoring unavailable; none (%s)",
+                type(exc).__name__,
+            )
             return None
 
     def describe_region(self, png: bytes) -> dict:
@@ -695,6 +831,138 @@ class StreetClipGateway:
             "matches": matches,
             "regions": regions,
             "coverage": coverage,
+        }
+
+    def validate_city_scene_scores(
+        self,
+        data: object,
+        iso: str,
+        city_ids: tuple[int, ...],
+        clues: tuple[tuple[str, str], ...],
+    ) -> dict:
+        """Validate one experimental ``/city-clue-scores`` response.
+
+        The provider must echo the exact ordered city IDs and clues, the pinned
+        model/prompt versions, and the backend catalog revision. Every clue
+        must carry exactly one finite cosine pair for every requested catalog
+        city. Returned city IDs are normalized to decimal strings for the HTTP
+        consumer; no unknown city or partial clue is accepted.
+        """
+        requested = str(iso or "").strip().upper()
+        if len(requested) != 2 or not requested.isalpha():
+            raise ValueError("invalid country iso")
+        targeted_city_ids = _normalize_city_scene_city_ids(city_ids)
+        canonical_clues = _normalize_city_scene_request_clues(clues)
+        if not isinstance(data, dict):
+            raise ValueError("invalid city scene payload")
+        expected_keys = {
+            "country_iso",
+            "city_catalog_revision",
+            "model_revision",
+            "prompt_version",
+            "city_ids",
+            "clues",
+        }
+        if set(data) != expected_keys:
+            raise ValueError("invalid city scene payload shape")
+        if str(data.get("country_iso") or "").strip().upper() != requested:
+            raise ValueError("city scene country mismatch")
+        if data.get("model_revision") != MODEL_REVISION:
+            raise ValueError("city scene model mismatch")
+        if data.get("prompt_version") != CITY_SCENE_VERSION:
+            raise ValueError("city scene prompt mismatch")
+
+        revision = _sha256_text(
+            data.get("city_catalog_revision"),
+            "city scene catalog revision",
+        )
+        try:
+            expected_revision = self._catalog().revision("cities")
+        except (CityCatalogError, ValueError) as exc:
+            raise ValueError("city catalog unavailable") from exc
+        if revision != expected_revision:
+            raise ValueError("city scene catalog mismatch")
+
+        try:
+            city_index = load_city_index(self._catalog().path).get(requested, {})
+        except CityCatalogError as exc:
+            raise ValueError("city catalog unavailable") from exc
+        if any(city_id not in city_index for city_id in targeted_city_ids):
+            raise ValueError("city scene outside the catalog scope")
+
+        raw_city_ids = data.get("city_ids")
+        if (
+            not isinstance(raw_city_ids, list)
+            or len(raw_city_ids) != len(targeted_city_ids)
+            or any(
+                isinstance(city_id, bool)
+                or not isinstance(city_id, int)
+                or city_id <= 0
+                for city_id in raw_city_ids
+            )
+            or tuple(raw_city_ids) != targeted_city_ids
+        ):
+            raise ValueError("city scene city IDs do not match the request")
+
+        raw_clues = data.get("clues")
+        if not isinstance(raw_clues, list) or len(raw_clues) != len(canonical_clues):
+            raise ValueError("city scene clue set is incomplete")
+
+        normalized_clues: list[dict] = []
+        for clue_index, (dimension, value) in enumerate(canonical_clues):
+            raw_clue = raw_clues[clue_index]
+            if not isinstance(raw_clue, dict):
+                raise ValueError("invalid city scene clue")
+            if set(raw_clue) != {"dimension", "value", "scores"}:
+                raise ValueError("invalid city scene clue shape")
+            if raw_clue.get("dimension") != dimension or raw_clue.get("value") != value:
+                raise ValueError("city scene clue mismatch")
+            raw_scores = raw_clue.get("scores")
+            if not isinstance(raw_scores, list) or len(raw_scores) != len(targeted_city_ids):
+                raise ValueError("city scene scores are incomplete")
+
+            scores: list[dict] = []
+            for score_index, expected_city_id in enumerate(targeted_city_ids):
+                row = raw_scores[score_index]
+                if not isinstance(row, dict):
+                    raise ValueError("invalid city scene score")
+                if set(row) != {"city_id", "raw_cosine", "neutral_cosine"}:
+                    raise ValueError("invalid city scene score shape")
+                city_id = row.get("city_id")
+                if (
+                    isinstance(city_id, bool)
+                    or not isinstance(city_id, int)
+                    or city_id != expected_city_id
+                ):
+                    raise ValueError("city scene score city mismatch")
+                scores.append(
+                    {
+                        "city_id": str(expected_city_id),
+                        "raw_cosine": _finite_cosine(
+                            row.get("raw_cosine"),
+                            "city scene raw cosine",
+                        ),
+                        "neutral_cosine": _finite_cosine(
+                            row.get("neutral_cosine"),
+                            "city scene neutral cosine",
+                        ),
+                    }
+                )
+            normalized_clues.append(
+                {
+                    "dimension": dimension,
+                    "value": value,
+                    "scores": scores,
+                }
+            )
+
+        return {
+            "country_iso": requested,
+            "city_catalog_revision": revision,
+            "model_revision": MODEL_REVISION,
+            "prompt_version": CITY_SCENE_VERSION,
+            "city_ids": [str(city_id) for city_id in targeted_city_ids],
+            "clues": normalized_clues,
         }
 
     def validate_city_ranking(self, data: object, iso: str) -> dict:

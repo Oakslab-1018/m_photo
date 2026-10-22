@@ -55,7 +55,9 @@ CATALOG_DIMENSIONS = (
     "culture",
 )
 
-# 没有目录元数据的观察维度：只展示，不参与任何排序
+# 没有国家目录元数据的观察维度：不参与国家/城市目录属性排序；
+# 用户确认或明确提供的观察可进入城市场景条件模型匹配，
+# 但只表示图像与场景条件的相似度，不是城市属性事实。
 OBSERVATION_DIMENSIONS = (
     "signage",
     "road",
@@ -115,15 +117,23 @@ VALUE_LABELS = {
     "desert": "荒漠",
     "tropical_rainforest": "热带雨林",
     "urban_sparse": "城市稀疏植被",
+    "street_trees": "行道树",
     # vehicle
     "dark_vehicle": "深色车辆",
     "white_silver_vehicle": "白/银色车辆",
     "unknown_vehicle": "未识别车辆",
+    "buses": "公交车",
+    "bicycles": "自行车",
+    "motorcycles_scooters": "摩托车/踏板车",
     # building
     "mediterranean": "地中海风格",
     "colonial": "殖民风格",
     "gothic": "哥特式",
     "modern_glass": "现代玻璃幕墙",
+    "brick_masonry": "红砖/砖石建筑",
+    "high_rise": "高层建筑",
+    "low_rise": "低层建筑",
+    "traditional_architecture": "传统建筑",
     "generic": "通用/不明显",
     # climate
     "mediterranean_sunny": "地中海晴朗气候",
@@ -131,6 +141,8 @@ VALUE_LABELS = {
     "cold_polar": "寒冷气候",
     "arid": "干旱气候",
     "temperate": "温带气候",
+    "humid": "湿润气候",
+    "tropical": "热带气候",
     # language
     "zh": "中文",
     "ja": "日语",

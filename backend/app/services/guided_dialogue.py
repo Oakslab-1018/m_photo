@@ -22,11 +22,13 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, List, Mapping, Sequence
+from urllib.parse import urlsplit
 
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 
 from services.chat import ChineseFreeTextParser, PendingQuestion, PlaceMention
+from services.city_scene_contract import CITY_SCENE_VERSION, MAX_CITY_SCENE_CITIES
 
 from ..config import Settings
 from ..database import GeoSession, GuidedDialogue, GuidedEvent
@@ -62,6 +64,7 @@ from ..schemas import (
 from .city_catalog import CityRow
 from .city_labels import city_name_zh
 from .city_reasoning import CityClueReasoner
+from .city_scene_reasoning import scene_clue_pairs, select_scene_observations
 from .deepseek import DeepSeekClient, narration_matches_action
 from .geo_session import GeoSessionService
 from .geocoding import GeocodingConfig, get_shared_geocoder
@@ -303,6 +306,7 @@ def _reviewed_to_clue(record: Mapping[str, Any]) -> Clue | None:
         return None
     extra = record.get("_extra")
     extra = dict(extra) if isinstance(extra, Mapping) else {}
+    extra.setdefault("guided_clue_id", str(record.get("id") or ""))
     confidence = _clamp_confidence(record.get("confidence"))
     return Clue(
         dimension=dimension,
@@ -312,6 +316,152 @@ def _reviewed_to_clue(record: Mapping[str, Any]) -> Clue | None:
         source=str(record.get("source") or "machine"),
         extra=extra,
     )
+
+
+_NETWORK_SOURCE_TYPES = frozenset({"web_search", "geocoder"})
+_NETWORK_MATCH_KINDS = frozenset({
+    "geocoder_locality", "geocoder_candidate", "web_candidate",
+})
+_SOURCE_REF_FIELDS = (
+    "provider", "provider_place_id", "label", "query", "attribution", "license",
+    "fetched_at", "source_type", "url", "title", "excerpt", "observation_source",
+)
+
+
+def _source_type_label(value: object) -> str:
+    labels = {
+        "local_catalog": "本地地名库",
+        "local_poi": "本地POI",
+        "local_road": "本地道路",
+        "web_search": "联网网页检索",
+        "geocoder": "联网地名检索",
+    }
+    return labels.get(str(value or "").strip().lower(), "")
+
+
+def _is_network_evidence(
+    match_kind: object, sources: Iterable[object],
+) -> bool:
+    kind = str(match_kind or "").strip().lower()
+    if kind in _NETWORK_MATCH_KINDS:
+        return True
+    for item in sources or ():
+        if not isinstance(item, Mapping):
+            continue
+        if _infer_source_type(item.get("provider"), item.get("source_type")) in _NETWORK_SOURCE_TYPES:
+            return True
+    return False
+
+
+def _safe_source_url(value: object) -> str | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    if len(raw) > 1000:
+        return None
+    try:
+        parts = urlsplit(raw)
+        hostname = parts.hostname
+    except ValueError:
+        return None
+    if parts.scheme.lower() not in {"http", "https"} or not hostname:
+        return None
+    if parts.username is not None or parts.password is not None:
+        return None
+    return raw
+
+
+def _infer_source_type(provider: object, value: object = None) -> str | None:
+    explicit = str(value or "").strip().lower()
+    if explicit in {
+        "local_catalog", "local_poi", "local_road", "web_search", "geocoder",
+    }:
+        return explicit
+    name = str(provider or "").strip().lower()
+    if name == "local_catalog" or name.startswith("local_catalog"):
+        return "local_catalog"
+    if name in {"photon", "nominatim", "maptiler", "geocoder"} or "geocod" in name:
+        return "geocoder"
+    if name in {"web", "web_search", "search"} or "web" in name:
+        return "web_search"
+    if "poi" in name:
+        return "local_poi"
+    if "road" in name:
+        return "local_road"
+    return None
+
+
+def _source_ref_payload(
+    item: Mapping[str, Any],
+    *,
+    observation_source: str | None = None,
+) -> dict[str, Any] | None:
+    provider = str(item.get("provider") or "").strip()[:40]
+    label = str(item.get("label") or item.get("title") or provider).strip()[:200]
+    if not provider or not label:
+        return None
+    source_type = _infer_source_type(provider, item.get("source_type"))
+    observed = str(item.get("observation_source") or observation_source or "").strip().lower()
+    if observed not in {"user", "ocr"}:
+        observed = ""
+    result = {
+        "provider": provider,
+        "provider_place_id": (
+            str(item.get("provider_place_id"))[:200]
+            if item.get("provider_place_id") is not None else None
+        ),
+        "label": label,
+        "query": str(item.get("query") or "")[:200],
+        "attribution": (
+            str(item.get("attribution"))[:200]
+            if item.get("attribution") is not None else None
+        ),
+        "license": (
+            str(item.get("license"))[:80]
+            if item.get("license") is not None else None
+        ),
+        "fetched_at": str(item.get("fetched_at") or item.get("retrieved_at") or "")[:80],
+    }
+    if source_type:
+        result["source_type"] = source_type
+    url = _safe_source_url(item.get("url"))
+    if url:
+        result["url"] = url
+    for key, limit in (("title", 200), ("excerpt", 500)):
+        value = str(item.get(key) or "").strip()
+        if value:
+            result[key] = value[:limit]
+    if observed:
+        result["observation_source"] = observed
+    return result
+
+
+def _merge_source_refs(
+    items: Iterable[object],
+    *,
+    observation_source: str | None = None,
+) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for item in items or ():
+        if not isinstance(item, Mapping):
+            continue
+        ref = _source_ref_payload(item, observation_source=observation_source)
+        if ref is None:
+            continue
+        key = (
+            str(ref.get("source_type") or ""),
+            str(ref.get("provider") or ""),
+            str(ref.get("url") or ""),
+            str(ref.get("observation_source") or ""),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(ref)
+        if len(result) >= 8:
+            break
+    return result
 
 
 def _target_key(target: Mapping[str, Any]) -> tuple[str, str]:
@@ -853,7 +1003,9 @@ class GuidedDialogueService:
                 continue
             if self._resolution_expired(entry):
                 continue
-            if str(entry.get("status") or "") not in {"unresolved", "ambiguous", "unavailable"}:
+            if str(entry.get("status") or "") not in {
+                "unresolved", "ambiguous", "unavailable", "candidates",
+            }:
                 continue
             clue_ids = {str(item) for item in entry.get("clue_ids") or [] if str(item)}
             if clue_ids and not clue_ids.issubset(active_ids):
@@ -882,6 +1034,8 @@ class GuidedDialogueService:
         active: set[str] = set()
         for record in state.get("clues") or []:
             if not isinstance(record, Mapping) or not record.get("id"):
+                continue
+            if (record.get("_extra") or {}).get("ranking_suspended") is True:
                 continue
             origin_user = str(record.get("_origin") or "") == "guided_user"
             adopted_observation = is_user_confirmed_observation(record.get("_extra"))
@@ -1343,7 +1497,9 @@ class GuidedDialogueService:
         for record in state.get("clues") or []:
             if not isinstance(record, Mapping):
                 continue
-            if str(record.get("status") or "") == "rejected":
+            if str(record.get("status") or "") in {"rejected", "uncertain"}:
+                continue
+            if (record.get("_extra") or {}).get("ranking_suspended") is True:
                 continue
             clue = _reviewed_to_clue(record)
             if clue is not None:
@@ -1386,7 +1542,8 @@ class GuidedDialogueService:
     @staticmethod
     def _candidate(target: Mapping[str, Any], **kwargs: Any) -> dict[str, Any]:
         result = {"target": dict(target)}
-        for key in ("score", "score_type", "reason", "selection_basis", "place_match"):
+        for key in ("score", "score_type", "reason", "selection_basis", "place_match",
+                    "matched_clues", "fusion", "clue_notes", "rank_before", "rank_after"):
             value = kwargs.get(key)
             if value is not None:
                 result[key] = value
@@ -1625,6 +1782,45 @@ class GuidedDialogueService:
                 CITY_RANKING_CACHE.put_failure(cache_key)
         return result if isinstance(result, Mapping) else None
 
+    def _cached_city_scene_scores(
+        self,
+        image_path: Path,
+        source_iso: str,
+        cache_key: CityRankingKey | None,
+        *,
+        city_ids: tuple[int, ...],
+        clues: tuple[tuple[str, str], ...],
+    ) -> Mapping[str, Any] | None:
+        scene_key = (
+            replace(
+                cache_key,
+                endpoint=str(self.settings.streetclip_url or "").rstrip("/") + "/city-clue-scores",
+                prompt_revision=CITY_SCENE_VERSION,
+                city_ids=city_ids,
+                scene_clues=clues,
+                operation_version=CITY_SCENE_VERSION,
+            ) if cache_key is not None else None
+        )
+        if scene_key is not None:
+            hit, cached = CITY_RANKING_CACHE.get(scene_key)
+            if hit:
+                return cached
+        try:
+            # Preparation runs before the event's CAS write transaction. Only
+            # normalized vocabulary and validated city IDs reach this provider.
+            result = self.gateway.rank_city_scenes(
+                image_path, source_iso, city_ids=city_ids, clues=clues,
+            )
+        except Exception as exc:
+            logger.warning("City scene matching unavailable (%s)", type(exc).__name__)
+            result = None
+        if scene_key is not None:
+            if isinstance(result, Mapping) and result:
+                CITY_RANKING_CACHE.put_success(scene_key, result)
+            else:
+                CITY_RANKING_CACHE.put_failure(scene_key)
+        return result if isinstance(result, Mapping) else None
+
     def _ranked_city_rows(
         self,
         state: Mapping[str, Any],
@@ -1645,6 +1841,8 @@ class GuidedDialogueService:
             endpoint = (
                 str(self.settings.streetclip_url or "").rstrip("/") + "/predict-cities"
             )
+        scene_selection = select_scene_observations(state.get("clues") or [])
+        scene_pairs = scene_clue_pairs(scene_selection.observations)
         merged: dict[str, Mapping[str, Any]] = {}
         for source_iso in self._country_source_scopes(state):
             if self._source_excluded(state, session, source_iso):
@@ -1670,8 +1868,13 @@ class GuidedDialogueService:
                 if isinstance(row, Mapping)
             ]
             scoped_rows = self._city_rows_for_source(source_iso)
-            scoped_evidence = [
+            verified_evidence = [
                 item for item in self._place_city_evidence(state)
+                if normalize_iso(item.source_iso) == source_iso
+                and item.city_id in scoped_rows
+            ]
+            candidate_evidence = [
+                item for item in self._source_city_candidates(state)
                 if normalize_iso(item.source_iso) == source_iso
                 and item.city_id in scoped_rows
             ]
@@ -1690,26 +1893,20 @@ class GuidedDialogueService:
                 ):
                     raw_scored_ids.add(city_id)
 
-            best_missing_evidence: dict[int, tuple[float, CityEvidence]] = {}
-            for item in scoped_evidence:
-                if item.city_id in raw_scored_ids:
-                    continue
-                try:
-                    confidence = float(item.confidence)
-                except (TypeError, ValueError):
-                    confidence = 0.0
-                if not math.isfinite(confidence):
-                    confidence = 0.0
-                current = best_missing_evidence.get(item.city_id)
-                if current is None or confidence > current[0]:
-                    best_missing_evidence[item.city_id] = (confidence, item)
-
+            verified_ids: list[int] = []
+            candidate_ids: list[int] = []
+            for item in verified_evidence:
+                if item.city_id not in raw_scored_ids and item.city_id not in verified_ids:
+                    verified_ids.append(item.city_id)
+            for item in candidate_evidence:
+                if (
+                    item.city_id not in raw_scored_ids
+                    and item.city_id not in verified_ids
+                    and item.city_id not in candidate_ids
+                ):
+                    candidate_ids.append(item.city_id)
             target_ids = tuple(
-                city_id
-                for city_id, _ in sorted(
-                    best_missing_evidence.items(),
-                    key=lambda item: (-item[1][0], item[0]),
-                )[:MAX_TARGET_CITY_IDS]
+                [*verified_ids, *candidate_ids][:MAX_TARGET_CITY_IDS]
             )
             if target_ids:
                 targeted_key = (
@@ -1741,13 +1938,28 @@ class GuidedDialogueService:
 
             if not rows:
                 continue
-            if scoped_rows and (clues or scoped_evidence) and rows:
+            scene_payload = None
+            if scene_pairs:
+                scene_city_ids = tuple(sorted({
+                    int(str(row["city_id"])) for row in rows
+                    if str(row.get("city_id") or "").isdigit()
+                    and int(str(row["city_id"])) in scoped_rows
+                }))[:MAX_CITY_SCENE_CITIES]
+                if len(scene_city_ids) >= 2:
+                    scene_payload = self._cached_city_scene_scores(
+                        image_path, source_iso, cache_key,
+                        city_ids=scene_city_ids, clues=scene_pairs,
+                    )
+            if scoped_rows and (clues or verified_evidence or scene_pairs or scene_selection.notes):
                 try:
                     reranked = CityClueReasoner({source_iso: scoped_rows}).rerank(
                         rows,
                         clues,
                         iso=source_iso,
-                        city_evidence=scoped_evidence,
+                        city_evidence=verified_evidence,
+                        scene_evidence=scene_payload,
+                        scene_observations=scene_selection.observations,
+                        scene_notes=scene_selection.notes,
                     )
                     if reranked is not None:
                         rows = list(reranked.city_scores)
@@ -1809,7 +2021,8 @@ class GuidedDialogueService:
             if existing is None:
                 candidates[key] = self._candidate(target, **kwargs)
                 return
-            for field in ("score", "score_type", "reason", "selection_basis", "place_match"):
+            for field in ("score", "score_type", "reason", "selection_basis", "place_match",
+                          "matched_clues", "fusion", "clue_notes", "rank_before", "rank_after"):
                 value = kwargs.get(field)
                 if value is not None and (
                     existing.get(field) is None
@@ -1826,10 +2039,14 @@ class GuidedDialogueService:
             row = self._city_row_by_id(str(raw.get("id") or ""))
             if row is None or row.iso not in country_scopes:
                 continue
+            meta = (state.get("proposal_meta") or {}).get(f"city:{row.city_id}")
+            candidate_only = bool(
+                isinstance(meta, Mapping) and meta.get("candidate_only")
+            )
             add(
                 self._city_target(row),
                 reason=self._proposal_reason(state, row),
-                selection_basis="user_text",
+                selection_basis="catalog_search" if candidate_only else "user_text",
                 place_match=self._place_match_from_meta(state, row),
             )
 
@@ -1856,8 +2073,13 @@ class GuidedDialogueService:
                 self._city_target(row),
                 score=ranked.get("score"),
                 score_type=ranked.get("score_type"),
+                matched_clues=ranked.get("matched_clues"),
+                fusion=ranked.get("fusion"),
+                clue_notes=ranked.get("clue_notes"),
+                rank_before=ranked.get("rank_before"),
+                rank_after=ranked.get("rank_after"),
                 reason=(
-                    "图片+文字地点证据"
+                    "图片与多维线索融合"
                     if (
                         str(city_id) in evidence_city_ids
                         or ranked.get("matched_clues")
@@ -2289,6 +2511,7 @@ class GuidedDialogueService:
         message = self.provider.narrate({
             "action": action,
             "scores": [score.to_dict() for score in prepared.scores],
+            "candidates": prepared.candidates[:5],
             "clues": prepared.state.get("clues") or [],
             "history": self.geo.list_messages(session_id),
             "feedback": feedback,
@@ -2890,6 +3113,10 @@ class GuidedDialogueService:
                 return self._outcome(state, False, "unchanged", "该线索状态没有变化。")
             updated = dict(record)
             updated["status"] = status
+            if status == "confirmed":
+                restored_extra = dict(updated.get("_extra") or {})
+                restored_extra.pop("ranking_suspended", None)
+                updated["_extra"] = restored_extra
             state["clues"] = [
                 updated if isinstance(item, Mapping) and str(item.get("id")) == str(clue_id) else item
                 for item in state["clues"]
@@ -3024,10 +3251,14 @@ class GuidedDialogueService:
             for record in state.get("clues") or []:
                 if not isinstance(record, Mapping) or str(record.get("id")) != str(event.clue_id):
                     continue
-                if str(record.get("status") or "pending") == "pending":
+                if (str(record.get("status") or "pending") == "pending"
+                        and (record.get("_extra") or {}).get("ranking_suspended") is True):
                     return self._outcome(state, False, "unchanged", "线索已经处于待复核状态。")
                 updated = dict(record)
                 updated["status"] = "pending"
+                suspended_extra = dict(updated.get("_extra") or {})
+                suspended_extra["ranking_suspended"] = True
+                updated["_extra"] = suspended_extra
                 state["clues"] = [
                     updated if isinstance(item, Mapping) and str(item.get("id")) == str(event.clue_id) else item
                     for item in state["clues"]
@@ -3320,6 +3551,17 @@ class GuidedDialogueService:
                 f"已记录文字线索，检索到目录城市候选{'、'.join(labels)}，需你确认。"
                 if labels else "已记录文字线索，但候选当前不可见；请补充城市或区名。"
             )
+        elif resolution is not None and resolution.status == "candidates":
+            labels = [
+                str(item.get("label") or item.get("id") or "")
+                for item in state.get("proposals") or []
+                if isinstance(item, Mapping) and item.get("level") == "city"
+            ]
+            summary = (
+                f"检索到待验证城市候选{'、'.join(labels)}；仅用于召回，"
+                "不会增加地名分，需你确认或补充本地目录证据。"
+                if labels else "检索到待验证地点候选；未核验，不增加地名分。"
+            )
         elif resolution is not None and resolution.status == "ambiguous":
             summary = resolution.notice or "地点不唯一；请补充城市、区名或附近地标。"
         elif resolution is not None and resolution.status == "foreign_conflict":
@@ -3471,6 +3713,7 @@ class GuidedDialogueService:
             state.setdefault("clues", []).append(updated)
             status_changed = True
         final_extra = dict(updated.get("_extra") or {})
+        final_extra.pop("ranking_suspended", None)
         final_extra.update({
             "literal_kind": str(final_extra.get("literal_kind") or "adopted_ocr_observation"),
             "display_only": True,
@@ -3542,6 +3785,17 @@ class GuidedDialogueService:
             return (
                 f"{prefix}；地点检索成功，{suffix}。"
                 "已进入既有地点候选/统一评分链，仍需你明确确认，不会自动确认城市或坐标。"
+            )
+        if status == "candidates":
+            labels = [
+                str(item.get("label") or item.get("id") or "")
+                for item in state.get("proposals") or []
+                if isinstance(item, Mapping) and item.get("level") == "city"
+            ]
+            suffix = f"生成了待验证城市候选{'、'.join(labels)}" if labels else "生成了待验证地点候选"
+            return (
+                f"{prefix}；{suffix}。候选仅用于召回，未增加地名分，"
+                "仍需你明确确认，不会自动确认城市或坐标。"
             )
         if status == "ambiguous":
             notice = str(resolution.notice or "命中的地点不唯一。").strip()
@@ -3947,7 +4201,7 @@ class GuidedDialogueService:
         state: dict[str, Any],
         resolution: PlaceResolutionBatch,
     ) -> bool:
-        """Persist bounded provenance and link it to active literal clues."""
+        """Persist bounded provenance and bind sources to individual cities."""
 
         terms = {
             normalize_place_text(term)
@@ -3955,6 +4209,7 @@ class GuidedDialogueService:
             if normalize_place_text(term)
         }
         clue_ids: list[str] = []
+        clue_observation: dict[str, str] = {}
         quote = ""
         for record in state.get("clues") or []:
             if not isinstance(record, Mapping):
@@ -3979,25 +4234,109 @@ class GuidedDialogueService:
             clue_id = str(record.get("id") or "")
             if clue_id and clue_id not in clue_ids:
                 clue_ids.append(clue_id)
+                origin = str(extra.get("origin_source") or record.get("source") or "").lower()
+                clue_observation[clue_id] = (
+                    "ocr"
+                    if is_user_confirmed_observation(extra) or origin == "ocr"
+                    else "user"
+                )
             if not quote:
                 quote = str(extra.get("place_quote") or record.get("description") or "")[:200]
         if not clue_ids:
             logger.warning("place resolution had no active literal clue linkage")
             return False
-        cities = [
-            {
+
+        def observation_for(evidence: CityEvidence) -> str | None:
+            evidence_clue_ids = tuple(evidence.clue_ids) or tuple(clue_ids)
+            values = {
+                clue_observation.get(str(clue_id))
+                for clue_id in evidence_clue_ids
+                if clue_observation.get(str(clue_id))
+            }
+            return next(iter(values)) if len(values) == 1 else None
+
+        def city_detail(evidence: CityEvidence, *, candidate: bool) -> dict[str, Any]:
+            observed = observation_for(evidence)
+            sources = _merge_source_refs(evidence.sources, observation_source=observed)
+            source_type = str(getattr(evidence, "source_type", "") or "").strip().lower()
+            if not sources and source_type in {
+                "local_catalog", "local_poi", "local_road", "web_search", "geocoder",
+            }:
+                fallback = _source_ref_payload({
+                    "provider": source_type,
+                    "provider_place_id": str(evidence.city_id),
+                    "label": evidence.text,
+                    "query": " ".join(resolution.query_terms),
+                    "source_type": source_type,
+                    "fetched_at": resolution.fetched_at,
+                }, observation_source=observed)
+                sources = [fallback] if fallback else []
+            return {
                 "city_id": str(evidence.city_id),
                 "source_iso": normalize_iso(evidence.source_iso),
-                "confidence": float(evidence.confidence),
-                "match_kind": str(evidence.match_kind),
+                "confidence": 0.0 if candidate else float(evidence.confidence),
+                "match_kind": (
+                    str(evidence.match_kind or "web_candidate")
+                    if candidate else str(evidence.match_kind or "catalog_exact")
+                ),
+                "sources": sources,
+                "source_type": source_type,
+                "candidate_only": bool(candidate),
+                **({"status": "candidates"} if candidate else {}),
             }
+
+        verified = [
+            city_detail(evidence, candidate=False)
             for evidence in resolution.city_evidence
         ]
-        sources = [dict(item) for item in resolution.sources if isinstance(item, Mapping)]
+        candidate_evidence = tuple(getattr(resolution, "candidate_cities", ()) or ())
+        candidates = [
+            city_detail(evidence, candidate=True)
+            for evidence in candidate_evidence
+        ]
+        if resolution.status == "candidates":
+            known_candidate_ids = {str(item.get("city_id")) for item in candidates}
+            observed_values = {
+                value for value in clue_observation.values() if value in {"user", "ocr"}
+            }
+            linked_observation = (
+                next(iter(observed_values)) if len(observed_values) == 1 else None
+            )
+            for city_id in resolution.city_id_strings:
+                if city_id in known_candidate_ids:
+                    continue
+                row = self._city_row_by_id(city_id)
+                if row is None:
+                    continue
+                local_source = _source_ref_payload({
+                    "provider": "local_catalog",
+                    "provider_place_id": city_id,
+                    "label": row.name,
+                    "query": " ".join(resolution.query_terms),
+                    "source_type": "local_catalog",
+                    "fetched_at": resolution.fetched_at,
+                }, observation_source=linked_observation)
+                candidates.append({
+                    "city_id": city_id,
+                    "source_iso": row.iso,
+                    "confidence": 0.0,
+                    "match_kind": "catalog_exact",
+                    "source_type": "local_catalog",
+                    "sources": [local_source] if local_source else [],
+                    "candidate_only": True,
+                    "status": "candidates",
+                })
+        sources = [
+            ref
+            for item in resolution.sources if isinstance(item, Mapping)
+            for ref in [_source_ref_payload(item)]
+            if ref is not None
+        ]
         identity = {
             "status": resolution.status,
             "query_terms": list(resolution.query_terms),
             "city_ids": list(resolution.city_id_strings),
+            "candidate_city_ids": [item["city_id"] for item in candidates],
             "foreign_country_isos": list(resolution.foreign_country_isos),
         }
         resolution_id = _json_hash("place-resolution", identity)
@@ -4007,20 +4346,44 @@ class GuidedDialogueService:
         ]
         if resolution.status == "resolved":
             for item in entries:
-                if str(item.get("status") or "") in {"unresolved", "ambiguous", "unavailable"}:
+                if str(item.get("status") or "") in {
+                    "unresolved", "ambiguous", "unavailable", "candidates",
+                }:
                     item["superseded_by"] = resolution_id
-        else:
+        elif resolution.status == "candidates":
             current_terms = {normalize_place_text(item) for item in resolution.query_terms}
             for item in entries:
                 previous_terms = {
                     normalize_place_text(value) for value in item.get("query_terms") or []
                 }
                 if (
-                    str(item.get("status") or "") in {"unresolved", "ambiguous", "unavailable"}
+                    str(item.get("status") or "") == "candidates"
                     and previous_terms == current_terms
                     and str(item.get("id") or "") != resolution_id
                 ):
                     item["superseded_by"] = resolution_id
+
+        def merge_city_details(
+            existing: object, incoming: Sequence[Mapping[str, Any]],
+        ) -> list[dict[str, Any]]:
+            by_id: dict[str, dict[str, Any]] = {}
+            for item in list(existing or ()) + list(incoming):
+                if not isinstance(item, Mapping):
+                    continue
+                city_id = str(item.get("city_id") or "")
+                if not city_id:
+                    continue
+                current = by_id.get(city_id)
+                if current is None:
+                    current = dict(item)
+                    current["sources"] = _merge_source_refs(current.get("sources") or ())
+                    by_id[city_id] = current
+                else:
+                    current["sources"] = _merge_source_refs(
+                        current.get("sources") or (), item.get("sources") or ()
+                    )
+            return list(by_id.values())
+
         existing_index = next(
             (
                 index for index, item in enumerate(entries)
@@ -4030,29 +4393,21 @@ class GuidedDialogueService:
         )
         if existing_index is not None:
             existing = entries[existing_index]
+            before = deepcopy(existing)
             merged_ids = sorted(set(existing.get("clue_ids") or []) | set(clue_ids))
-            changed = merged_ids != list(existing.get("clue_ids") or [])
-            if changed:
-                existing["clue_ids"] = merged_ids
-            known_sources = {
-                (str(item.get("provider")), str(item.get("provider_place_id")))
-                for item in existing.get("sources") or [] if isinstance(item, Mapping)
-            }
-            for source in sources:
-                key = (
-                    str(source.get("provider")),
-                    str(source.get("provider_place_id")),
-                )
-                if key not in known_sources:
-                    existing.setdefault("sources", []).append(source)
-                    known_sources.add(key)
-                    changed = True
-            if cities:
-                existing["cities"] = cities
-                changed = True
+            existing["clue_ids"] = merged_ids
+            existing["cities"] = merge_city_details(existing.get("cities"), verified)
+            existing["candidate_cities"] = merge_city_details(
+                existing.get("candidate_cities"), candidates
+            )
+            existing["sources"] = _merge_source_refs(
+                existing.get("sources") or (), sources
+            )
+            changed = existing != before
             if changed:
                 state["place_resolutions"] = entries
             return changed
+
         entries.append({
             "id": resolution_id,
             "version": int(resolution.version),
@@ -4061,7 +4416,8 @@ class GuidedDialogueService:
             "quote": quote or " ".join(resolution.query_terms),
             "clue_ids": sorted(clue_ids),
             "city_ids": list(resolution.city_id_strings),
-            "cities": cities,
+            "cities": verified,
+            "candidate_cities": candidates,
             "sources": sources,
             "foreign_country_isos": list(resolution.foreign_country_isos),
             "notice": resolution.notice,
@@ -4103,11 +4459,23 @@ class GuidedDialogueService:
             if str(entry.get("status") or "") != "resolved":
                 continue
             clue_ids = tuple(str(item) for item in entry.get("clue_ids") or [] if str(item))
-            sources = tuple(
+            global_sources = tuple(
                 item for item in entry.get("sources") or [] if isinstance(item, Mapping)
             )
             for city in entry.get("cities") or []:
                 if not isinstance(city, Mapping):
+                    continue
+                match_kind = str(city.get("match_kind") or "catalog_exact")
+                city_sources = tuple(
+                    item for item in city.get("sources") or () if isinstance(item, Mapping)
+                )
+                if not city_sources:
+                    city_sources = global_sources
+                city_source_type = str(city.get("source_type") or "").strip().lower()
+                if (
+                    city_source_type in _NETWORK_SOURCE_TYPES
+                    or _is_network_evidence(match_kind, city_sources)
+                ):
                     continue
                 try:
                     city_id = int(str(city.get("city_id")))
@@ -4121,21 +4489,84 @@ class GuidedDialogueService:
                     source_iso=source_iso,
                     text=" ".join(str(item) for item in entry.get("query_terms") or []),
                     confidence=float(city.get("confidence") or 0.0),
-                    match_kind=str(city.get("match_kind") or "catalog_exact"),
+                    match_kind=match_kind,
+                    clue_ids=clue_ids,
+                    sources=city_sources,
+                    source_type=str(city.get("source_type") or ""),
+                ))
+        return evidence
+
+    def _source_city_candidates(self, state: Mapping[str, Any]) -> list[CityEvidence]:
+        """Network/local recall candidates; never ranking evidence or country facts."""
+
+        evidence: list[CityEvidence] = []
+        for entry in self._active_resolution_entries(state):
+            status = str(entry.get("status") or "")
+            clue_ids = tuple(str(item) for item in entry.get("clue_ids") or [] if str(item))
+            details: list[Mapping[str, Any]] = []
+            if status == "candidates":
+                details = [
+                    item for item in entry.get("candidate_cities") or []
+                    if isinstance(item, Mapping)
+                ]
+            elif status == "resolved":
+                details = [
+                    item for item in entry.get("cities") or []
+                    if isinstance(item, Mapping)
+                    and (
+                        str(item.get("source_type") or "").strip().lower()
+                        in _NETWORK_SOURCE_TYPES
+                        or _is_network_evidence(
+                            item.get("match_kind"),
+                            item.get("sources") or entry.get("sources") or (),
+                        )
+                    )
+                ]
+            for city in details:
+                try:
+                    city_id = int(str(city.get("city_id")))
+                except (TypeError, ValueError):
+                    continue
+                source_iso = normalize_iso(city.get("source_iso"))
+                if not source_iso:
+                    continue
+                raw_sources = city.get("sources") or (
+                    entry.get("sources") or () if status == "resolved" else ()
+                )
+                sources = tuple(
+                    item for item in raw_sources if isinstance(item, Mapping)
+                )
+                match_kind = str(city.get("match_kind") or "web_candidate")
+                evidence.append(CityEvidence(
+                    city_id=city_id,
+                    source_iso=source_iso,
+                    text=" ".join(str(item) for item in entry.get("query_terms") or []),
+                    confidence=0.0,
+                    match_kind=match_kind,
                     clue_ids=clue_ids,
                     sources=sources,
+                    source_type=str(city.get("source_type") or ""),
                 ))
         return evidence
 
     def _resolved_country_targets(self, state: Mapping[str, Any]) -> list[dict[str, Any]]:
-        """Project a unique resolved catalog city back to its country proposal."""
+        """Project only local verified cities to a country proposal."""
 
         countries: set[str] = set()
         for entry in self._active_resolution_entries(state):
             if str(entry.get("status") or "") != "resolved":
                 continue
-            for city_id in entry.get("city_ids") or []:
-                row = self._city_row_by_id(str(city_id))
+            for city in entry.get("cities") or []:
+                if not isinstance(city, Mapping):
+                    continue
+                sources = city.get("sources") or entry.get("sources") or ()
+                if (
+                    str(city.get("source_type") or "").strip().lower()
+                    in _NETWORK_SOURCE_TYPES
+                    or _is_network_evidence(city.get("match_kind"), sources)
+                ):
+                    continue
+                row = self._city_row_by_id(str(city.get("city_id") or ""))
                 if row is None:
                     continue
                 canonical = canonical_country_iso(row.iso)
@@ -4149,7 +4580,7 @@ class GuidedDialogueService:
         return [self._country_target(country)]
 
     def _refresh_derived_proposals(self, state: dict[str, Any]) -> None:
-        """Rebuild city proposals and metadata from active literal evidence."""
+        """Rebuild pending city proposals without promoting network recall to fact."""
 
         retained = [
             dict(item) for item in state.get("proposals") or []
@@ -4160,15 +4591,19 @@ class GuidedDialogueService:
         scopes = set(self._country_source_scopes(state))
         for entry in self._active_resolution_entries(state):
             status = str(entry.get("status") or "")
-            if status not in {"resolved", "ambiguous"}:
+            if status not in {"resolved", "ambiguous", "candidates"}:
                 continue
-            sources = [
-                dict(item) for item in entry.get("sources") or [] if isinstance(item, Mapping)
-            ]
-            city_details = {
+            verified_details = {
                 str(item.get("city_id")): dict(item)
                 for item in entry.get("cities") or [] if isinstance(item, Mapping)
             }
+            candidate_details = {
+                str(item.get("city_id")): dict(item)
+                for item in entry.get("candidate_cities") or [] if isinstance(item, Mapping)
+            }
+            global_sources = [
+                dict(item) for item in entry.get("sources") or [] if isinstance(item, Mapping)
+            ]
             for city_id in entry.get("city_ids") or []:
                 row = self._city_row_by_id(str(city_id))
                 if row is None:
@@ -4181,55 +4616,93 @@ class GuidedDialogueService:
                 key = _target_state_key(target)
                 proposals[key] = target
                 row_label = str(target.get("label") or row.name)
-                detail = city_details.get(str(city_id), {})
-                provider = next(
-                    (str(item.get("provider") or "") for item in sources if item.get("provider")),
-                    "local_catalog",
+                detail = candidate_details.get(str(city_id)) or verified_details.get(str(city_id)) or {}
+                match_kind = str(detail.get("match_kind") or (
+                    "web_candidate" if status == "candidates" else "catalog_exact"
+                ))
+                sources = [
+                    ref for item in detail.get("sources") or ()
+                    if isinstance(item, Mapping)
+                    for ref in [_source_ref_payload(item)]
+                    if ref is not None
+                ]
+                if not sources and status != "candidates":
+                    sources = [_source_ref_payload(item) for item in global_sources]
+                    sources = [item for item in sources if isinstance(item, dict)]
+                candidate_only = bool(
+                    status in {"candidates", "ambiguous"}
+                    or str(detail.get("source_type") or "").strip().lower()
+                    in _NETWORK_SOURCE_TYPES
+                    or _is_network_evidence(match_kind, sources)
                 )
                 if status == "ambiguous":
                     reason = (
                         "文字可能指向多个目录城市；需补充城市、区名或附近地标，"
                         "不会按人口或检索排名自动选择。"
                     )
-                elif provider == "local_catalog":
+                elif candidate_only:
+                    source_labels = "、".join(
+                        label for item in sources[:2]
+                        for label in [
+                            _source_type_label(item.get("source_type"))
+                            or _source_type_label(item.get("provider"))
+                            or str(item.get("provider") or "")
+                        ]
+                        if label
+                    ) or "联网检索"
+                    reason = (
+                        f"地点候选「{row_label}」来自{source_labels}，仅用于召回，"
+                        "不是已核验地点，需你确认或补充本地目录证据。"
+                    )
+                elif match_kind in {"catalog_exact", "city_alias", "poi", "road", "local_poi", "local_road"}:
                     reason = f"目录名称精确匹配「{row_label}」，待确认。"
                 else:
-                    reason = (
-                        f"用户文字经 {provider} 检索并映射到目录城市「{row_label}」，待确认。"
+                    provider = next(
+                        (str(item.get("provider") or "") for item in sources if item.get("provider")),
+                        "本地目录",
                     )
+                    reason = f"本地来源 {provider} 映射到目录城市「{row_label}」，待确认。"
                 current = meta.get(key)
+                incoming = {
+                    "reason": reason,
+                    "clue_ids": list(entry.get("clue_ids") or []),
+                    "resolution_ids": [str(entry.get("id") or "")],
+                    "selection_basis": "catalog_search" if candidate_only else "user_text",
+                    "ambiguous": status == "ambiguous",
+                    "candidate_only": candidate_only,
+                    "status": "candidates" if candidate_only else None,
+                    "query_terms": list(entry.get("query_terms") or []),
+                    "match_kind": match_kind,
+                    "sources": sources,
+                }
                 if current is None:
-                    meta[key] = {
-                        "reason": reason,
-                        "clue_ids": list(entry.get("clue_ids") or []),
-                        "resolution_ids": [str(entry.get("id") or "")],
-                        "selection_basis": "user_text",
-                        "ambiguous": status == "ambiguous",
-                        "query_terms": list(entry.get("query_terms") or []),
-                        "match_kind": str(detail.get("match_kind") or "geocoder_locality"),
-                        "sources": sources,
-                    }
+                    meta[key] = incoming
                 else:
                     current["clue_ids"] = sorted(
-                        set(current.get("clue_ids") or []) | set(entry.get("clue_ids") or [])
+                        set(current.get("clue_ids") or []) | set(incoming["clue_ids"])
                     )
                     current["resolution_ids"] = sorted(
-                        set(current.get("resolution_ids") or []) | {str(entry.get("id") or "")}
+                        set(current.get("resolution_ids") or []) | set(incoming["resolution_ids"])
                     )
-                    current["ambiguous"] = bool(current.get("ambiguous") or status == "ambiguous")
+                    current["ambiguous"] = bool(current.get("ambiguous") or incoming["ambiguous"])
+                    was_candidate = bool(current.get("candidate_only"))
+                    current["candidate_only"] = bool(
+                        was_candidate and incoming["candidate_only"]
+                    )
+                    if was_candidate and not current["candidate_only"]:
+                        current["reason"] = incoming["reason"]
+                        current["match_kind"] = incoming["match_kind"]
+                    if current["candidate_only"]:
+                        current["status"] = "candidates"
+                    else:
+                        current.pop("status", None)
                     known = {
-                        (str(item.get("provider")), str(item.get("provider_place_id")))
-                        for item in current.get("sources") or []
-                        if isinstance(item, Mapping)
+                        (str(item.get("provider")), str(item.get("url") or ""))
+                        for item in current.get("sources") or [] if isinstance(item, Mapping)
                     }
                     for source in sources:
-                        source_key = (
-                            str(source.get("provider")),
-                            str(source.get("provider_place_id")),
-                        )
-                        if source_key not in known:
+                        if (str(source.get("provider")), str(source.get("url") or "")) not in known:
                             current.setdefault("sources", []).append(source)
-                            known.add(source_key)
         state["proposals"] = [*retained, *proposals.values()][:PROPOSAL_LIMIT]
         state["proposal_meta"] = meta
 
@@ -4253,34 +4726,24 @@ class GuidedDialogueService:
         meta = (state.get("proposal_meta") or {}).get(key)
         if not isinstance(meta, Mapping):
             return None
-        return {
+        candidate_only = bool(meta.get("candidate_only"))
+        result = {
             "query_terms": [str(item)[:60] for item in meta.get("query_terms") or []][:4],
             "clue_ids": [str(item)[:120] for item in meta.get("clue_ids") or []][:20],
             "match_kind": str(meta.get("match_kind") or "catalog_exact"),
             "ambiguous": bool(meta.get("ambiguous")),
+            "candidate_only": candidate_only,
             "sources": [
-                {
-                    "provider": str(item.get("provider") or "local_catalog")[:40],
-                    "provider_place_id": (
-                        str(item.get("provider_place_id"))[:200]
-                        if item.get("provider_place_id") is not None else None
-                    ),
-                    "label": str(item.get("label") or row.name)[:200],
-                    "query": str(item.get("query") or " ".join(meta.get("query_terms") or []))[:200],
-                    "attribution": (
-                        str(item.get("attribution"))[:200]
-                        if item.get("attribution") is not None else None
-                    ),
-                    "license": (
-                        str(item.get("license"))[:80]
-                        if item.get("license") is not None else None
-                    ),
-                    "fetched_at": str(item.get("fetched_at") or "")[:80],
-                }
-                for item in meta.get("sources") or []
+                ref for item in meta.get("sources") or []
                 if isinstance(item, Mapping)
+                for ref in [_source_ref_payload(item)]
+                if ref is not None
             ][:4],
         }
+        if candidate_only:
+            result["status"] = "candidates"
+            result["confidence"] = 0.0
+        return result
 
     def _refresh_conflict(self, state: dict[str, Any]) -> None:
         proposals = [

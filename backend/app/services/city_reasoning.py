@@ -22,8 +22,9 @@
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from urllib.parse import urlsplit
 
 from ..domain.geolocation.clue import Clue
 from ..domain.geolocation.engine import (
@@ -33,6 +34,7 @@ from ..domain.geolocation.engine import (
 )
 from ..domain.geolocation.country_policy import canonical_country_iso, normalize_iso
 from .place_resolution import CityEvidence
+from .city_scene_reasoning import SceneObservation, apply_scene_residual
 
 
 CITY_CLUE_BOOST_SCALE = 0.12
@@ -42,6 +44,10 @@ MIN_ASCII_CITY_NAME = 4
 MIN_NON_ASCII_CITY_NAME = 2
 MIN_EVIDENCE_CONFIDENCE = 0.3
 _OCR_SOURCES = frozenset({"ocr", "point_click"})
+_NETWORK_SOURCE_TYPES = frozenset({"web_search", "geocoder"})
+_NETWORK_MATCH_KINDS = frozenset({
+    "geocoder_locality", "geocoder_candidate", "web_candidate",
+})
 
 
 @dataclass(frozen=True)
@@ -51,6 +57,7 @@ class CityRerankResult:
     city_scores: List[Dict[str, Any]]
     clue_dimensions: Tuple[str, ...] = ()
     coverage_note: Optional[str] = None
+    clue_notes: Tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -62,6 +69,99 @@ class _Evidence:
     catalog_iso: Optional[str] = None
     city_id: Optional[int] = None
     source_iso: Optional[str] = None
+    source: str = ""
+    clue_id: str = ""
+    source_refs: Tuple[Mapping[str, Any], ...] = ()
+    match_kind: str = ""
+
+
+_SOURCE_REF_FIELDS = (
+    "provider", "provider_place_id", "label", "query", "attribution", "license",
+    "fetched_at", "source_type", "url", "title", "excerpt", "observation_source",
+)
+
+
+def _source_refs_are_network(items: Sequence[Mapping[str, Any]]) -> bool:
+    for item in items:
+        source_type = str(item.get("source_type") or "").strip().lower()
+        if source_type in _NETWORK_SOURCE_TYPES:
+            return True
+    return False
+
+
+def _source_refs_from_clue(
+    clue: Clue, extra: Mapping[str, Any]
+) -> Tuple[Mapping[str, Any], ...]:
+    raw_refs = extra.get("source_refs")
+    if isinstance(raw_refs, Mapping):
+        raw_refs = (raw_refs,)
+    refs = _merge_source_refs(tuple(raw_refs or ()))
+    if refs:
+        return refs
+    origin = str(extra.get("origin_source") or clue.source or "").strip().lower()
+    observation_source = "ocr" if origin == "ocr" or clue.source == "ocr" else (
+        "user" if origin in {"user_text", "user"} or clue.source == "user" else None
+    )
+    provider = str(extra.get("provider") or clue.source or "unknown").strip()[:40]
+    if not provider:
+        provider = "unknown"
+    ref = {
+        "provider": provider,
+        "label": str(extra.get("matched_text") or clue.evidence or provider)[:200],
+        "fetched_at": str(extra.get("fetched_at") or "")[:80],
+    }
+    if observation_source:
+        ref["observation_source"] = observation_source
+    return (ref,)
+
+
+def _merge_source_refs(
+    *groups: object,
+) -> Tuple[Mapping[str, Any], ...]:
+    merged: list[dict[str, Any]] = []
+    seen: set[tuple[str, ...]] = set()
+    for group in groups:
+        if isinstance(group, Mapping):
+            group = (group,)
+        for item in group or ():
+            if not isinstance(item, Mapping):
+                continue
+            ref = {
+                key: item.get(key)
+                for key in _SOURCE_REF_FIELDS
+                if item.get(key) is not None
+            }
+            raw_url = str(ref.get("url") or "").strip()
+            if raw_url:
+                try:
+                    parts = urlsplit(raw_url)
+                    hostname = parts.hostname
+                except ValueError:
+                    parts = None
+                    hostname = None
+                if (
+                    parts is None
+                    or parts.scheme.lower() not in {"http", "https"}
+                    or not hostname
+                    or parts.username is not None
+                    or parts.password is not None
+                    or len(raw_url) > 1000
+                ):
+                    ref.pop("url", None)
+            else:
+                ref.pop("url", None)
+            if not ref.get("provider"):
+                ref["provider"] = str(item.get("origin_source") or "unknown")[:40]
+            if not ref.get("label"):
+                ref["label"] = str(ref.get("title") or ref["provider"])[:200]
+            key = tuple(str(ref.get(field) or "") for field in (
+                "source_type", "provider", "url", "title", "observation_source",
+            ))
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(ref)
+    return tuple(merged[:8])
 
 
 class CityClueReasoner:
@@ -74,106 +174,201 @@ class CityClueReasoner:
 
     def rerank(self, city_scores: Sequence[Dict[str, Any]],
                clues: Sequence[Clue], *, iso: str,
-               city_evidence: Sequence[CityEvidence] = ()) -> CityRerankResult:
-        rows = list(city_scores or [])
+               city_evidence: Sequence[CityEvidence] = (),
+               scene_evidence: Mapping[str, Any] | None = None,
+               scene_observations: Sequence[SceneObservation] = (),
+               scene_notes: Sequence[str] = ()) -> CityRerankResult:
+        rows = [dict(row) for row in (city_scores or ())]
         iso_key = str(iso or "").strip().upper()
-        if not rows or self._catalog is None:
-            return CityRerankResult(rows)
-        scope = self._catalog.get(iso_key) or {}
-        if not scope:
-            return CityRerankResult(rows)
-        evidence = self._extract_evidence(clues, iso_key)
-        evidence.extend(self._extract_city_evidence(city_evidence, iso_key, scope))
-        if not evidence:
-            return CityRerankResult(rows)
+        dimensions: set[str] = set()
+        all_notes: List[str] = list(scene_notes)
+        place_notes: List[str] = []
+        changed = False
 
-        buckets = self._name_buckets(scope, iso_key)
-        rows_by_id = {str(row.get("city_id")): row for row in rows if row.get("city_id") is not None}
-        matched: Dict[str, Dict[str, Dict[str, Any]]] = {}
-        notes: List[str] = []
-
-        for item in evidence:
-            if item.city_id is not None:
-                # The resolver already mapped the literal street/POI to this
-                # catalog city. The street itself need not contain its name.
-                ids = [item.city_id]
-                hit = normalize_place_text(self._row_name(scope.get(item.city_id)))
-                if not hit:
-                    continue
-            else:
-                norm = normalize_place_text(item.text)
-                if not norm:
-                    continue
-                hit = self._match_name(norm, buckets)
-                if hit is None:
-                    continue
-                ids = buckets[hit]
-            if len(ids) > 1:
-                notes.append(f"线索中的「{hit}」在该国目录中不唯一，未参与重排")
-                continue
-            display = self._row_name(scope.get(ids[0])) or hit
-            city_key = str(ids[0])
-            if city_key not in rows_by_id:
-                notes.append(
-                    f"线索命中的「{display}」不在本次模型返回的前 {len(rows)} 个城市候选内，未参与重排"
-                )
-                continue
-            entries = matched.setdefault(city_key, {})
-            entry = entries.get(hit)
-            if entry is None:
-                entries[hit] = {
-                    "dimension": item.dimension,
-                    "confidence": min(1.0, item.confidence),
-                    "evidence": item.evidence,
-                    "value": display,
+        scope: Mapping[Any, Any] = {}
+        if self._catalog is not None and iso_key:
+            scope = self._catalog.get(iso_key) or {}
+        if scope:
+            evidence = self._extract_evidence(clues, iso_key)
+            evidence.extend(self._extract_city_evidence(city_evidence, iso_key, scope))
+            if evidence:
+                buckets = self._name_buckets(scope, iso_key)
+                rows_by_id = {
+                    str(row.get("city_id")): row
+                    for row in rows
+                    if row.get("city_id") is not None
                 }
-            elif item.confidence > entry["confidence"]:
-                entry.update(dimension=item.dimension,
-                             confidence=min(1.0, item.confidence),
-                             evidence=item.evidence,
-                             value=display)
+                matched: Dict[str, Dict[str, Dict[str, Any]]] = {}
+                for item in evidence:
+                    if item.city_id is not None:
+                        ids = [item.city_id]
+                        hit = normalize_place_text(self._row_name(scope.get(item.city_id)))
+                        if not hit:
+                            continue
+                    else:
+                        norm = normalize_place_text(item.text)
+                        if not norm:
+                            continue
+                        hit = self._match_name(norm, buckets)
+                        if hit is None:
+                            continue
+                        ids = buckets[hit]
+                    if len(ids) > 1:
+                        place_notes.append(
+                            f"线索中的「{hit}」在该国目录中不唯一，未参与重排"
+                        )
+                        continue
+                    display = self._row_name(scope.get(ids[0])) or hit
+                    city_key = str(ids[0])
+                    if city_key not in rows_by_id:
+                        place_notes.append(
+                            f"线索命中的「{display}」不在本次模型返回的前 {len(rows)} 个城市候选内，未参与重排"
+                        )
+                        continue
+                    entries = matched.setdefault(city_key, {})
+                    entry = entries.get("__city__")
+                    refs = _merge_source_refs(item.source_refs)
+                    if entry is None:
+                        entries["__city__"] = {
+                            "dimension": item.dimension,
+                            "confidence": min(1.0, item.confidence),
+                            "evidence": item.evidence,
+                            "value": display,
+                            "source": item.source,
+                            "clue_id": item.clue_id,
+                            "source_refs": refs,
+                            "match_kind": item.match_kind,
+                        }
+                    else:
+                        # Multiple OCR/network rows for one city support one
+                        # bounded contribution; only provenance is merged.
+                        entry["source_refs"] = _merge_source_refs(
+                            tuple(entry.get("source_refs") or ()), refs
+                        )
+                        if item.confidence > entry["confidence"]:
+                            entry.update(
+                                dimension=item.dimension,
+                                confidence=min(1.0, item.confidence),
+                                evidence=item.evidence,
+                                value=display,
+                                source=item.source,
+                                clue_id=item.clue_id,
+                                match_kind=item.match_kind,
+                            )
 
-        if not matched:
-            return CityRerankResult(rows, (), self._join_notes(notes))
+                if matched:
+                    boosted: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
+                    for city_key, entries in matched.items():
+                        terms: List[Dict[str, Any]] = []
+                        for name, entry in sorted(entries.items()):
+                            term = round(
+                                min(1.0, float(entry["confidence"])) * CITY_CLUE_BOOST_SCALE,
+                                6,
+                            )
+                            terms.append({
+                                "dimension": entry["dimension"],
+                                "value": entry.get("value", name),
+                                "gain": term,
+                                "evidence": entry["evidence"]
+                                or f"城市名精确匹配：{name}",
+                                "source": entry.get("source") or "",
+                                "clue_id": entry.get("clue_id") or "",
+                                "source_refs": list(entry.get("source_refs") or ()),
+                                "match_kind": entry.get("match_kind") or "city_name",
+                            })
+                            dimensions.add(entry["dimension"])
+                        total = min(CITY_CLUE_BOOST_CAP, sum(term["gain"] for term in terms))
+                        boosted[city_key] = (round(total, 6), terms)
 
-        boosted: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
-        dimensions: set = set()
-        for city_key, entries in matched.items():
-            terms: List[Dict[str, Any]] = []
-            for name, entry in sorted(entries.items()):
-                term = round(min(1.0, float(entry["confidence"])) * CITY_CLUE_BOOST_SCALE, 6)
-                terms.append({
-                    "dimension": entry["dimension"],
-                    "value": entry.get("value", name),
-                    "gain": term,
-                    "evidence": entry["evidence"] or f"城市名精确匹配：{name}",
-                })
-                dimensions.add(entry["dimension"])
-            total = min(CITY_CLUE_BOOST_CAP, sum(term["gain"] for term in terms))
-            boosted[city_key] = (round(total, 6), terms)
+                    before_order = sorted(
+                        rows,
+                        key=lambda row: (
+                            -_model_score(row),
+                            _numeric_city_id(row),
+                        ),
+                    )
+                    before_rank = {
+                        str(row.get("city_id")): index
+                        for index, row in enumerate(before_order, 1)
+                    }
+                    result: List[Dict[str, Any]] = []
+                    for row in rows:
+                        city_key = str(row.get("city_id"))
+                        boost, terms = boosted.get(city_key, (0.0, []))
+                        base_score = _model_score(row)
+                        final_score = min(1.0, base_score + boost)
+                        fusion = dict(row.get("fusion")) if isinstance(row.get("fusion"), Mapping) else {}
+                        fusion.update({
+                            "base_score": round(base_score, 6),
+                            "model_base_score": round(base_score, 6),
+                            "place_boost": round(boost, 6),
+                            "place_match_boost": round(boost, 6),
+                            "clue_boost": round(boost, 6),
+                            "clue_boost_cap": CITY_CLUE_BOOST_CAP,
+                            "clue_boost_scale": CITY_CLUE_BOOST_SCALE,
+                            "scene_delta": 0.0,
+                            "final_score": round(final_score, 6),
+                            "rank_before": before_rank.get(city_key),
+                        })
+                        updated = {
+                            **row,
+                            "score": final_score,
+                            "fusion": fusion,
+                        }
+                        if boost > 0.0:
+                            updated["score_type"] = CITY_CLUE_SCORE_TYPE
+                            updated["matched_clues"] = terms
+                        result.append(updated)
+                    after_order = sorted(
+                        result,
+                        key=lambda row: (
+                            -_candidate_score(row),
+                            _numeric_city_id(row),
+                        ),
+                    )
+                    after_rank = {
+                        str(row.get("city_id")): index
+                        for index, row in enumerate(after_order, 1)
+                    }
+                    for row in result:
+                        row["fusion"]["rank_after"] = after_rank.get(
+                            str(row.get("city_id"))
+                        )
+                        row["rank_before"] = before_rank.get(str(row.get("city_id")))
+                        row["rank_after"] = after_rank.get(str(row.get("city_id")))
+                    rows = result
+                    changed = True
 
-        result: List[Dict[str, Any]] = []
-        for row in rows:
-            city_key = str(row.get("city_id"))
-            if city_key not in boosted:
-                result.append(row)
-                continue
-            boost, terms = boosted[city_key]
-            base_score = float(row.get("score", 0.0))
-            result.append({
-                **row,
-                "score": min(1.0, base_score + boost),
-                "score_type": CITY_CLUE_SCORE_TYPE,
-                "matched_clues": terms,
-                "fusion": {
-                    "base_score": base_score,
-                    "clue_boost": boost,
-                    "clue_boost_cap": CITY_CLUE_BOOST_CAP,
-                    "clue_boost_scale": CITY_CLUE_BOOST_SCALE,
-                },
-            })
-        result.sort(key=_city_order_key)
-        return CityRerankResult(result, tuple(sorted(dimensions)), self._join_notes(notes))
+        if scene_observations or scene_notes:
+            scene_result = apply_scene_residual(
+                rows,
+                scene_evidence,
+                scene_observations,
+                notes=[*place_notes, *scene_notes],
+            )
+            rows = scene_result.city_scores
+            for row in rows:
+                fusion = row.get("fusion")
+                if isinstance(fusion, dict):
+                    place_match_boost = fusion.get("place_match_boost")
+                    if place_match_boost is None and fusion.get("place_boost") is not None:
+                        fusion["place_match_boost"] = fusion.get("place_boost")
+            dimensions.update(scene_result.dimensions)
+            all_notes = list(scene_result.clue_notes)
+            changed = changed or scene_result.attempted
+        else:
+            all_notes = _unique_notes([*place_notes, *all_notes])
+
+        if changed:
+            rows.sort(key=_city_order_key)
+        if all_notes:
+            rows = [{**row, "clue_notes": list(all_notes)} for row in rows]
+        return CityRerankResult(
+            rows,
+            tuple(sorted(dimensions)),
+            self._join_notes(all_notes),
+            tuple(all_notes),
+        )
 
     # ---- evidence -----------------------------------------------------------
     def _extract_evidence(self, clues: Sequence[Clue], iso: str) -> List[_Evidence]:
@@ -186,6 +381,16 @@ class CityClueReasoner:
             # into a city match. Resolver-validated CityEvidence below remains
             # an independent, catalog-scoped path.
             if extra.get("display_only") is True or extra.get("affects_ranking") is False:
+                continue
+            if (
+                extra.get("candidate_only") is True
+                or str(extra.get("match_kind") or "").strip().lower() in _NETWORK_MATCH_KINDS
+                or _source_refs_are_network(
+                    tuple(extra.get("source_refs") or ())
+                    if not isinstance(extra.get("source_refs"), Mapping)
+                    else (extra.get("source_refs"),)
+                )
+            ):
                 continue
             dimension = clue.dimension
             if dimension == "place_name":
@@ -220,12 +425,17 @@ class CityClueReasoner:
                 # 语义线索（value=ISO）把已校验城市名放在 extra 里。
                 texts.append(city_name)
             for text in texts:
+                source_refs = _source_refs_from_clue(clue, extra)
                 evidence.append(_Evidence(
                     dimension=dimension,
                     text=text,
                     confidence=min(1.0, confidence),
                     evidence=str(clue.evidence or ""),
                     catalog_iso=catalog_iso,
+                    source=str(clue.source or ""),
+                    clue_id=str(extra.get("guided_clue_id") or extra.get("clue_id") or ""),
+                    source_refs=source_refs,
+                    match_kind=str(extra.get("match_kind") or extra.get("match") or ""),
                 ))
         return evidence
 
@@ -243,6 +453,13 @@ class CityClueReasoner:
                 continue
             if str(item.source_iso or "").strip().upper() != iso:
                 continue
+            item_source_type = str(getattr(item, "source_type", "") or "").strip().lower()
+            if (
+                item_source_type in _NETWORK_SOURCE_TYPES
+                or str(item.match_kind or "").strip().lower() in _NETWORK_MATCH_KINDS
+                or _source_refs_are_network(tuple(item.sources or ()))
+            ):
+                continue
             try:
                 city_id = int(item.city_id)
             except (TypeError, ValueError):
@@ -252,8 +469,15 @@ class CityClueReasoner:
             confidence = min(1.0, max(0.0, float(item.confidence)))
             if confidence < MIN_EVIDENCE_CONFIDENCE:
                 continue
+            refs = _merge_source_refs(tuple(item.sources or ()))
+            if not refs and item_source_type:
+                refs = _merge_source_refs(({
+                    "provider": item_source_type,
+                    "label": item.text,
+                    "source_type": item_source_type,
+                },))
             current = best.get(city_id)
-            if current is None or confidence > current.confidence:
+            if current is None:
                 best[city_id] = _Evidence(
                     dimension="place_name",
                     text=item.text,
@@ -262,6 +486,17 @@ class CityClueReasoner:
                     catalog_iso=iso,
                     city_id=city_id,
                     source_iso=iso,
+                    source="place_resolution",
+                    clue_id=(item.clue_ids[0] if item.clue_ids else ""),
+                    source_refs=refs,
+                    match_kind=str(item.match_kind or ""),
+                )
+            else:
+                best[city_id] = replace(
+                    current,
+                    confidence=max(current.confidence, confidence),
+                    evidence=current.evidence or item.text,
+                    source_refs=_merge_source_refs(current.source_refs, refs),
                 )
         return list(best.values())
     # ---- name matching ------------------------------------------------------
@@ -313,6 +548,51 @@ class CityClueReasoner:
         return "；".join(unique[:2]) + suffix
 
 
+def _numeric_city_id(row: Mapping[str, Any]) -> int:
+    try:
+        return int(str(row.get("city_id")))
+    except (TypeError, ValueError):
+        return 1 << 62
+
+
+def _model_score(row: Mapping[str, Any]) -> float:
+    fusion = row.get("fusion")
+    if isinstance(fusion, Mapping):
+        value = fusion.get("model_base_score")
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            number = float(value)
+            if number == number and number not in (float("inf"), float("-inf")):
+                return number
+    value = row.get("score", 0.0)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _candidate_score(row: Mapping[str, Any]) -> float:
+    fusion = row.get("fusion")
+    if isinstance(fusion, Mapping):
+        value = fusion.get("final_score")
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            number = float(value)
+            if number == number and number not in (float("inf"), float("-inf")):
+                return number
+    try:
+        return float(row.get("score", 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _unique_notes(notes: Sequence[str]) -> List[str]:
+    unique: List[str] = []
+    for raw in notes:
+        note = str(raw or "").strip()
+        if note and note not in unique:
+            unique.append(note)
+    return unique
+
+
 def _usable_name(normalized_name: str) -> bool:
     if not normalized_name:
         return False
@@ -328,15 +608,7 @@ def _city_phrase_found(norm_text: str, name: str) -> bool:
 
 
 def _city_order_key(row: Mapping[str, Any]) -> Tuple[float, int]:
-    try:
-        city_id = int(str(row.get("city_id")))
-    except (TypeError, ValueError):
-        city_id = 1 << 62
-    try:
-        score = float(row.get("score", 0.0))
-    except (TypeError, ValueError):
-        score = 0.0
-    return (-score, city_id)
+    return (-_candidate_score(row), _numeric_city_id(row))
 
 
 __all__ = [

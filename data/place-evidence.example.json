@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "kind": "m_photo_place_evidence",
+  "note": "Example only. Replace every placeholder with a literal name and a verifiable source record. POI/road rows require city_id/source_iso to match an existing catalog city, confidence >= 0.9, and a source URL with no credentials.",
+  "generated_at": "2026-10-22T00:00:00Z",
+  "entries": [
+    {
+      "name": "<literal road or POI name from the source>",
+      "kind": "road",
+      "city_id": "<existing catalog city id>",
+      "source_iso": "CN",
+      "confidence": 0.95,
+      "sources": [
+        {
+          "provider": "<source provider>",
+          "label": "<literal road or POI name from the source>",
+          "url": "https://data.example.org/source-record#anchor",
+          "title": "<source page title>",
+          "excerpt": "<source excerpt tying the name to the city>",
+          "fetched_at": "2026-10-22T00:00:00Z",
+          "attribution": "<required attribution>",
+          "license": "<source license>"
+        }
+      ]
+    }
+  ]
+}

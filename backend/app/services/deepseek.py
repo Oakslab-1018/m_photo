@@ -20,6 +20,9 @@ SYSTEM_PROMPT = """你是照片国家级定位助手，请用简短中文与用�
 不得改变国家、动作或排除条件，不得声称已锁定/已确认拍摄地。
 StreetCLIP 只是候选国家目录内的相似度排序，余弦和规则权重都不是概率。
 候选目录外的地点也会被排进目录；不能声称检测出了目录外图片。
+来源只能依据 evidence_summary 中明确的 source_type、observation_source 和 signal_kind。
+本地库、联网检索、OCR/用户观察、模型观察必须分开表述；candidate_only 或 status=candidates
+表示未核验召回，不能说成已核验地点，也不能声称联网候选增加了地名分。
 国家坐标仅为展示用代表点，不是照片 GPS。不要编造未提供的视觉证据。
 台湾、香港、澳门是中国不可分割的一部分（地区）而不是国家：台湾只能表述为
 「中国台湾地区」，国家候选统一写作「中国」，绝不能把台湾称为国家或使用
@@ -79,6 +82,74 @@ def _safe_confidence(value: object) -> dict | None:
     if isinstance(top3, list):
         result["top3"] = [row for row in (_safe_score_row(item) for item in top3[:3]) if row]
     return result or None
+
+
+def _safe_evidence_ref(value: object) -> dict | None:
+    if not isinstance(value, dict):
+        return None
+    result = {
+        key: str(value.get(key))[:limit]
+        for key, limit in (
+            ("source_type", 32), ("provider", 40), ("title", 160),
+            ("excerpt", 240), ("fetched_at", 80), ("observation_source", 16),
+        )
+        if value.get(key) is not None and str(value.get(key)).strip()
+    }
+    if result.get("source_type") not in {
+        "local_catalog", "local_poi", "local_road", "web_search", "geocoder",
+    }:
+        result.pop("source_type", None)
+    if result.get("observation_source") not in {"user", "ocr"}:
+        result.pop("observation_source", None)
+    return result or None
+
+
+def _candidate_evidence_summary(candidates: object) -> list[dict]:
+    if not isinstance(candidates, list):
+        return []
+    result: list[dict] = []
+    for candidate in candidates[:5]:
+        if not isinstance(candidate, dict):
+            continue
+        target = candidate.get("target") if isinstance(candidate.get("target"), dict) else {}
+        place_match = candidate.get("place_match") if isinstance(candidate.get("place_match"), dict) else {}
+        refs: list[dict] = []
+        for source in place_match.get("sources") or []:
+            ref = _safe_evidence_ref(source)
+            if ref and ref not in refs:
+                refs.append(ref)
+        matched = candidate.get("matched_clues") if isinstance(candidate.get("matched_clues"), list) else []
+        signals: list[str] = []
+        for clue in matched[:5]:
+            if not isinstance(clue, dict):
+                continue
+            signal = str(clue.get("signal_kind") or clue.get("match_kind") or "")[:40]
+            if signal and signal not in signals:
+                signals.append(signal)
+            for source in clue.get("source_refs") or []:
+                ref = _safe_evidence_ref(source)
+                if ref and ref not in refs:
+                    refs.append(ref)
+        item = {
+            "level": str(target.get("level") or "")[:16],
+            "label": str(target.get("label") or target.get("id") or "")[:200],
+            "score": candidate.get("score"),
+            "score_type": str(candidate.get("score_type") or "")[:64],
+            "candidate_only": bool(place_match.get("candidate_only")),
+            "status": place_match.get("status") if place_match.get("status") == "candidates" else None,
+            "candidate_confidence": place_match.get("confidence"),
+            "match_kind": str(place_match.get("match_kind") or "")[:48],
+            "signals": signals,
+            "sources": refs[:6],
+        }
+        if item["score"] is not None and not isinstance(item["score"], (int, float)):
+            item.pop("score")
+        if item["status"] is None:
+            item.pop("status")
+        if item["candidate_confidence"] is None:
+            item.pop("candidate_confidence")
+        result.append(item)
+    return result
 
 
 def _safe_action_payload(payload: object) -> dict:
@@ -280,6 +351,7 @@ class DeepSeekClient:
                         ) if row
                     ],
                     "clues": clues,
+                    "evidence_summary": _candidate_evidence_summary(context.get("candidates")),
                     "feedback": self._redact(context.get("feedback", "")),
                     "history": [{"role": m.get("role"), "content": self._redact(m.get("content", ""), 600)}
                                 for m in context.get("history", [])[-8:] if isinstance(m, dict)]}

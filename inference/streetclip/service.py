@@ -12,6 +12,7 @@ from __future__ import annotations
 import importlib
 import inspect
 import logging
+import math
 import threading
 from typing import Any
 
@@ -39,6 +40,13 @@ from .predictor import (
     SceneAnalysisUnavailableError,
     StreetClipPredictor,
 )
+from services.city_scene_contract import (
+    CITY_SCENE_VERSION,
+    MAX_CITY_SCENE_CITIES,
+    MAX_CITY_SCENE_CLUES,
+    MAX_CITY_SCENE_PROMPTS,
+    normalize_city_scene_clue,
+)
 from .schema import (
     DecodeError,
     EmptyImageError,
@@ -63,6 +71,10 @@ class InvalidCityIdsError(ValueError):
     """Raised when targeted scoring IDs are malformed or outside the catalog."""
 
 
+class InvalidCitySceneCluesError(ValueError):
+    """Raised when city-scene clues are outside the fixed bounded vocabulary."""
+
+
 def _normalize_target_city_ids(city_ids: Any) -> tuple[int, ...]:
     """Validate unique positive target IDs in request order."""
     if isinstance(city_ids, (str, bytes, bytearray)):
@@ -84,6 +96,49 @@ def _normalize_target_city_ids(city_ids: Any) -> tuple[int, ...]:
             raise InvalidCityIdsError("city_ids must be unique")
         seen.add(city_id)
         normalized.append(city_id)
+    return tuple(normalized)
+
+
+def _normalize_city_scene_city_ids(city_ids: Any) -> tuple[int, ...]:
+    """Validate 1..20 unique positive city IDs for scene-condition scoring."""
+    if isinstance(city_ids, (str, bytes, bytearray)):
+        raise InvalidCityIdsError("city_ids must be an array of positive integers")
+    try:
+        values = tuple(city_ids)
+    except TypeError as exc:
+        raise InvalidCityIdsError("city_ids must be an array of positive integers") from exc
+    if not 1 <= len(values) <= MAX_CITY_SCENE_CITIES:
+        raise InvalidCityIdsError(
+            f"city_ids must contain 1 to {MAX_CITY_SCENE_CITIES} unique positive integers"
+        )
+    normalized: list[int] = []
+    seen: set[int] = set()
+    for city_id in values:
+        if isinstance(city_id, bool) or not isinstance(city_id, int) or city_id <= 0:
+            raise InvalidCityIdsError("city_ids must contain positive integers")
+        if city_id in seen:
+            raise InvalidCityIdsError("city_ids must be unique")
+        seen.add(city_id)
+        normalized.append(city_id)
+    return tuple(normalized)
+
+
+def _normalize_city_scene_clue_pairs(clues: Any) -> tuple[tuple[str, str], ...]:
+    """Validate canonical ``(dimension, value)`` pairs without free text."""
+    if not isinstance(clues, (list, tuple)):
+        raise InvalidCitySceneCluesError("clues must be an array")
+    if not 1 <= len(clues) <= MAX_CITY_SCENE_CLUES:
+        raise InvalidCitySceneCluesError(
+            f"clues must contain 1 to {MAX_CITY_SCENE_CLUES} entries"
+        )
+    normalized: list[tuple[str, str]] = []
+    for clue in clues:
+        if not isinstance(clue, (list, tuple)) or len(clue) != 2:
+            raise InvalidCitySceneCluesError("each clue must be a dimension/value pair")
+        pair = normalize_city_scene_clue(clue[0], clue[1])
+        if pair is None:
+            raise InvalidCitySceneCluesError("unknown clue dimension or value")
+        normalized.append(pair)
     return tuple(normalized)
 
 
@@ -504,6 +559,155 @@ class StreetClipService:
                 f"scene analysis returned invalid bounded results: {exc}"
             ) from exc
 
+    def city_scene_scores(
+        self,
+        country_iso: str,
+        payload: bytes,
+        *,
+        city_ids: tuple[int, ...],
+        clues: tuple[tuple[str, str], ...],
+    ) -> dict[str, Any]:
+        """Score fixed scene conditions for exactly 1..20 catalog cities.
+
+        This is experimental model matching, not city-attribute verification:
+        it compares one image against the neutral city text prototypes and two
+        fixed street-scene prompts per clue. The prompts contain only the
+        catalog's original city/country names and a contract-owned English
+        description. No LLM, caller prompt, city fact or coordinate is inferred,
+        and the cosine values are not probabilities or accuracy claims.
+
+        The image is encoded exactly once by the shared encoder while the
+        existing ``_predict_lock`` is held. Every clue covers every requested
+        city in request order.
+        """
+        iso = str(country_iso or "").strip().upper()
+        if len(iso) != 2 or not iso.isalpha():
+            raise InvalidCountryError("country_iso must be a two-letter ISO code")
+        if iso not in self._country_by_iso:
+            raise InvalidCountryError("unsupported country_iso")
+
+        targeted_city_ids = _normalize_city_scene_city_ids(city_ids)
+        canonical_clues = _normalize_city_scene_clue_pairs(clues)
+        if (
+            len(targeted_city_ids) * len(canonical_clues) * 2
+            > MAX_CITY_SCENE_PROMPTS
+        ):
+            raise InvalidCitySceneCluesError(
+                "city-scene prompt count exceeds the bounded contract"
+            )
+
+        validate_image_bytes(payload, max_bytes=self.settings.max_upload_bytes)
+
+        catalog_cities = self._cities.get(iso, ())
+        city_by_id = {city.city_id: city for city in catalog_cities}
+        if any(city_id not in city_by_id for city_id in targeted_city_ids):
+            raise InvalidCityIdsError(
+                "city_ids must reference catalog cities in the requested country"
+            )
+        cities = tuple(city_by_id[city_id] for city_id in targeted_city_ids)
+        if self._city_catalog_revision is None:
+            raise PredictorUnavailableError("city catalog revision is unavailable")
+
+        if self._predictor is None or not self._predictor.ready:
+            raise PredictorUnavailableError("model is not ready")
+        encode_image = getattr(self._predictor, "encode_image", None)
+        city_scene_predictor = getattr(self._predictor, "city_scene_scores", None)
+        if not callable(encode_image) or not callable(city_scene_predictor):
+            raise PredictorUnavailableError(
+                "city scene-condition scoring is unavailable"
+            )
+
+        image = decode_image_bytes(payload)
+        try:
+            with self._predict_lock:
+                vector = encode_image(image)
+                raw_results = city_scene_predictor(
+                    vector,
+                    iso,
+                    cities,
+                    self._country_by_iso[iso].name,
+                    canonical_clues,
+                )
+        except PredictorUnavailableError:
+            raise
+        except Exception as exc:  # pragma: no cover - delegated capability boundary
+            raise PredictorUnavailableError(
+                f"city scene-condition scoring failed: {type(exc).__name__}"
+            ) from exc
+
+        if not isinstance(raw_results, (list, tuple)) or len(raw_results) != len(canonical_clues):
+            raise PredictorUnavailableError(
+                "city scene-condition clue count does not match the request"
+            )
+
+        expected_city_ids = tuple(city.city_id for city in cities)
+        normalized_results: list[dict[str, Any]] = []
+        for clue_index, (dimension, value) in enumerate(canonical_clues):
+            row = raw_results[clue_index]
+            if not isinstance(row, dict):
+                raise PredictorUnavailableError(
+                    "city scene-condition clue result is malformed"
+                )
+            if row.get("dimension") != dimension or row.get("value") != value:
+                raise PredictorUnavailableError(
+                    "city scene-condition clue identity does not match the request"
+                )
+            raw_scores = row.get("scores")
+            if not isinstance(raw_scores, (list, tuple)) or len(raw_scores) != len(cities):
+                raise PredictorUnavailableError(
+                    "city scene-condition scores do not cover all requested cities"
+                )
+            scores: list[dict[str, Any]] = []
+            for city_index, city in enumerate(cities):
+                score_row = raw_scores[city_index]
+                if not isinstance(score_row, dict):
+                    raise PredictorUnavailableError(
+                        "city scene-condition score row is malformed"
+                    )
+                if score_row.get("city_id") != expected_city_ids[city_index]:
+                    raise PredictorUnavailableError(
+                        "city scene-condition city order does not match the request"
+                    )
+                try:
+                    raw_cosine = float(score_row.get("raw_cosine"))
+                    neutral_cosine = float(score_row.get("neutral_cosine"))
+                except (TypeError, ValueError) as exc:
+                    raise PredictorUnavailableError(
+                        "city scene-condition cosine is not numeric"
+                    ) from exc
+                if (
+                    not math.isfinite(raw_cosine)
+                    or not math.isfinite(neutral_cosine)
+                    or not -1.0 <= raw_cosine <= 1.0
+                    or not -1.0 <= neutral_cosine <= 1.0
+                ):
+                    raise PredictorUnavailableError(
+                        "city scene-condition cosine is outside the bounded range"
+                    )
+                scores.append(
+                    {
+                        "city_id": city.city_id,
+                        "raw_cosine": raw_cosine,
+                        "neutral_cosine": neutral_cosine,
+                    }
+                )
+            normalized_results.append(
+                {
+                    "dimension": dimension,
+                    "value": value,
+                    "scores": scores,
+                }
+            )
+
+        return {
+            "country_iso": iso,
+            "city_catalog_revision": self._city_catalog_revision,
+            "model_revision": MODEL_REVISION,
+            "prompt_version": CITY_SCENE_VERSION,
+            "city_ids": list(targeted_city_ids),
+            "clues": normalized_results,
+        }
+
     def predict_cities(
         self,
         country_iso: str,
@@ -608,6 +812,7 @@ __all__ = [
     "ImageTooLargeError",
     "ImageValidationError",
     "InvalidCityIdsError",
+    "InvalidCitySceneCluesError",
     "InvalidCountryError",
     "SceneAnalysisUnavailableError",
     "StreetClipService",

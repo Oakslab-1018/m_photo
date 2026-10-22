@@ -45,8 +45,17 @@ from .scene import (
     iter_scene_prompts,
 )
 from .schema import build_prediction, build_scene_analysis
+from services.city_scene_contract import (
+    MAX_CITY_SCENE_CITIES,
+    MAX_CITY_SCENE_CLUES,
+    MAX_CITY_SCENE_PROMPTS,
+    normalize_city_scene_clue,
+    render_city_scene_prompts,
+)
 
 logger = logging.getLogger(__name__)
+
+MAX_CITY_SCENE_PROTOTYPE_CACHE_ENTRIES = 32
 
 
 class PredictorUnavailableError(RuntimeError):
@@ -115,6 +124,12 @@ class StreetClipPredictor:
         self._city_cache_limit = max(1, int(CITY_TEXT_FEATURE_CACHE_COUNTRIES))
         self._scene_cache_lock = threading.Lock()
         self._scene_text_cache: tuple[np.ndarray, ...] | None = None
+        self._city_scene_cache_lock = threading.Lock()
+        self._city_scene_compute_lock = threading.Lock()
+        self._city_scene_cache: "OrderedDict[tuple[Any, ...], np.ndarray]" = (
+            OrderedDict()
+        )
+        self._city_scene_cache_limit = MAX_CITY_SCENE_PROTOTYPE_CACHE_ENTRIES
 
     @property
     def ready(self) -> bool:
@@ -611,6 +626,232 @@ class StreetClipPredictor:
             for index, city in enumerate(cities)
         ]
 
+    def _city_scene_text_features(
+        self,
+        country_iso: str,
+        cities: tuple[City, ...],
+        country_name: str,
+        clues: tuple[tuple[str, str], ...],
+    ) -> np.ndarray:
+        """Return bounded conditioned city-scene prototypes from a fixed LRU.
+
+        This cache is independent from ``_city_cache``. Each entry stores one
+        ``(clue, city, embedding_dimension)`` matrix for the exact ordered city
+        and clue set; at most 32 entries are retained. Prompt text is always
+        the fixed contract description plus the catalog's original city and
+        country names, never caller-provided free text.
+        """
+        if not self._ready or self._model is None:
+            raise PredictorUnavailableError("model is not loaded")
+        if not cities or len(cities) > MAX_CITY_SCENE_CITIES:
+            raise ValueError("invalid city-scene city count")
+        if not clues or len(clues) > MAX_CITY_SCENE_CLUES:
+            raise ValueError("invalid city-scene clue count")
+
+        iso = country_iso.strip().upper()
+        city_ids = tuple(city.city_id for city in cities)
+        cache_key = (iso, country_name, city_ids, clues)
+        with self._city_scene_cache_lock:
+            cached = self._city_scene_cache.get(cache_key)
+            if cached is not None:
+                self._city_scene_cache.move_to_end(cache_key)
+                return cached
+
+        # Avoid duplicate text-forward work when direct predictor callers race.
+        # The service already serializes this work with its prediction lock.
+        with self._city_scene_compute_lock:
+            with self._city_scene_cache_lock:
+                cached = self._city_scene_cache.get(cache_key)
+                if cached is not None:
+                    self._city_scene_cache.move_to_end(cache_key)
+                    return cached
+
+            prompts: list[str] = []
+            for city in cities:
+                for dimension, value in clues:
+                    prompts.extend(
+                        render_city_scene_prompts(
+                            city.name,
+                            country_name,
+                            (dimension, value),
+                        )
+                    )
+            expected_prompt_count = len(cities) * len(clues) * 2
+            if (
+                expected_prompt_count > MAX_CITY_SCENE_PROMPTS
+                or len(prompts) != expected_prompt_count
+            ):
+                raise PredictorUnavailableError(
+                    "city-scene prompt count is outside the bounded contract"
+                )
+
+            flat = np.asarray(self._encode_text_prompts(prompts), dtype=np.float32)
+            if (
+                flat.ndim != 2
+                or flat.shape[0] != expected_prompt_count
+                or flat.shape[1] == 0
+                or not bool(np.isfinite(flat).all())
+            ):
+                raise PredictorUnavailableError(
+                    "StreetCLIP returned invalid city-scene text embeddings"
+                )
+
+            per_city_clue = flat.reshape(
+                len(cities), len(clues), 2, flat.shape[1]
+            )
+            averaged = per_city_clue.mean(axis=2, dtype=np.float32)
+            normalized = _l2_normalize_numpy(averaged)
+            # Score in clue-major order: (clue, city, embedding_dimension).
+            prototypes = np.ascontiguousarray(
+                np.transpose(normalized, (1, 0, 2)), dtype=np.float32
+            )
+            with self._city_scene_cache_lock:
+                self._city_scene_cache[cache_key] = prototypes
+                self._city_scene_cache.move_to_end(cache_key)
+                while len(self._city_scene_cache) > self._city_scene_cache_limit:
+                    self._city_scene_cache.popitem(last=False)
+            return prototypes
+
+    def city_scene_scores(
+        self,
+        image_vector: np.ndarray,
+        country_iso: str,
+        cities: tuple[City, ...],
+        countryname: str,
+        clues: tuple[tuple[str, str], ...],
+    ) -> list[dict[str, Any]]:
+        """Return experimental city scene-condition cosine scores.
+
+        Each clue carries a conditioned cosine from two fixed street-scene
+        prompts that combine the fixed English condition description with the
+        catalog's original city and country names. ``neutral_cosine`` is the
+        existing city text-prototype cosine from ``city_text_scores``. Both are
+        model similarities in ``[-1, 1]``, not city-attribute verification,
+        probabilities or validated accuracy claims.
+        """
+        if not self._ready or self._model is None:
+            raise PredictorUnavailableError("model is not loaded")
+        if not isinstance(cities, (tuple, list)) or not 1 <= len(cities) <= MAX_CITY_SCENE_CITIES:
+            raise ValueError("invalid city-scene cities")
+        if not isinstance(clues, (tuple, list)) or not 1 <= len(clues) <= MAX_CITY_SCENE_CLUES:
+            raise ValueError("invalid city-scene clues")
+        cities = tuple(cities)
+
+        iso = str(country_iso or "").strip().upper()
+        if len(iso) != 2 or not iso.isalpha():
+            raise ValueError("invalid city-scene country_iso")
+        country_name = " ".join(str(countryname or "").split())
+        if not country_name:
+            raise ValueError("invalid city-scene country name")
+
+        seen_city_ids: set[int] = set()
+        for city in cities:
+            if isinstance(city.city_id, bool) or city.city_id <= 0:
+                raise ValueError("invalid city-scene city id")
+            if city.city_id in seen_city_ids:
+                raise ValueError("duplicate city-scene city id")
+            seen_city_ids.add(city.city_id)
+            if city.iso.strip().upper() != iso:
+                raise ValueError("city-scene city is outside the requested country")
+
+        normalized_clues: list[tuple[str, str]] = []
+        for clue in clues:
+            if not isinstance(clue, (tuple, list)) or len(clue) != 2:
+                raise ValueError("invalid city-scene clue pair")
+            pair = normalize_city_scene_clue(clue[0], clue[1])
+            if pair is None:
+                raise ValueError("unknown city-scene clue")
+            normalized_clues.append(pair)
+        canonical_clues = tuple(normalized_clues)
+
+        try:
+            query = np.asarray(image_vector, dtype=np.float32)
+        except (TypeError, ValueError) as exc:
+            raise PredictorUnavailableError(
+                "city-scene scoring requires a numeric image vector"
+            ) from exc
+        if query.ndim != 1 or query.size == 0:
+            raise PredictorUnavailableError(
+                "city-scene scoring requires a 1-D image vector"
+            )
+        norm = float(np.linalg.norm(query.astype(np.float64)))
+        if not math.isfinite(norm) or norm <= 1e-12:
+            raise PredictorUnavailableError(
+                "city-scene scoring requires a non-zero finite image vector"
+            )
+        query = query / np.float32(norm)
+
+        neutral_rows = self.city_text_scores(
+            query,
+            iso,
+            cities,
+            country_name,
+        )
+        expected_ids = tuple(city.city_id for city in cities)
+        if tuple(city_id for city_id, _ in neutral_rows) != expected_ids:
+            raise PredictorUnavailableError(
+                "neutral city-scene score IDs do not match the selected cities"
+            )
+        neutral_by_id: dict[int, float] = {}
+        for city_id, neutral_cosine in neutral_rows:
+            value = float(neutral_cosine)
+            if not math.isfinite(value) or not -1.0 <= value <= 1.0:
+                raise PredictorUnavailableError(
+                    "neutral city-scene cosine is non-finite or out of range"
+                )
+            neutral_by_id[city_id] = value
+
+        prototypes = self._city_scene_text_features(
+            iso,
+            cities,
+            country_name,
+            canonical_clues,
+        )
+        if (
+            prototypes.ndim != 3
+            or prototypes.shape[0] != len(canonical_clues)
+            or prototypes.shape[1] != len(cities)
+            or prototypes.shape[2] != query.shape[0]
+        ):
+            raise PredictorUnavailableError(
+                "city-scene text feature shape does not match the request"
+            )
+        conditioned = prototypes @ query
+        if conditioned.shape != (len(canonical_clues), len(cities)):
+            raise PredictorUnavailableError(
+                "city-scene conditioned score shape mismatch"
+            )
+        if not bool(np.isfinite(conditioned).all()):
+            raise PredictorUnavailableError("city-scene cosine is non-finite")
+
+        results: list[dict[str, Any]] = []
+        for clue_index, (dimension, value) in enumerate(canonical_clues):
+            scores: list[dict[str, Any]] = []
+            for city_index, city in enumerate(cities):
+                raw_cosine = float(
+                    np.clip(conditioned[clue_index, city_index], -1.0, 1.0)
+                )
+                neutral_cosine = neutral_by_id[city.city_id]
+                if not -1.0 <= raw_cosine <= 1.0:
+                    raise PredictorUnavailableError(
+                        "conditioned city-scene cosine is out of range"
+                    )
+                scores.append(
+                    {
+                        "city_id": city.city_id,
+                        "raw_cosine": raw_cosine,
+                        "neutral_cosine": neutral_cosine,
+                    }
+                )
+            results.append(
+                {
+                    "dimension": dimension,
+                    "value": value,
+                    "scores": scores,
+                }
+            )
+        return results
+
     def predict_from_vector(self, image_vector: np.ndarray) -> dict[str, Any]:
         """Country ranking from a shared :meth:`encode_image` vector.
 
@@ -685,6 +926,8 @@ class StreetClipPredictor:
         with self._city_cache_lock:
             self._city_cache.clear()
             self._city_locks.clear()
+        with self._city_scene_cache_lock:
+            self._city_scene_cache.clear()
         torch = self._torch
         self._torch = None
         if torch is not None and torch.cuda.is_available():
@@ -692,6 +935,7 @@ class StreetClipPredictor:
 
 
 __all__ = [
+    "MAX_CITY_SCENE_PROTOTYPE_CACHE_ENTRIES",
     "Predictor",
     "PredictorUnavailableError",
     "SceneAnalysisUnavailableError",

@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, ref, watch } from 'vue'
 import { AnimatePresence, motion, useReducedMotion } from 'motion-v'
+import GuidedCityClueImpact from '@/components/GuidedCityClueImpact.vue'
 import PlaceMatchEvidence from '@/components/PlaceMatchEvidence.vue'
 import type {
   ConfidenceRoute,
@@ -21,6 +22,7 @@ import {
   candidatePointLabel,
   candidateScoreLabel,
   guidedCandidateComposition,
+  guidedCityClueImpact,
   guidedCurrentReviewClue,
   guidedPreviousLevel,
   guidedQuestionMessage,
@@ -299,8 +301,20 @@ const candidateTitle = computed(() => {
 
 const candidateComposition = computed(() => guidedCandidateComposition(topCandidates.value))
 const candidateLevelName = computed(() => (stage.value === 'city' ? '城市' : '国家 / 地区'))
+const hasCityImpactDetails = computed(
+  () =>
+    stage.value === 'city' &&
+    topCandidates.value.some((candidate) => guidedCityClueImpact(candidate)?.hasDetail),
+)
 const candidateSectionNote = computed(() => {
   const composition = candidateComposition.value
+  // City scores already share one ordering. User text/catalog provenance must
+  // not be described as priority over model scores.
+  if (stage.value === 'city') {
+    if (composition.hasModelScores) return '统一排序 · 非概率'
+    if (composition.hasExplicitSelectionBasis) return '文字 / 目录候选（尚无排序分）'
+    return `城市目录候选（当前显示 ${topCandidates.value.length} 项）`
+  }
   if (composition.hasUserText) {
     return composition.mixed ? '线索匹配优先 · 其余按排序分' : '线索匹配候选'
   }
@@ -313,9 +327,20 @@ const candidateSectionNote = computed(() => {
 const candidateSectionHint = computed(() => {
   const composition = candidateComposition.value
   if (!props.locationConfirmationReady) {
+    if (stage.value === 'city') {
+      return '新增观察待核对，城市排名仍可查看，但暂不能确认或排除地点。'
+    }
     return composition.hasModelScores && !composition.hasExplicitSelectionBasis
       ? '新增观察待核对，排名仍可查看，但暂不能确认或排除地点。'
       : '新增观察待核对，候选仍可查看，但暂不能确认或排除地点。'
+  }
+  if (stage.value === 'city') {
+    if (composition.hasModelScores) {
+      return hasCityImpactDetails.value
+        ? '城市候选按图像原分与线索影响后的排序分统一排序；可展开查看逐维贡献，排序分不代表概率。'
+        : '城市候选按真实有限排序分统一排序；排序分不代表概率。'
+    }
+    return '当前尚无城市排序分，按目录顺序展示；可补充河边、山地、建筑等多维线索，或输入城市名称检索。'
   }
   if (composition.hasUserText) {
     return composition.mixed
@@ -363,15 +388,15 @@ const latestAssistantMessage = computed(() => {
 })
 const composerHint = computed(() => {
   if (isResolved.value) {
-    return '新线索会交回助手重新核对，不改动已确认结果。'
+    return '可继续补充河边、山地、建筑等多维线索；新线索会交回助手重新核对，不改动已确认结果。'
   }
   if (!props.candidatesUnlocked) {
-    return '补充可见招牌、道路方向或文字；提交不会自动确认地点。'
+    return '可补充多个可见线索，如河边、有山地、红砖建筑，也可补充店名或路牌；提交不会自动确认地点。'
   }
   if (stage.value === 'country') {
-    return `可直接输入${candidateLevelName.value}名称检索目录；提交后会重新比较国家候选，不会自动确认地点。`
+    return '可补充多个可观察线索（如河边、有山地、红砖建筑），也可输入国家/地区名称或店名检索目录；提交不会自动确认地点。'
   }
-  return `可直接输入${candidateLevelName.value}名称检索目录；提交不会自动确认地点。`
+  return '可补充多个可观察线索（如河边、有山地、红砖建筑），也可输入城市名或路牌；提交不会自动确认地点。'
 })
 const latestReceiptText = computed(() => safeGuidedReceipt(props.receipt?.summary))
 const receiptStatusText = computed(() => {
@@ -655,6 +680,8 @@ watch(stage, (nextStage, previousStage) => {
                 </button>
               </div>
 
+              <GuidedCityClueImpact :candidate="candidate" />
+
               <details
                 v-if="candidate.reason || candidate.place_match || !candidatePointLabel(candidate.target)"
                 class="guided-candidate-detail"
@@ -901,6 +928,8 @@ watch(stage, (nextStage, previousStage) => {
                 </button>
               </div>
 
+              <GuidedCityClueImpact :candidate="candidate" />
+
               <details
                 v-if="candidate.reason || candidate.place_match || !candidatePointLabel(candidate.target)"
                 class="guided-candidate-detail"
@@ -1026,7 +1055,7 @@ watch(stage, (nextStage, previousStage) => {
             type="text"
             autocomplete="off"
             enterkeyhint="send"
-            placeholder="输入照片中的招牌、文字或地名"
+            placeholder="如：河边、有山地、红砖建筑，也可补充店名或路牌"
             :disabled="busy"
             aria-describedby="guided-composer-hint"
             @compositionstart="composing = true"

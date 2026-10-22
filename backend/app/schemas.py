@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, Field, field_validator, model_serializer, model_validator
 
@@ -51,13 +52,33 @@ class ClueModel(BaseModel):
     model_config = {"extra": "allow"}
 
 
+PlaceSourceType = Literal[
+    "local_catalog", "local_poi", "local_road", "web_search", "geocoder"
+]
+ObservationSourceType = Literal["user", "ocr"]
+
+
 class MatchedClueModel(BaseModel):
     dimension: str
     value: str
     gain: float = 0.0
     evidence: str = ""
+    source_refs: list["PlaceSourceModel"] | None = None
+    candidate_only: bool = False
+    status: Literal["candidates"] | None = None
 
     model_config = {"extra": "allow"}
+
+    @model_serializer(mode="wrap")
+    def _drop_absent_provenance(self, handler):
+        data = handler(self)
+        if data.get("source_refs") is None:
+            data.pop("source_refs", None)
+        if data.get("candidate_only") is not True:
+            data.pop("candidate_only", None)
+        if data.get("status") is None:
+            data.pop("status", None)
+        return data
 
 
 class CountryScoreModel(BaseModel):
@@ -229,7 +250,7 @@ class GuidedLocationTarget(BaseModel):
 
 
 class PlaceSourceModel(BaseModel):
-    """One bounded source supporting a catalog city match."""
+    """One bounded retrieval/observation source supporting a city candidate."""
 
     provider: str = Field(min_length=1, max_length=40)
     provider_place_id: str | None = Field(default=None, max_length=200)
@@ -238,20 +259,77 @@ class PlaceSourceModel(BaseModel):
     attribution: str | None = Field(default=None, max_length=200)
     license: str | None = Field(default=None, max_length=80)
     fetched_at: str = Field(default="", max_length=80)
+    source_type: PlaceSourceType | None = None
+    url: str | None = Field(default=None, max_length=1000)
+    title: str | None = Field(default=None, max_length=200)
+    excerpt: str | None = Field(default=None, max_length=500)
+    observation_source: ObservationSourceType | None = None
 
     model_config = {"extra": "forbid"}
+
+    @field_validator("url")
+    @classmethod
+    def _safe_source_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        raw = str(value).strip()
+        if not raw:
+            return None
+        if len(raw) > 1000:
+            raise ValueError("source URL is too long")
+        try:
+            parts = urlsplit(raw)
+            hostname = parts.hostname
+        except ValueError as exc:
+            raise ValueError("source URL is invalid") from exc
+        if parts.scheme.lower() not in {"http", "https"} or not hostname:
+            raise ValueError("source URL must use http or https and include a host")
+        if parts.username is not None or parts.password is not None:
+            raise ValueError("source URL must not contain credentials")
+        return raw
+
+    @model_serializer(mode="wrap")
+    def _drop_absent_source_fields(self, handler):
+        data = handler(self)
+        for key in (
+            "source_type", "url", "title", "excerpt", "observation_source",
+        ):
+            if data.get(key) is None:
+                data.pop(key, None)
+        return data
+
+
+PlaceSourceModel.model_rebuild()
+MatchedClueModel.model_rebuild()
 
 
 class PlaceMatchModel(BaseModel):
-    """User-text place evidence that resolved to authoritative catalog rows."""
+    """Place recall/validation evidence; candidate_only marks unverified recall."""
 
     query_terms: list[str] = Field(default_factory=list, max_length=4)
     clue_ids: list[str] = Field(default_factory=list, max_length=20)
-    match_kind: Literal["catalog_exact", "geocoder_locality"]
+    match_kind: Literal[
+        "catalog_exact", "city_alias", "poi", "road", "local_poi", "local_road",
+        "geocoder_locality", "geocoder_candidate", "web_candidate",
+    ]
     ambiguous: bool = False
+    candidate_only: bool = False
+    status: Literal["candidates"] | None = None
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0, allow_inf_nan=False)
     sources: list[PlaceSourceModel] = Field(default_factory=list, max_length=4)
 
     model_config = {"extra": "forbid"}
+
+    @model_serializer(mode="wrap")
+    def _drop_absent_candidate_fields(self, handler):
+        data = handler(self)
+        if data.get("candidate_only") is not True:
+            data.pop("candidate_only", None)
+        if data.get("status") is None:
+            data.pop("status", None)
+        if data.get("confidence") is None:
+            data.pop("confidence", None)
+        return data
 
 
 class GuidedCandidateModel(BaseModel):
@@ -263,13 +341,23 @@ class GuidedCandidateModel(BaseModel):
     reason: str | None = None
     selection_basis: Literal["user_text", "catalog_search"] | None = None
     place_match: PlaceMatchModel | None = None
+    # Optional city-stage provenance. ``fusion`` is the canonical frontend
+    # field for before/after ranks and model/base/place/scene breakdown.
+    matched_clues: list[MatchedClueModel] | None = None
+    fusion: dict[str, Any] | None = None
+    clue_notes: list[str] | None = None
+    rank_before: int | None = None
+    rank_after: int | None = None
 
     model_config = {"extra": "forbid"}
 
     @model_serializer(mode="wrap")
     def _drop_absent_optional_fields(self, handler):
         data = handler(self)
-        for key in ("score", "score_type", "reason", "selection_basis", "place_match"):
+        for key in (
+            "score", "score_type", "reason", "selection_basis", "place_match",
+            "matched_clues", "fusion", "clue_notes", "rank_before", "rank_after",
+        ):
             if data.get(key) is None:
                 data.pop(key, None)
         return data
@@ -712,8 +800,10 @@ __all__ = [
     "GuidedLocationTarget",
     "GuidedQuestionModel",
     "GuidedQuestionOptionModel",
+    "ObservationSourceType",
     "PlaceMatchModel",
     "PlaceSourceModel",
+    "PlaceSourceType",
     "GuidedReceiptModel",
     "HealthResponse",
     "MatchedClueModel",

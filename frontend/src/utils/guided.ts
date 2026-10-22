@@ -1,4 +1,5 @@
 import type {
+  CityFusionBreakdown,
   ConfidenceRoute,
   GuidedDialogue,
   GuidedEventReceipt,
@@ -8,13 +9,21 @@ import type {
   GuidedTargetRef,
   HypothesisAction,
   LocationCandidate,
+  MatchedClue,
   LocationTarget,
+  PlaceSource,
   ReviewedClue,
   ReviewedClueStatus,
 } from '@/types'
 import { displayCityName } from '@/utils/city'
 import { clueValueLabel, dimensionLabel } from '@/utils/clues'
 import { normalizeIsoCode } from '@/utils/geo'
+import {
+  mergePlaceMatches,
+  normalizePlaceMatch,
+  normalizePlaceSources,
+  placeSourceIdentity,
+} from '@/utils/placeSources'
 
 export interface GuidedStep {
   level: GuidedLocationLevel
@@ -429,6 +438,85 @@ interface RankedGuidedCandidate {
   basisRank: 0 | 1 | 2
 }
 
+function unknownRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null
+}
+
+function finiteScore(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
+function finiteRank(value: unknown): number | null {
+  const rank = finiteScore(value)
+  return rank !== null && Number.isInteger(rank) && rank >= 1 ? rank : null
+}
+
+function cleanText(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : ''
+}
+
+/**
+ * Preserve every distinct matched-clue row. The same dimension may contribute
+ * both positively and negatively, so deduplication never collapses by
+ * dimension alone.
+ */
+function mergeMatchedClues(
+  left: readonly MatchedClue[] | null | undefined,
+  right: readonly MatchedClue[] | null | undefined,
+): MatchedClue[] | null {
+  const merged: MatchedClue[] = []
+  const seen = new Set<string>()
+  for (const item of [...(left ?? []), ...(right ?? [])]) {
+    if (!unknownRecord(item)) continue
+    const key = [
+      item.dimension,
+      item.value,
+      item.value_label,
+      item.gain,
+      item.evidence,
+      item.source,
+      normalizePlaceSources(item.source_refs).map(placeSourceIdentity).join('\u0002'),
+      item.signal_kind,
+      item.match_kind,
+    ]
+      .map((value) => (value === null || value === undefined ? '' : String(value)))
+      .join('\u0001')
+    if (seen.has(key)) continue
+    seen.add(key)
+    merged.push(item)
+  }
+  return merged.length ? merged : null
+}
+
+function mergeFusionBreakdown(
+  left: CityFusionBreakdown | null | undefined,
+  right: CityFusionBreakdown | null | undefined,
+): CityFusionBreakdown | null {
+  if (!left && !right) return null
+  const merged: Record<string, unknown> = {}
+  for (const source of [left, right]) {
+    const record = unknownRecord(source)
+    if (!record) continue
+    for (const [key, value] of Object.entries(record)) {
+      if (value !== null && value !== undefined) merged[key] = value
+    }
+  }
+  return Object.keys(merged).length ? (merged as CityFusionBreakdown) : null
+}
+
+function mergeClueNotes(
+  left: readonly string[] | null | undefined,
+  right: readonly string[] | null | undefined,
+): string[] | null {
+  const notes: string[] = []
+  for (const value of [...(left ?? []), ...(right ?? [])]) {
+    const note = cleanText(value)
+    if (note && !notes.includes(note)) notes.push(note)
+  }
+  return notes.length ? notes : null
+}
 function mergeGuidedCandidate(
   left: RankedGuidedCandidate,
   right: RankedGuidedCandidate,
@@ -444,8 +532,40 @@ function mergeGuidedCandidate(
       ? { selection_basis: basis.candidate.selection_basis }
       : {}),
   }
-  const placeMatch = basis.candidate.place_match ?? left.candidate.place_match ?? right.candidate.place_match
+  const placeMatch = mergePlaceMatches(
+    basis.candidate.place_match,
+    left.candidate.place_match,
+    right.candidate.place_match,
+  )
   if (placeMatch) merged.place_match = placeMatch
+  const rankBefore = [
+    scored.candidate.rank_before,
+    left.candidate.rank_before,
+    right.candidate.rank_before,
+  ]
+    .map(finiteRank)
+    .find((value) => value !== null)
+  if (rankBefore !== undefined && rankBefore !== null) merged.rank_before = rankBefore
+  const rankAfter = [
+    scored.candidate.rank_after,
+    left.candidate.rank_after,
+    right.candidate.rank_after,
+  ]
+    .map(finiteRank)
+    .find((value) => value !== null)
+  if (rankAfter !== undefined && rankAfter !== null) merged.rank_after = rankAfter
+  const matchedClues = mergeMatchedClues(
+    left.candidate.matched_clues,
+    right.candidate.matched_clues,
+  )
+  if (matchedClues) merged.matched_clues = matchedClues
+  const fusion = mergeFusionBreakdown(
+    scored.candidate.fusion,
+    scored === left ? right.candidate.fusion : left.candidate.fusion,
+  )
+  if (fusion) merged.fusion = fusion
+  const clueNotes = mergeClueNotes(left.candidate.clue_notes, right.candidate.clue_notes)
+  if (clueNotes) merged.clue_notes = clueNotes
   if (scored.score !== null) {
     merged.score = scored.score
     merged.score_type = scored.candidate.score_type ?? null
@@ -483,11 +603,15 @@ export function selectTopGuidedCandidates(
       typeof candidate.score === 'number' && Number.isFinite(candidate.score)
         ? candidate.score
         : null
+    const placeMatch = normalizePlaceMatch(candidate.place_match)
+    const normalizedCandidate = placeMatch
+      ? { ...candidate, place_match: placeMatch }
+      : candidate
     const entry: RankedGuidedCandidate = {
-      candidate,
+      candidate: normalizedCandidate,
       index,
       score,
-      basisRank: selectionBasisRank(candidate),
+      basisRank: selectionBasisRank(normalizedCandidate),
     }
     const current = uniqueByKey.get(key)
     uniqueByKey.set(key, current ? mergeGuidedCandidate(current, entry) : entry)
@@ -572,13 +696,163 @@ function scoreTypeLabel(scoreType: string | null | undefined): string {
       return '参考图融合排序'
     case 'city_clue_fusion':
       return '线索融合排序'
+    case 'city_scene_clue_fusion':
+    case 'city_scene_model_similarity':
+      return '多维线索融合'
     default:
       return '匹配排序'
   }
 }
 
+export interface GuidedMatchedClueImpact {
+  dimension: string
+  value: string
+  valueLabel?: string
+  gain: number | null
+  evidence: string
+  source: string
+  sourceRefs: PlaceSource[]
+  signalKind: string
+}
+
+export interface GuidedCityClueImpact {
+  baseScore: number | null
+  finalScore: number | null
+  rankBefore: number | null
+  rankAfter: number | null
+  rankDelta: number | null
+  /** Effective place adjustment: place_boost, falling back to legacy clue_boost. */
+  placeBoost: number | null
+  placeBoostIsLegacy: boolean
+  sceneDelta: number | null
+  signalKind: string
+  sceneVersion: string
+  matchedClues: GuidedMatchedClueImpact[]
+  clueNotes: string[]
+  hasDetail: boolean
+}
+
+/**
+ * Defensive view model for city fusion diagnostics. The backend contract may
+ * gain fields over time; absent, malformed, or non-finite values are ignored
+ * rather than rendered as NaN or zero.
+ */
+export function guidedCityClueImpact(
+  candidate: LocationCandidate,
+): GuidedCityClueImpact | null {
+  if (candidate.target.level !== 'city') return null
+  const fusion = unknownRecord(candidate.fusion)
+  const matchedClues: GuidedMatchedClueImpact[] = []
+  for (const item of Array.isArray(candidate.matched_clues) ? candidate.matched_clues : []) {
+    const row = unknownRecord(item)
+    if (!row) continue
+    const dimension = cleanText(row.dimension)
+    const value = cleanText(row.value)
+    const evidence = cleanText(row.evidence)
+    if (!dimension && !value && !evidence) continue
+    matchedClues.push({
+      dimension,
+      value,
+      valueLabel: cleanText(row.value_label),
+      gain: finiteScore(row.gain),
+      evidence,
+      source: cleanText(row.source),
+      sourceRefs: normalizePlaceSources(row.source_refs),
+      signalKind: cleanText(row.signal_kind) || cleanText(row.match_kind),
+    })
+  }
+  const clueNotes: string[] = []
+  for (const item of Array.isArray(candidate.clue_notes) ? candidate.clue_notes : []) {
+    const note = cleanText(item)
+    if (note && !clueNotes.includes(note)) clueNotes.push(note)
+  }
+  const baseScore =
+    finiteScore(fusion?.model_base_score) ??
+    finiteScore(fusion?.model_score) ??
+    finiteScore(fusion?.model) ??
+    finiteScore(fusion?.base_score)
+  const explicitFinalScore = finiteScore(fusion?.final_score)
+  const finalScore =
+    explicitFinalScore ??
+    (baseScore !== null ? finiteScore(candidate.score) : null)
+  const rankBefore = finiteRank(candidate.rank_before) ?? finiteRank(fusion?.rank_before)
+  const rankAfter = finiteRank(candidate.rank_after) ?? finiteRank(fusion?.rank_after)
+  const rankDelta =
+    rankBefore !== null && rankAfter !== null ? rankBefore - rankAfter : null
+  const explicitPlaceBoost = finiteScore(fusion?.place_boost)
+  const legacyClueBoost = finiteScore(fusion?.clue_boost)
+  // clue_boost is the legacy alias for the same place adjustment. Never show
+  // both; use it only when place_boost is unavailable.
+  const placeBoost = explicitPlaceBoost ?? legacyClueBoost
+  const placeBoostIsLegacy = explicitPlaceBoost === null && legacyClueBoost !== null
+  const sceneDelta = finiteScore(fusion?.scene_delta)
+  const signalKind = cleanText(fusion?.signal_kind)
+  const knownSceneSignal =
+    signalKind.toLowerCase() === 'model_similarity' || signalKind.toLowerCase().includes('scene')
+  const sceneVersion = cleanText(fusion?.scene_version)
+  if (
+    !fusion &&
+    !matchedClues.length &&
+    !clueNotes.length
+  ) {
+    return null
+  }
+  return {
+    baseScore,
+    finalScore,
+    rankBefore,
+    rankAfter,
+    rankDelta,
+    placeBoost,
+    placeBoostIsLegacy,
+    sceneDelta,
+    signalKind,
+    sceneVersion,
+    matchedClues,
+    clueNotes,
+    hasDetail: Boolean(
+      matchedClues.length ||
+        placeBoost !== null ||
+        sceneDelta !== null ||
+        candidate.place_match ||
+        knownSceneSignal ||
+        sceneVersion ||
+        clueNotes.length,
+    ),
+  }
+}
+
+export function guidedSignedValue(value: number | null | undefined): string {
+  const number = finiteScore(value)
+  if (number === null) return ''
+  if (number === 0) return '0.000'
+  return `${number > 0 ? '+' : ''}${number.toFixed(3)}`
+}
+
+/** Compact score transition and optional rank movement; never a probability. */
+export function guidedCityClueImpactSummary(candidate: LocationCandidate): string {
+  const impact = guidedCityClueImpact(candidate)
+  if (!impact) return ''
+  const parts: string[] = []
+  if (impact.baseScore !== null && impact.finalScore !== null) {
+    parts.push(
+      `图像原分 ${impact.baseScore.toFixed(3)} → 线索后 ${impact.finalScore.toFixed(3)}（排序分，非概率）`,
+    )
+  }
+  if (impact.rankDelta !== null) {
+    if (impact.rankDelta > 0) parts.push(`↑ ${impact.rankDelta} 位`)
+    else if (impact.rankDelta < 0) parts.push(`↓ ${Math.abs(impact.rankDelta)} 位`)
+    else parts.push('名次不变')
+  }
+  return parts.join(' · ')
+}
+
 /** Never turn missing provenance or a missing score into a fabricated probability. */
 export function candidateScoreLabel(candidate: LocationCandidate): string {
+  const cityImpact = candidate.target.level === 'city'
+    ? guidedCityClueImpactSummary(candidate)
+    : ''
+  if (cityImpact) return cityImpact
   const score = candidate.score
   const scoreText =
     typeof score === 'number' && Number.isFinite(score)

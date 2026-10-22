@@ -54,7 +54,49 @@ export interface ReferenceRegion {
   support: number
 }
 
-export type CityScoreType = 'city_text_cosine' | 'city_reference_hybrid' | 'city_clue_fusion' | string
+export type CityScoreType =
+  | 'city_text_cosine'
+  | 'city_reference_hybrid'
+  | 'city_clue_fusion'
+  | 'city_scene_clue_fusion'
+  | 'city_scene_model_similarity'
+  | string
+
+/**
+ * One bounded clue contribution attached to a ranked location. Fields remain
+ * optional because older/malformed payloads must degrade without breaking the
+ * guided flow; the UI validates each value before rendering it.
+ */
+export interface MatchedClue {
+  dimension?: ClueDimension | string
+  value?: string
+  /** Backend-localized canonical scene label; preferred over raw value tokens. */
+  value_label?: string | null
+  gain?: number | null
+  evidence?: string | null
+  source?: string | null
+  /** Structured provenance; preferred over the legacy free-text source. */
+  source_refs?: PlaceSource[] | null
+  signal_kind?: string | null
+  match_kind?: string | null
+  [key: string]: unknown
+}
+
+/** Optional city-fusion diagnostics; unknown keys are preserved for compatibility. */
+export interface CityFusionBreakdown {
+  model_base_score?: number | null
+  model_score?: number | null
+  base_score?: number | null
+  clue_boost?: number | null
+  place_boost?: number | null
+  scene_delta?: number | null
+  final_score?: number | null
+  rank_before?: number | null
+  rank_after?: number | null
+  signal_kind?: string | null
+  scene_version?: string | null
+  [key: string]: unknown
+}
 
 /**
  * One raw regional source aggregated under country CN (TW/HK/MO), optionally
@@ -86,9 +128,13 @@ export interface CityScore {
   country_iso?: string | null
   source_iso?: string | null
   source_region?: SourceRegionEntry | null
-  /** Optional clue-fusion diagnostics for city_clue_fusion rows; shape owned by the backend contract. */
-  matched_clues?: Array<Record<string, unknown>>
-  fusion?: Record<string, unknown>
+  /** Optional clue-fusion diagnostics for city_clue_fusion rows. */
+  matched_clues?: MatchedClue[] | null
+  fusion?: CityFusionBreakdown | null
+  /** Current backend writes rank movement on the row; fusion fallback is read too. */
+  rank_before?: number | null
+  rank_after?: number | null
+  clue_notes?: string[] | null
 }
 
 /** Scope counters; every field optional because an unavailable response may send {} */
@@ -127,7 +173,7 @@ export interface CountryScore {
   reference_matches?: ReferenceMatch[]
   reference_regions?: ReferenceRegion[]
   reference_cosine?: number | null
-  matched_clues?: Array<Record<string, unknown>>
+  matched_clues?: MatchedClue[] | null
   lat: number
   lng: number
   /**
@@ -458,6 +504,15 @@ export interface LocationTarget extends GuidedTargetRef {
   coordinate_city_id?: number | null
 }
 
+export type PlaceSourceType =
+  | 'local_catalog'
+  | 'local_poi'
+  | 'local_road'
+  | 'web_search'
+  | 'geocoder'
+
+export type PlaceObservationSource = 'ocr' | 'user'
+
 export interface PlaceSource {
   provider: string
   provider_place_id?: string | null
@@ -465,15 +520,33 @@ export interface PlaceSource {
   query?: string
   attribution?: string | null
   license?: string | null
-  fetched_at?: string
+  source_type?: PlaceSourceType | string | null
+  /** Safe external links are rendered only after an http(s) URL check. */
+  url?: string | null
+  title?: string | null
+  excerpt?: string | null
+  observation_source?: PlaceObservationSource | string | null
+  fetched_at?: string | null
+  [key: string]: unknown
 }
 
 export interface PlaceMatch {
   query_terms: string[]
   clue_ids: string[]
-  match_kind: 'catalog_exact' | 'geocoder_locality'
+  match_kind:
+    | 'catalog_exact'
+    | 'geocoder_candidate'
+    | 'web_candidate'
+    | 'city_alias'
+    | 'poi'
+    | 'road'
+    // Legacy compatibility only; normalizers map this to geocoder_candidate.
+    | 'geocoder_locality'
   ambiguous: boolean
   sources: PlaceSource[]
+  /** Web/batch recall rows are candidates only and never verified matches. */
+  candidate_only?: boolean
+  [key: string]: unknown
 }
 
 /** One ranked/sorted location option. score is absent for catalog-only rows. */
@@ -482,9 +555,17 @@ export interface LocationCandidate {
   score?: number | null
   score_type?: string | null
   reason?: string | null
-  /** Server-authorized provenance; explicit matches outrank model score rows. */
+  /** Provenance annotation only; ordering follows the backend unified fused score. */
   selection_basis?: 'user_text' | 'catalog_search'
   place_match?: PlaceMatch | null
+  /** City clue-fusion diagnostics; absent on country rows and older servers. */
+  matched_clues?: MatchedClue[] | null
+  fusion?: CityFusionBreakdown | null
+  /** Some backend revisions expose rank movement outside the fusion object. */
+  rank_before?: number | null
+  rank_after?: number | null
+  /** Human-readable reasons a clue could not affect this city's score. */
+  clue_notes?: string[] | null
 }
 
 export type ReviewedClueStatus = 'pending' | 'confirmed' | 'rejected' | 'uncertain'
