@@ -89,7 +89,7 @@ export class GeoApi {
     }
 
     if (!isRecord(body)) {
-      throw new ApiError({ message: '后端返回了无法识别的数据格式', status: response.status, detail: body })
+      throw new ApiError({ message: '返回的数据无法识别，请稍后重试', status: response.status, detail: body })
     }
 
     if (typeof body.error === 'string' && body.error.trim()) {
@@ -227,7 +227,7 @@ function responseOk(body: JsonRecord): boolean {
 function stringField(record: JsonRecord, key: string): string {
   const value = record[key]
   if (typeof value !== 'string') {
-    throw new ApiError({ message: `后端响应缺少字段：${key}` })
+    throw new ApiError({ message: `返回的数据缺少「${key}」` })
   }
   return value
 }
@@ -235,7 +235,7 @@ function stringField(record: JsonRecord, key: string): string {
 function numberField(record: JsonRecord, key: string): number {
   const value = record[key]
   if (typeof value !== 'number' || !Number.isFinite(value)) {
-    throw new ApiError({ message: `后端响应缺少字段：${key}` })
+    throw new ApiError({ message: `返回的数据缺少「${key}」` })
   }
   return value
 }

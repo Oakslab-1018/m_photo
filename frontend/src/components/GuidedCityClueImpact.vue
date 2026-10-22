@@ -66,18 +66,18 @@ function clueEvidenceLabel(clue: GuidedMatchedClueImpact): string {
     ]),
   ].join(' ')
   const category = evidenceCategory(clue.signalKind, sourceKey)
-  if (category === 'scene') return '模型观察（仅参与排序）'
+  if (category === 'scene') return '场景线索（只用于排序）'
   if (category === 'place') {
     return candidateIsPlaceCandidate.value || sourcesAreCandidateOnly(clue.sourceRefs)
       ? '地点候选 · 待验证'
-      : '地名证据匹配'
+      : '地名依据'
   }
   return ''
 }
 
 function placeBoostLabel(): string {
-  if (!impact.value || impact.value.placeBoostIsLegacy) return '地名线索调整'
-  return candidateIsPlaceCandidate.value ? '候选地名调整' : '地名证据调整'
+  if (!impact.value || impact.value.placeBoostIsLegacy) return '地名调整'
+  return candidateIsPlaceCandidate.value ? '候选名称调整' : '地名依据调整'
 }
 
 function clueLabel(clue: GuidedMatchedClueImpact): string {
@@ -119,14 +119,14 @@ function signedClass(value: number | null): string {
 
 <template>
   <details v-if="impact?.hasDetail" class="guided-city-impact">
-    <summary>查看线索如何影响排序</summary>
+    <summary>排序依据</summary>
     <div class="guided-city-impact-body">
       <p v-if="hasSceneModelSignal" class="guided-city-impact-note">
-        场景条件仅表示图像与固定场景描述相似，不是城市属性核验。
+        场景线索只用于排序，不代表城市一定有这种景观。
       </p>
 
       <section v-if="impact.matchedClues.length" class="guided-city-impact-section">
-        <h4>逐维线索贡献</h4>
+        <h4>各条线索的影响</h4>
         <ul class="guided-city-impact-list">
           <li
             v-for="(clue, index) in impact.matchedClues"
@@ -140,13 +140,13 @@ function signedClass(value: number | null): string {
                 class="guided-city-impact-gain"
                 :class="signedClass(clue.gain)"
               >{{ guidedSignedValue(clue.gain) }}</span>
-              <span v-else class="guided-city-impact-missing">未提供贡献值</span>
+              <span v-else class="guided-city-impact-missing">暂无数据</span>
             </div>
             <p v-if="clue.evidence" class="guided-city-impact-evidence">
               {{ safeGuidedText(clue.evidence) }}
             </p>
             <small v-if="clueEvidenceLabel(clue)">
-              证据类别：{{ clueEvidenceLabel(clue) }}
+              来源：{{ clueEvidenceLabel(clue) }}
             </small>
             <PlaceSourceEvidence
               v-if="clue.sourceRefs.length"
@@ -166,7 +166,7 @@ function signedClass(value: number | null): string {
           <dd :class="signedClass(impact.placeBoost)">{{ guidedSignedValue(impact.placeBoost) }}</dd>
         </template>
         <template v-if="impact.sceneDelta !== null">
-          <dt>场景条件模型匹配 Δ</dt>
+          <dt>场景调整</dt>
           <dd :class="signedClass(impact.sceneDelta)">{{ guidedSignedValue(impact.sceneDelta) }}</dd>
         </template>
       </dl>
@@ -180,15 +180,15 @@ function signedClass(value: number | null): string {
         v-if="hasSceneModelSignal || impact.sceneVersion"
         class="guided-city-impact-section"
       >
-        <h4>模型观察（仅参与排序）</h4>
+        <h4>场景线索（只用于排序）</h4>
         <p v-if="impact.sceneVersion" class="guided-city-impact-evidence">
-          场景模板版本：{{ safeGuidedText(impact.sceneVersion) }}
+          场景模板：{{ safeGuidedText(impact.sceneVersion) }}
         </p>
-        <small>模型相似度只参与排序，不证实城市具有山地、河流或建筑等属性。</small>
+        <small>场景相似度只用于排序，不代表城市有山地、河流或建筑等特征。</small>
       </section>
 
       <section v-if="impact.clueNotes.length" class="guided-city-impact-section">
-        <h4>未计分原因</h4>
+        <h4>没有计入排序的线索</h4>
         <p
           v-for="note in impact.clueNotes"
           :key="note"

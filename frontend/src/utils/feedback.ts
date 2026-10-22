@@ -21,16 +21,16 @@ export interface FeedbackReceiptView {
 type JsonRecord = Record<string, unknown>
 
 const STATUS_VIEW: Record<string, { label: string; tone: FeedbackReceiptTone }> = {
-  applied: { label: '已理解并应用', tone: 'ok' },
-  unchanged: { label: '已理解，结论无变化', tone: 'muted' },
-  unrecognized: { label: '未能识别这条反馈', tone: 'warn' },
+  applied: { label: '已更新', tone: 'ok' },
+  unchanged: { label: '没有变化', tone: 'muted' },
+  unrecognized: { label: '没有识别到有效信息', tone: 'warn' },
   // Tolerated aliases so an older or adjacent backend never renders raw codes.
-  understood: { label: '已理解', tone: 'ok' },
-  accepted: { label: '已接收并理解', tone: 'ok' },
-  no_change: { label: '已理解，结论无变化', tone: 'muted' },
-  unknown: { label: '未能识别这条反馈', tone: 'warn' },
-  failed: { label: '反馈处理失败', tone: 'warn' },
-  error: { label: '反馈处理失败', tone: 'warn' },
+  understood: { label: '已收到', tone: 'ok' },
+  accepted: { label: '已收到', tone: 'ok' },
+  no_change: { label: '没有变化', tone: 'muted' },
+  unknown: { label: '没有识别到有效信息', tone: 'warn' },
+  failed: { label: '处理失败', tone: 'warn' },
+  error: { label: '处理失败', tone: 'warn' },
 }
 
 function isRecord(value: unknown): value is JsonRecord {
@@ -86,8 +86,8 @@ function receiptDetails(record: JsonRecord): string[] {
   const details: string[] = []
   const addedClues = countOf(firstOf(record, ['added_clues', 'addedClues']))
   const removedClues = countOf(firstOf(record, ['removed_clues', 'removedClues']))
-  if (addedClues) details.push(`新增线索 ${addedClues} 条`)
-  if (removedClues) details.push(`移除线索 ${removedClues} 条`)
+  if (addedClues) details.push(`新增 ${addedClues} 条线索`)
+  if (removedClues) details.push(`移除 ${removedClues} 条线索`)
 
   const addedExclusions = exclusionList(
     firstOf(record, ['added_exclusions', 'addedExclusions', 'new_exclusions', 'exclusions_added']),
@@ -95,8 +95,8 @@ function receiptDetails(record: JsonRecord): string[] {
   const removedExclusions = exclusionList(
     firstOf(record, ['removed_exclusions', 'removedExclusions', 'cleared_exclusions', 'exclusions_removed']),
   )
-  if (addedExclusions.length) details.push(`新增排除：${addedExclusions.join('、')}`)
-  if (removedExclusions.length) details.push(`恢复候选：${removedExclusions.join('、')}`)
+  if (addedExclusions.length) details.push(`排除：${addedExclusions.join('、')}`)
+  if (removedExclusions.length) details.push(`恢复：${removedExclusions.join('、')}`)
 
   const ranking: JsonRecord | null = isRecord(record.ranking_change)
     ? record.ranking_change
@@ -114,11 +114,11 @@ function receiptDetails(record: JsonRecord): string[] {
     record.leaderChanged === true ||
     ranking?.changed === true
   if (leaderBefore && leaderAfter && leaderBefore !== leaderAfter) {
-    details.push(`领先候选：${leaderBefore} → ${leaderAfter}`)
+    details.push(`首选变为：${leaderAfter}`)
   } else if (leaderAfter) {
-    details.push(`领先候选：${leaderAfter}`)
+    details.push(`首选：${leaderAfter}`)
   } else if (leaderChanged) {
-    details.push('领先候选已更新')
+    details.push('首选已更新')
   }
   return details
 }
@@ -127,7 +127,7 @@ export function readFeedbackReceipt(raw: unknown): FeedbackReceiptView | null {
   const record = isRecord(raw) ? raw : null
   if (!record) {
     const text = asString(raw)
-    return text ? { status: '', label: '服务器回执', tone: 'muted', summary: text, details: [] } : null
+    return text ? { status: '', label: '已收到反馈', tone: 'muted', summary: text, details: [] } : null
   }
   const status = (asString(record.status) ?? '').toLowerCase()
   const summary = asString(record.summary) ?? asString(record.detail) ?? asString(record.message)
@@ -135,12 +135,12 @@ export function readFeedbackReceipt(raw: unknown): FeedbackReceiptView | null {
   const view = STATUS_VIEW[status]
   const questionAnswered =
     record.question === true || record.question_answered === true || record.questionAnswered === true
-  let label = view?.label ?? (status ? `回执：${status}` : '服务器回执')
+  let label = view?.label ?? '已收到反馈'
   let tone: FeedbackReceiptTone = view?.tone ?? 'muted'
   // Answering the pending question without new clues is a normal outcome, not
   // an unrecognized feedback: keep it muted and explain why.
   if (questionAnswered && (status === 'unrecognized' || status === 'unknown')) {
-    label = '已回应问题（未新增线索）'
+    label = '已回应，没有新增线索'
     tone = 'muted'
   }
   return {

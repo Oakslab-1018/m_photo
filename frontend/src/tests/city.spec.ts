@@ -22,14 +22,14 @@ describe('city score labels', () => {
     const label = cityScoreLabel(
       city({ score_type: 'city_clue_fusion', matched_clues: [{}, {}], fusion: { clue_weight: 0.3 } }),
     )
-    expect(label).toContain('线索融合排序 0.812')
-    expect(label).toContain('全图余弦 0.744')
-    expect(label).toContain('非概率')
+    expect(label).toContain('综合匹配 0.812')
+    expect(label).toContain('图片相似度 0.744')
+    expect(label).toContain('不是概率')
   })
 
-  it('keeps reference hybrid and plain cosine labels honest', () => {
-    expect(cityScoreLabel(city({ score_type: 'city_reference_hybrid' }))).toContain('融合排序 0.812')
-    expect(cityScoreLabel(city())).toBe('城市文本余弦 0.744（非概率）')
+  it('keeps reference hybrid and plain similarity labels honest', () => {
+    expect(cityScoreLabel(city({ score_type: 'city_reference_hybrid' }))).toContain('综合匹配 0.812')
+    expect(cityScoreLabel(city())).toBe('图片相似度 0.744（不是概率）')
   })
 
   it('counts matched clue diagnostics and tolerates missing data', () => {

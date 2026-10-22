@@ -58,7 +58,7 @@ onMounted(scrollToBottom)
 <template>
   <div ref="logRef" class="chat-log" aria-live="polite">
     <div class="msg ai">
-      <div class="bubble">上传街景或风景图，开始提取线索。</div>
+      <div class="bubble">上传一张照片，开始定位。</div>
     </div>
     <template v-for="(message, index) in messages" :key="message.id ?? index">
       <div class="msg" :class="message.role">
@@ -88,14 +88,14 @@ onMounted(scrollToBottom)
         <span v-if="item.status === 'sending'" class="pending-state">发送中…</span>
         <template v-else>
           <span class="pending-state error">
-            {{ item.orphaned ? '原会话已变更' : '发送失败' }}{{ item.error ? `：${item.error}` : '' }}
+            {{ item.orphaned ? '照片已更换' : '发送失败' }}{{ item.error ? `：${item.error}` : '' }}
           </span>
           <span class="pending-actions">
             <button
               type="button"
               class="retry-btn"
               :disabled="item.orphaned"
-              :title="item.orphaned ? '原会话已变更，需重新输入或删除' : '重新发送这条反馈'"
+              :title="item.orphaned ? '照片已更换，请重新输入或删除' : '重新发送'"
               @click="emit('retry', item)"
             >
               重试
@@ -103,7 +103,7 @@ onMounted(scrollToBottom)
             <button
               type="button"
               class="dismiss-btn"
-              aria-label="删除这条未发送的反馈"
+              aria-label="删除这条未发送的消息"
               @click="emit('dismiss', item)"
             >
               ×
@@ -113,7 +113,7 @@ onMounted(scrollToBottom)
       </div>
     </div>
     <div v-if="loading" class="msg ai">
-      <div class="bubble typing">AI 正在分析…</div>
+      <div class="bubble typing">正在分析照片…</div>
     </div>
   </div>
 </template>

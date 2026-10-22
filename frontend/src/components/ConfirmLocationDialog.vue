@@ -43,10 +43,10 @@ onBeforeUnmount(() => {
       <div class="confirm-msg">
         是否确认这张照片拍摄的国家是「{{ country.name_zh }}」？
         <div v-if="subregion" class="confirm-sub">
-          区域命中：{{ subregion }}（属于中国候选范围，不是独立国家）
+          区域：{{ subregion }}（按中国地区处理）
         </div>
         <div class="confirm-sub">
-          当前{{ scoreLabel(country) }} · 确认的是候选国家，不是照片 GPS 坐标
+          当前{{ scoreLabel(country) }} · 确认的是国家，不是照片坐标
         </div>
       </div>
       <div class="confirm-actions">

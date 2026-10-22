@@ -496,10 +496,9 @@ describe('GeoMap basemap retry UI', () => {
   it('keeps an accessible retry button interactive over the click-through safe area', () => {
     const source = readFileSync(new URL('../components/GeoMap.vue', import.meta.url), 'utf8')
 
-    expect(source).toContain('重试底图')
-    expect(source).toMatch(/<button[\s\S]*?type="button"[\s\S]*?重试底图/)
+    expect(source).toMatch(/class="ghost-btn map-error-overlay__retry"[\s\S]*?@click\.stop="retryBasemap"/)
     expect(source).toContain('lifecycle?.retryStyle()')
-    expect(source).toContain('底图样式重试失败，请稍后重试')
+    expect(source).toContain('地图还没准备好，请稍后重试')
     expect(source).toMatch(/\.geo-map__safe-center \.map-error-overlay \{[\s\S]*?pointer-events:\s*auto;/)
   })
 })

@@ -1,9 +1,9 @@
 import type { CountryScore, ReferenceMatch, ReferenceRegion } from '@/types'
 
 /** UI-facing disclaimer: labeled-reference similarity is retrieval-only diagnostics. */
-export const REFERENCE_MATCH_DISCLAIMER = '参考街景相似结果 · 参考图地点，不是照片定位或 GPS'
+export const REFERENCE_MATCH_DISCLAIMER = '参考图地点，不是照片定位或 GPS'
 export const REFERENCE_SIMILARITY_SEMANTICS =
-  '余弦相似度仅用于参考图检索排序，不是地点概率或定位置信度'
+  '相似度只用于参考图排序，不是地点概率或置信度。'
 
 export const REFERENCE_MATCH_LIMIT = 5
 
@@ -17,10 +17,10 @@ function finiteCosine(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null
 }
 
-/** Format similarity evidence explicitly as cosine, never as a probability/percentage. */
+/** Format similarity evidence explicitly as a score, never as a probability/percentage. */
 export function formatReferenceCosine(value: number | null | undefined): string | null {
   const cosine = finiteCosine(value)
-  return cosine == null ? null : `余弦 ${cosine.toFixed(3)}（非概率）`
+  return cosine == null ? null : `相似度 ${cosine.toFixed(3)}（不是概率）`
 }
 
 function compareByCosineThenKey<T>(

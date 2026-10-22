@@ -179,8 +179,8 @@ const shortcutExplanation = computed(() => {
   const message = safeGuidedText(props.action?.message)
   if (message) return message
   return countryShortcut.value === 'high'
-    ? '首选国家；请结合照片确认。'
-    : '候选接近；请结合照片选择。'
+    ? '最符合这张照片的国家。'
+    : '几个候选比较接近，请按照片选择。'
 })
 const shortcutTitle = computed(() => {
   if (countryShortcut.value === 'high') return '推荐国家 / 地区'
@@ -188,18 +188,18 @@ const shortcutTitle = computed(() => {
   return '国家 / 地区候选待确认'
 })
 const shortcutNote = computed(() => {
-  if (countryShortcut.value === 'high') return '可继续深化城市'
-  if (props.confidence?.tier === 'low') return '仅在能够确认时选择'
-  return '请确认最符合照片的候选'
+  if (countryShortcut.value === 'high') return '确认后可继续选城市'
+  if (props.confidence?.tier === 'low') return '只在确定时选择'
+  return '请选择最符合照片的'
 })
 const shortcutFooter = computed(() => {
   if (countryShortcut.value === 'high') {
-    return '这是当前国家预测；如需继续深化城市，可确认该国家后进入下一步。'
+    return '确认国家后，继续选择城市。'
   }
   if (props.confidence?.tier === 'low') {
-    return '这些只是线索不足时的可选候选；仅在能够确认时选择，未确认前不会推进。'
+    return '这些只是参考；不确定时请继续补充线索。'
   }
-  return '请从以上候选中明确确认国家；确认后会进入下一级，未确认前不会推进。'
+  return '请从下面选择并确认国家。'
 })
 const showLowCluePrompt = computed(() => {
   const kind = pendingQuestion.value?.kind
@@ -238,9 +238,9 @@ const nextStepLabel = computed(() =>
 const currentTaskLabel = computed(() => {
   if (isResolved.value) return '定位完成'
   if (countryShortcut.value) {
-    return props.confidence?.tier === 'low' ? '核对可选候选' : '确认国家推荐'
+    return props.confidence?.tier === 'low' ? '选择候选' : '确认国家'
   }
-  if (props.phase === 'candidates') return stage.value === 'city' ? '确认城市' : '确认国家 / 地区'
+  if (props.phase === 'candidates') return stage.value === 'city' ? '选择城市' : '选择国家 / 地区'
   if (isReviewClueQuestion.value) {
     const progress = reviewProgress.value
     return progress ? `核对观察 ${progress.current}/${progress.total}` : '核对观察'
@@ -311,51 +311,42 @@ const candidateSectionNote = computed(() => {
   // City scores already share one ordering. User text/catalog provenance must
   // not be described as priority over model scores.
   if (stage.value === 'city') {
-    if (composition.hasModelScores) return '统一排序 · 非概率'
-    if (composition.hasExplicitSelectionBasis) return '文字 / 目录候选（尚无排序分）'
-    return `城市目录候选（当前显示 ${topCandidates.value.length} 项）`
+    if (composition.hasModelScores) return '按匹配度排序'
+    if (composition.hasExplicitSelectionBasis) return '按目录顺序'
+    return `目录候选（${topCandidates.value.length} 项）`
   }
   if (composition.hasUserText) {
-    return composition.mixed ? '线索匹配优先 · 其余按排序分' : '线索匹配候选'
+    return composition.mixed ? '含线索匹配' : '线索匹配候选'
   }
   if (composition.hasCatalogSearch) {
-    return composition.mixed ? '目录检索优先 · 其余按排序分' : '目录检索候选'
+    return composition.mixed ? '含目录检索' : '目录检索候选'
   }
-  if (composition.hasModelScores) return '候选可信度前五'
-  return `目录候选（当前显示 ${topCandidates.value.length} 项）`
+  if (composition.hasModelScores) return '候选前五'
+  return `目录候选（${topCandidates.value.length} 项）`
 })
 const candidateSectionHint = computed(() => {
   const composition = candidateComposition.value
   if (!props.locationConfirmationReady) {
-    if (stage.value === 'city') {
-      return '新增观察待核对，城市排名仍可查看，但暂不能确认或排除地点。'
-    }
-    return composition.hasModelScores && !composition.hasExplicitSelectionBasis
-      ? '新增观察待核对，排名仍可查看，但暂不能确认或排除地点。'
-      : '新增观察待核对，候选仍可查看，但暂不能确认或排除地点。'
+    return '有新的观察待核对，暂时不能确认或排除。'
   }
   if (stage.value === 'city') {
     if (composition.hasModelScores) {
       return hasCityImpactDetails.value
-        ? '城市候选按图像原分与线索影响后的排序分统一排序；可展开查看逐维贡献，排序分不代表概率。'
-        : '城市候选按真实有限排序分统一排序；排序分不代表概率。'
+        ? '可展开查看线索如何影响排序。'
+        : '匹配度不是概率。'
     }
-    return '当前尚无城市排序分，按目录顺序展示；可补充河边、山地、建筑等多维线索，或输入城市名称检索。'
+    return '暂无评分，按目录顺序显示；可补充线索或输入城市名。'
   }
   if (composition.hasUserText) {
-    return composition.mixed
-      ? '带“线索匹配候选”的条目来自你提供的文字线索，优先展示且不是模型概率；其余条目保留真实排序分。'
-      : '带“线索匹配候选”的条目来自你提供的文字线索，优先展示且不是模型概率。'
+    return '标有“线索匹配候选”的条目来自你输入的文字。'
   }
   if (composition.hasCatalogSearch) {
-    return composition.mixed
-      ? '目录检索命中优先展示且不是模型概率；其余条目保留真实排序分。'
-      : '目录检索命中优先展示，不是模型概率。'
+    return '目录检索命中的条目优先显示。'
   }
   if (composition.hasModelScores) {
-    return '候选可信度前五 · 排序分仅供参考，不代表概率'
+    return '匹配度仅供参考。'
   }
-  return `按目录顺序展示，可输入${candidateLevelName.value}名称查找更多；尚无图像评分，不代表最可能的五个`
+  return `按目录顺序显示；可输入${candidateLevelName.value}名称，或补充照片里的线索。`
 })
 
 const displayError = computed(() => props.conflict ?? props.error)
@@ -371,7 +362,7 @@ const questionReason = computed(() => {
 const latestAssistantMessage = computed(() => {
   if (isResolved.value) {
     return safeGuidedText(props.action?.message).trim()
-      || '定位已完成；如发现新线索，仍可继续补充。'
+      || '定位已完成，还可以继续补充线索。'
   }
   if (countryShortcut.value) return shortcutExplanation.value
   // In the low-confidence country route, only the validated question may be
@@ -388,24 +379,24 @@ const latestAssistantMessage = computed(() => {
 })
 const composerHint = computed(() => {
   if (isResolved.value) {
-    return '可继续补充河边、山地、建筑等多维线索；新线索会交回助手重新核对，不改动已确认结果。'
+    return '还可以补充线索；新增线索会重新核对，不会改变已确认结果。'
   }
   if (!props.candidatesUnlocked) {
-    return '可补充多个可见线索，如河边、有山地、红砖建筑，也可补充店名或路牌；提交不会自动确认地点。'
+    return '输入照片里的细节，如河边、红砖建筑、招牌文字；不会自动确认地点。'
   }
   if (stage.value === 'country') {
-    return '可补充多个可观察线索（如河边、有山地、红砖建筑），也可输入国家/地区名称或店名检索目录；提交不会自动确认地点。'
+    return '输入照片里的细节，或直接输入国家/地区、店名；不会自动确认地点。'
   }
-  return '可补充多个可观察线索（如河边、有山地、红砖建筑），也可输入城市名或路牌；提交不会自动确认地点。'
+  return '输入照片里的细节，或直接输入城市名、路牌；不会自动确认地点。'
 })
 const latestReceiptText = computed(() => safeGuidedReceipt(props.receipt?.summary))
 const receiptStatusText = computed(() => {
   const summary = latestReceiptText.value
   if (summary) return summary
   const status = props.receipt?.status?.trim().toLowerCase()
-  if (status === 'unchanged') return '这条线索此前已保存，无需重复提交。'
-  if (status === 'unrecognized') return '没有识别到新的线索。'
-  return '操作已应用'
+  if (status === 'unchanged') return '这条线索之前已保存。'
+  if (status === 'unrecognized') return '没有识别到新线索。'
+  return '已更新'
 })
 const submissionReceiptText = computed(() =>
   safeGuidedReceipt(props.freeTextSubmission?.receipt?.summary),
@@ -413,21 +404,21 @@ const submissionReceiptText = computed(() =>
 const composerStatusText = computed(() => {
   const submission = props.freeTextSubmission
   if (!submission) return ''
-  if (submission.status === 'pending') return '正在解析这条线索…'
+  if (submission.status === 'pending') return '正在处理…'
   if (submission.status === 'failed') {
     const reason = safeGuidedText(submission.error).trim()
     return `${reason || '这次提交没有完成'} · 草稿已保留，可修改后再发送。`
   }
   if (submission.status === 'unconfirmed') {
     const reason = safeGuidedText(submission.error).trim()
-    return `${reason || '这次提交还没有明确回执'} · 草稿已保留，请核对最新状态后再试。`
+    return `${reason || '没有收到确认'} · 草稿已保留，请核对后再试。`
   }
   if (submission.status === 'unchanged') {
-    return '这条线索已记录，无需重复添加。'
+    return '这条线索之前已记录。'
   }
   return submissionReceiptText.value
-    ? `助手反馈：${submissionReceiptText.value}`
-    : '已收到，助手会继续核对。'
+    ? `助手：${submissionReceiptText.value}`
+    : '已收到。'
 })
 
 /** Scroll only the guided panel; never scroll the document or a candidate card. */
@@ -542,7 +533,7 @@ watch(stage, (nextStage, previousStage) => {
                 type="button"
                 class="ghost-btn guided-back-btn"
                 :disabled="busy"
-                :title="`回到上一层级：${locationLevelLabel(previousLevel)}（保留其他证据与排除）`"
+                :title="`回到上一层级：${locationLevelLabel(previousLevel)}（保留其他结果和排除）`"
                 @click="emit('backtrack', previousLevel)"
               >
                 返回上一步：{{ locationLevelLabel(previousLevel) }}
@@ -602,7 +593,7 @@ watch(stage, (nextStage, previousStage) => {
         </div>
 
         <div v-if="loading && !dialogue" class="guided-loading" role="status" aria-live="polite">
-          正在读取服务器保存的引导状态…
+          正在加载…
         </div>
 
         <template v-else-if="dialogue">
@@ -626,7 +617,7 @@ watch(stage, (nextStage, previousStage) => {
           >
             <span class="guided-resolved-label">最终结果</span>
             <strong>{{ targetLabel(dialogue.confirmed.city) }}</strong>
-            <p>已根据您的确认完成定位；城市坐标仅为代表点，不是照片 GPS。</p>
+            <p>已按你的确认完成定位。城市位置是代表点，不是照片 GPS。</p>
           </motion.div>
 
           <motion.section
@@ -686,11 +677,11 @@ watch(stage, (nextStage, previousStage) => {
                 v-if="candidate.reason || candidate.place_match || !candidatePointLabel(candidate.target)"
                 class="guided-candidate-detail"
               >
-                <summary>查看依据与坐标说明</summary>
+                <summary>依据说明</summary>
                 <div class="guided-candidate-detail-body">
                   <p v-if="candidate.reason" class="guided-candidate-reason">{{ candidate.reason }}</p>
                   <p v-if="!candidatePointLabel(candidate.target)" class="guided-candidate-point-note">
-                    无坐标；选中仅聚焦父级范围。
+                    没有地图坐标，选中后只显示所在区域。
                   </p>
                   <PlaceMatchEvidence v-if="candidate.place_match" :match="candidate.place_match" />
                 </div>
@@ -717,7 +708,7 @@ watch(stage, (nextStage, previousStage) => {
             </motion.article>
 
             <div v-if="!shortcutCandidates.length" class="guided-empty">
-              候选尚未就绪，请重新加载。
+              候选还没准备好，请重新加载。
             </div>
             <div class="guided-confidence-actions">
               <button
@@ -727,7 +718,7 @@ watch(stage, (nextStage, previousStage) => {
                 :disabled="busy"
                 @click="focusFreeText"
               >
-                补充线索细化
+                补充线索
               </button>
               <span>{{ shortcutFooter }}</span>
             </div>
@@ -740,8 +731,8 @@ watch(stage, (nextStage, previousStage) => {
           >
             <template v-if="phase === 'review'">
               <div v-if="showLowCluePrompt" class="guided-low-confidence-note">
-                <strong>当前信息不足，先补充可观察线索</strong>
-                <span>回答下方问题，或在下方补充文字线索。</span>
+                <strong>信息不足，先补充照片里的线索</strong>
+                <span>回答下面的问题，或在下方输入线索。</span>
               </div>
               <div v-if="isReviewClueQuestion" class="guided-review-box">
                 <div class="guided-section-head">
@@ -749,14 +740,14 @@ watch(stage, (nextStage, previousStage) => {
                   <span v-if="reviewProgress" class="guided-review-progress">
                     第 {{ reviewProgress.current }} / {{ reviewProgress.total }}
                   </span>
-                  <span v-else class="guided-one-question">本轮仅此一条观察</span>
+                  <span v-else class="guided-one-question">本轮只有这一条</span>
                 </div>
                 <template v-if="currentReviewClue">
                   <p class="guided-question-message">{{ questionMessage }}</p>
                   <p class="guided-question-reason">{{ questionReason }}</p>
                   <div class="guided-question-clue">
                     <strong>{{ reviewedClueText(currentReviewClue) }}</strong>
-                    <span>{{ currentReviewClue.description || '未提供详细说明' }}</span>
+                    <span>{{ currentReviewClue.description || '暂无说明' }}</span>
                     <span v-if="isRecentClue(currentReviewClue.id)" class="guided-clue-new">新线索</span>
                   </div>
                   <div class="guided-inline-actions">
@@ -766,7 +757,7 @@ watch(stage, (nextStage, previousStage) => {
                       :disabled="busy"
                       @click="emit('confirm-clue', currentReviewClue.id)"
                     >
-                      判断准确
+                      准确
                     </button>
                     <button
                       type="button"
@@ -783,21 +774,21 @@ watch(stage, (nextStage, previousStage) => {
                     :disabled="busy"
                     @click="emit('unknown')"
                   >
-                    不确定 / 无法判断（不代表排除）
+                    不确定（不代表排除）
                   </button>
                 </template>
                 <div v-else class="guided-question-hint">
-                  观察暂时无法显示，请重新加载。
+                  这条观察暂时无法显示，请重新加载。
                 </div>
               </div>
 
               <div v-else-if="blockingQuestion" class="guided-review-box">
                 <div class="guided-section-head">
                   <span class="guided-section-title">{{ guidedQuestionTitle(blockingQuestion) }}</span>
-                  <span class="guided-one-question">本轮仅此一问</span>
+                  <span class="guided-one-question">本轮只有这一题</span>
                 </div>
                 <p v-if="narratedLowQuestion" class="guided-question-reason">
-                  <strong>问题说明：</strong>{{ narratedLowQuestion }}
+                  {{ narratedLowQuestion }}
                 </p>
                 <p class="guided-question-message">{{ questionMessage }}</p>
                 <p class="guided-question-reason">{{ guidedQuestionReason(blockingQuestion) }}</p>
@@ -814,7 +805,7 @@ watch(stage, (nextStage, previousStage) => {
                   </button>
                 </div>
                 <div v-else class="guided-question-hint">
-                  在下方输入可观察线索。
+                  在下方输入你能看到的线索。
                 </div>
                 <button
                   type="button"
@@ -822,7 +813,7 @@ watch(stage, (nextStage, previousStage) => {
                   :disabled="busy"
                   @click="emit('unknown')"
                 >
-                  不确定 / 跳过此问题
+                  不确定，跳过
                 </button>
               </div>
 
@@ -832,8 +823,8 @@ watch(stage, (nextStage, previousStage) => {
 
               <div v-else class="guided-next-step" role="status">
                 <div>
-                  <strong>观察核对已完成</strong>
-                  <span>下一步查看地点候选；选择符合照片的地点后再确认。</span>
+                  <strong>核对完成</strong>
+                  <span>查看候选，选中符合照片的地点再确认。</span>
                   <span v-if="questionMessage" class="guided-question-hint">{{ questionMessage }}</span>
                 </div>
                 <button
@@ -854,7 +845,7 @@ watch(stage, (nextStage, previousStage) => {
                   :title="canReviewBack ? '重新核对上一条已确认的观察' : '还没有已确认的观察'"
                   @click="emit('review-back')"
                 >
-                  返回上一条观察（重新核对）
+                  重新核对上一条
                 </button>
               </div>
             </template>
@@ -881,17 +872,17 @@ watch(stage, (nextStage, previousStage) => {
                 :title="canReviewBack ? '重新核对上一条已确认的观察' : '还没有已确认的观察'"
                 @click="emit('review-back')"
               >
-                重审上一条观察
+                重新核对上一条
               </button>
             </div>
 
             <div v-if="pendingQuestion?.kind === 'confirm_location'" class="guided-question-hint">
-              请明确选择当前层级；不会自动确认第一名。
+              请选择并确认，不会自动采用第一项。
             </div>
 
             <p class="guided-section-hint">{{ candidateSectionHint }}</p>
             <div v-if="!topCandidates.length" class="guided-empty">
-              当前层级暂无候选；可补充照片中可见的招牌、地名或文字。
+              暂无候选；可补充照片里的招牌、地名或文字。
             </div>
 
             <motion.article
@@ -934,11 +925,11 @@ watch(stage, (nextStage, previousStage) => {
                 v-if="candidate.reason || candidate.place_match || !candidatePointLabel(candidate.target)"
                 class="guided-candidate-detail"
               >
-                <summary>查看依据与坐标说明</summary>
+                <summary>依据说明</summary>
                 <div class="guided-candidate-detail-body">
                   <p v-if="candidate.reason" class="guided-candidate-reason">{{ candidate.reason }}</p>
                   <p v-if="!candidatePointLabel(candidate.target)" class="guided-candidate-point-note">
-                    无坐标；选中仅聚焦父级范围。
+                    没有地图坐标，选中后只显示所在区域。
                   </p>
                   <PlaceMatchEvidence v-if="candidate.place_match" :match="candidate.place_match" />
                 </div>
@@ -970,7 +961,7 @@ watch(stage, (nextStage, previousStage) => {
               <span class="guided-section-title">已排除地点</span>
               <span class="guided-section-note">可撤回</span>
             </div>
-            <p class="guided-section-hint">排除仅作用于该目标。</p>
+            <p class="guided-section-hint">只排除这一项，可随时撤回。</p>
             <div
               v-for="target in dialogue.exclusions"
               :key="`${target.level}-${target.id}`"
@@ -990,7 +981,7 @@ watch(stage, (nextStage, previousStage) => {
         </template>
 
         <div v-else-if="!loading" class="guided-loading">
-          引导状态尚未就绪，请重试。
+          还没加载好，请重试。
         </div>
       </div>
     </div>
@@ -1004,7 +995,7 @@ watch(stage, (nextStage, previousStage) => {
       @submit.prevent="submitComposer"
     >
       <label id="guided-composer-label" for="guided-conversation-input" class="sr-only">
-        补充线索，与定位助手对话
+        补充线索
       </label>
 
       <AnimatePresence>

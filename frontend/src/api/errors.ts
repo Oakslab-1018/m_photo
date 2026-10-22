@@ -41,7 +41,7 @@ export function normalizeApiError(
     const isNetworkFailure =
       input.name === 'TypeError' || /failed to fetch|networkerror|load failed/i.test(input.message)
     return new ApiError({
-      message: isNetworkFailure ? '网络连接失败，请确认后端服务已启动' : input.message || fallback,
+      message: isNetworkFailure ? '网络连接失败，请检查网络后重试' : input.message || fallback,
       status,
       cause: input,
     })

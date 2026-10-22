@@ -50,7 +50,7 @@ const rows = computed(() =>
     :class="{ 'place-source-evidence--compact': compact }"
   >
     <div v-if="retrievalLabels.length" class="place-source-provenance">
-      <span class="place-source-provenance-label">检索来源：</span>
+      <span class="place-source-provenance-label">来源：</span>
       <span
         v-for="label in retrievalLabels"
         :key="label"
@@ -58,7 +58,7 @@ const rows = computed(() =>
       >{{ label }}</span>
     </div>
     <div v-if="observationLabels.length" class="place-source-provenance">
-      <span class="place-source-provenance-label">文字来源：</span>
+      <span class="place-source-provenance-label">文字来自：</span>
       <span
         v-for="label in observationLabels"
         :key="label"
@@ -80,7 +80,7 @@ const rows = computed(() =>
           >查看来源</a>
         </div>
         <p v-if="row.excerpt" class="place-source-excerpt">{{ row.excerpt }}</p>
-        <small v-if="row.fetchedAt">获取时间：{{ row.fetchedAt }}</small>
+        <small v-if="row.fetchedAt">更新于 {{ row.fetchedAt }}</small>
       </li>
     </ul>
   </div>

@@ -79,7 +79,7 @@ describe('guided candidate Top-5', () => {
     expect(top).toHaveLength(5)
   })
 
-  it('keeps user-text and catalog matches ahead of five scored model rows without inventing scores', () => {
+  it('orders real city scores first and keeps unscored proposals after them without inventing scores', () => {
     const models = Array.from({ length: 5 }, (_, index) => ({
       target: cityTarget(String(2000 + index), `模型城市 ${index + 1}`),
       score: 0.9 - index * 0.1,
@@ -96,21 +96,33 @@ describe('guided candidate Top-5', () => {
       selection_basis: 'catalog_search',
     }
 
-    const top = selectTopGuidedCandidates([...models, chengdu, searched], 'city')
+    const full = selectTopGuidedCandidates([...models, chengdu, searched], 'city')
 
-    expect(top.map((item) => item.target.id)).toEqual([
-      '1815286',
-      '1816670',
+    expect(full.map((item) => item.target.id)).toEqual([
       '2000',
       '2001',
       '2002',
+      '2003',
+      '2004',
     ])
-    expect(top[0]).toMatchObject({ selection_basis: 'user_text', reason: '自由文本提议' })
-    expect(top[0]?.score).toBeUndefined()
-    expect(top[1]).toMatchObject({ selection_basis: 'catalog_search' })
-    expect(top[1]?.score).toBeUndefined()
-    expect(top.slice(2).map((item) => Number(item.score?.toFixed(1)))).toEqual([0.9, 0.8, 0.7])
-    expect(top.slice(2).every((item) => item.score_type === 'city_text_cosine')).toBe(true)
+    expect(full.every((item) => Number.isFinite(item.score))).toBe(true)
+
+    const withSpace = selectTopGuidedCandidates(
+      [...models.slice(0, 2), chengdu, searched],
+      'city',
+    )
+
+    expect(withSpace.map((item) => item.target.id)).toEqual([
+      '2000',
+      '2001',
+      '1815286',
+      '1816670',
+    ])
+    expect(withSpace.slice(2).map((item) => item.score)).toEqual([undefined, undefined])
+    expect(withSpace.slice(2).map((item) => item.selection_basis)).toEqual([
+      'user_text',
+      'catalog_search',
+    ])
   })
 
   it('labels a mixed user-text proposal without claiming a top-confidence ranking', async () => {
@@ -134,10 +146,10 @@ describe('guided candidate Top-5', () => {
       ],
     })
 
-    expect(html.indexOf('成都')).toBeLessThan(html.indexOf('模型城市'))
+    expect(html.indexOf('模型城市')).toBeLessThan(html.indexOf('成都'))
     expect(html).toContain('线索匹配候选')
-    expect(html).toContain('来自你提供的文字线索（非模型概率）')
-    expect(html).toContain('线索匹配优先 · 其余按排序分')
+    expect(html).toContain('标有“线索匹配候选”的条目来自你输入的文字。')
+    expect(html).toContain('含线索匹配')
     expect(html).not.toContain('候选可信度前五')
   })
 
@@ -165,9 +177,9 @@ describe('guided candidate Top-5', () => {
     expect(html.indexOf('Echo')).toBeLessThan(html.indexOf('Catalog first'))
     expect(html).not.toContain('Catalog second')
     expect(html).toContain('>5<')
-    expect(html).toContain('候选可信度前五 · 排序分仅供参考，不代表概率')
-    expect(html).toContain('排序分，非概率')
-    expect(html).toContain('目录候选（无模型评分）')
+    expect(html).toContain('候选前五')
+    expect(html).toContain('匹配 0.900（不是概率）')
+    expect(html).toContain('目录候选')
   })
 
   it('describes catalog-only rows as directory order without inventing a ranking', async () => {
@@ -185,11 +197,11 @@ describe('guided candidate Top-5', () => {
       guidedCandidates: candidates,
     })
 
-    expect(html).toContain('目录候选（当前显示 5 项）')
+    expect(html).toContain('目录候选（5 项）')
     expect(html).toContain(
-      '按目录顺序展示，可输入城市名称查找更多；尚无图像评分，不代表最可能的五个',
+      '按目录顺序显示；可输入城市名称，或补充照片里的线索。',
     )
-    expect(html).toContain('目录候选（无模型评分）')
+    expect(html).toContain('目录候选（5 项）')
     expect(html).not.toContain('候选可信度前五')
     expect(html).not.toContain('排序分仅供参考')
   })
@@ -229,7 +241,7 @@ describe('guided candidate Top-5', () => {
       scores: [legacyScore('JP', '日本')],
     })
 
-    expect(html).toContain('先核对观察，再查看地点候选')
+    expect(html).toContain('先核对观察，再查看候选')
     expect(html).not.toContain('日本')
     expect(html).not.toContain('>1<')
     expect(html).not.toContain('确认国家 / 地区')
@@ -245,7 +257,7 @@ describe('guided candidate Top-5', () => {
       scores: [legacyScore('JP', '日本')],
     })
 
-    expect(html).toContain('正在读取服务器保存的引导状态')
+    expect(html).toContain('正在加载…')
     expect(html).not.toContain('日本')
     expect(html).not.toContain('候选国家推断')
   })
@@ -260,7 +272,7 @@ describe('guided candidate Top-5', () => {
     })
 
     expect(html).toContain('日本')
-    expect(html).toContain('新增观察待核对')
+    expect(html).toContain('有新的观察待核对，暂时不能确认或排除。')
     expect(html).toMatch(/class="mini-btn confirm"[^>]*disabled/)
     expect(html).toMatch(/class="mini-btn reject"[^>]*disabled/)
   })

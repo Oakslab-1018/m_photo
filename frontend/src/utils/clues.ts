@@ -196,11 +196,11 @@ export type ClueProvenance = 'user' | 'ocr' | 'observed' | 'model' | 'heuristic'
 const MODEL_SOURCES = new Set(['model', 'streetclip', 'deepseek', 'ml', 'cnn'])
 
 const PROVENANCE_LABELS: Record<Exclude<ClueProvenance, 'unknown'>, string> = {
-  user: '用户补充',
-  ocr: 'OCR 识别',
-  observed: '局部分析',
-  model: '模型推断',
-  heuristic: '启发式推断',
+  user: '你补充的',
+  ocr: '图片文字',
+  observed: '区域分析',
+  model: '图像分析',
+  heuristic: '推断',
 }
 
 export interface ClueGroup {

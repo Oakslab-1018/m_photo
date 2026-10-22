@@ -57,13 +57,13 @@ function purposeLabel(purpose: RegionReport['purpose']): string {
 function dedupeLabel(report: RegionReport): string {
   switch (report.dedupe) {
     case 'new':
-      return '新增证据'
+      return '新增结果'
     case 'duplicate_region':
-      return '相同区域，已有报告'
+      return '相同区域，已有结果'
     case 'duplicate_request':
-      return '重复请求，已复用报告'
+      return '重复分析，已复用结果'
     case 'no_new_evidence':
-      return '未发现新增证据'
+      return '没有新增内容'
   }
 }
 
@@ -74,21 +74,21 @@ function kindLabel(kind: RegionObservation['kind']): string {
     case 'semantic':
       return '语义线索'
     case 'pixel_signal':
-      return '像素测量'
+      return '图像测量'
     case 'scene_hypothesis':
-      return '场景假设（复核参考）'
+      return '场景线索（仅供参考）'
     case 'crop_ranking':
-      return '裁剪排序证据'
+      return '裁剪排序'
   }
 }
 
 function trustLabel(observation: RegionObservation): string {
   const trust = observation.trust
-  const level = trust.level === 'high' ? '高可信' : trust.level === 'medium' ? '中等可信' : '低可信'
+  const level = trust.level === 'high' ? '可信度高' : trust.level === 'medium' ? '可信度中等' : '可信度低'
   const flags: string[] = [level]
   if (trust.reliable) flags.push('可靠')
   if (trust.validated) flags.push('已核对')
-  if (trust.affects_ranking) flags.push('影响排序')
+  if (trust.affects_ranking) flags.push('参与排序')
   if (trust.uncertain) flags.push('不确定')
   return flags.join(' · ')
 }
@@ -99,8 +99,8 @@ function providerState(status: { enabled: boolean; available: boolean; state: st
   const state = status.state.toLowerCase()
   if (!state || state === 'unknown') return '可用'
   if (state === 'ok' || state === 'ready' || state === 'available' || state === 'healthy') return '可用'
-  if (state === 'mock') return '模拟模式（仅开发，不可靠）'
-  return status.state
+  if (state === 'mock') return '开发模式'
+  return '状态未知'
 }
 
 function formatNumber(value: number | null | undefined, digits = 3): string {
@@ -178,22 +178,22 @@ function adoptionSettled(report: RegionReport, observation: RegionObservation): 
 function adoptionStatusText(adoption: ObservationAdoptionSubmission): string {
   const summary = adoption.receipt?.summary?.trim()
   if (adoption.status === 'pending') {
-    return '正在确认 OCR 原文并检索地点；不会自动确认地点。'
+    return '正在用这段文字查询地点…'
   }
   if (adoption.status === 'applied') {
     return summary
-      ? `已确认文字；助手反馈：${summary}`
-      : '已确认 OCR 原文并提交地点检索；不会自动确认地点。'
+      ? `已使用这段文字；助手：${summary}`
+      : '已用这段文字查询地点，不会自动确认。'
   }
   if (adoption.status === 'unchanged') {
     return summary
-      ? `这段 OCR 原文此前已确认；助手反馈：${summary}`
-      : '这段 OCR 原文此前已确认，无需重复提交。'
+      ? `这段文字之前已使用；助手：${summary}`
+      : '这段文字之前已使用。'
   }
   if (adoption.status === 'unconfirmed') {
-    return adoption.error?.trim() || '服务器未返回可识别的采用回执，请核对最新引导状态后再试。'
+    return adoption.error?.trim() || '没有收到确认，请核对后再试。'
   }
-  return adoption.error?.trim() || '确认文字失败，地点未被自动确认。'
+  return adoption.error?.trim() || '确认文字失败，地点没有被自动确认。'
 }
 
 function adoptionIsPending(report: RegionReport, observation: RegionObservation): boolean {
@@ -219,19 +219,18 @@ function adoptionClassFor(report: RegionReport, observation: RegionObservation):
 </script>
 
 <template>
-  <aside class="region-report-panel" aria-label="局部区域分析报告">
+  <aside class="region-report-panel" aria-label="区域分析">
     <div class="region-report-head">
       <div>
         <span class="region-report-kicker">LOCAL ANALYSIS</span>
-        <h3>局部区域报告</h3>
+        <h3>区域分析</h3>
       </div>
-      <span class="region-report-count">{{ reports.length }} 份</span>
+      <span class="region-report-count">{{ reports.length }} 次</span>
     </div>
 
     <div v-if="requests.length" class="region-request-list">
       <div v-for="record in requests" :key="record.id" class="region-request-row" :class="record.status">
         <span class="region-request-state">{{ record.status === 'pending' ? '分析中…' : '分析失败' }}</span>
-        <span class="region-request-id">{{ record.id }}</span>
         <p v-if="record.error" class="region-request-error">{{ record.error }}</p>
         <button
           v-if="record.status === 'failed'"
@@ -240,17 +239,17 @@ function adoptionClassFor(report: RegionReport, observation: RegionObservation):
           :disabled="waitReason"
           @click="emit('retry-region', record.request)"
         >
-          使用同一请求 ID 重试
+          重试
         </button>
       </div>
     </div>
 
     <div v-if="!reports.length" class="region-report-empty">
-      尚未收到区域报告。旧版响应只显示原有线索，不会伪造 OCR 或模型结论。
+      还没有分析结果。
     </div>
 
     <template v-else>
-      <div class="region-report-history" aria-label="区域报告历史">
+      <div class="region-report-history" aria-label="区域分析历史">
         <button
           v-for="report in reports"
           :key="report.id"
@@ -260,13 +259,13 @@ function adoptionClassFor(report: RegionReport, observation: RegionObservation):
           @click="emit('select-region', report.id)"
         >
           <span class="region-history-purpose">{{ purposeLabel(report.purpose) }}</span>
-          <strong>{{ report.summary || '局部区域分析' }}</strong>
-          <small>{{ dedupeLabel(report) }} · {{ report.id }}</small>
+          <strong>{{ report.summary || '区域分析' }}</strong>
+          <small>{{ dedupeLabel(report) }}</small>
         </button>
       </div>
 
       <article v-if="selectedReport" class="region-report-detail">
-        <p class="region-report-summary">{{ selectedReport.summary || '服务器未提供摘要。' }}</p>
+        <p class="region-report-summary">{{ selectedReport.summary || '没有摘要。' }}</p>
 
         <div class="region-crop-preview" :style="cropPreviewStyle(selectedReport)">
           <img
@@ -278,38 +277,41 @@ function adoptionClassFor(report: RegionReport, observation: RegionObservation):
           <span v-else>原图不可用</span>
         </div>
 
-        <div class="region-meta-grid">
-          <span>用途：{{ purposeLabel(selectedReport.purpose) }}</span>
-          <span>尺度：{{ formatNumber(selectedReport.scale, 2) }}</span>
-          <span>{{ bboxText(selectedReport) }}</span>
-          <span>EXIF 方向：{{ selectedReport.image.orientation_applied ? '已应用' : '无需处理' }}</span>
-        </div>
+        <details class="region-tech">
+          <summary>技术信息</summary>
+          <div class="region-meta-grid">
+            <span>用途：{{ purposeLabel(selectedReport.purpose) }}</span>
+            <span>尺度：{{ formatNumber(selectedReport.scale, 2) }}</span>
+            <span>{{ bboxText(selectedReport) }}</span>
+            <span>图片方向：{{ selectedReport.image.orientation_applied ? '已校正' : '无需校正' }}</span>
+          </div>
 
-        <section class="region-provider-grid">
-          <div class="region-provider-card" :class="{ unavailable: !selectedReport.ocr.available }">
-            <span class="region-provider-title">OCR · {{ selectedReport.ocr.provider }}</span>
-            <strong>{{ providerState(selectedReport.ocr) }}</strong>
-            <small>识别行数 {{ selectedReport.ocr.line_count }}</small>
-          </div>
-          <div class="region-provider-card" :class="{ unavailable: !selectedReport.model.available }">
-            <span class="region-provider-title">模型 · {{ selectedReport.model.provider }}</span>
-            <strong>{{ providerState(selectedReport.model) }}</strong>
-            <small>
-              {{ selectedReport.model.ranking_applied ? '已参与弱排序' : '未参与排序' }}
-              <template v-if="selectedReport.model.scene_available === false"> · 场景端点不可用</template>
-            </small>
-            <small v-if="typeof selectedReport.model.margin === 'number'">
-              排序诊断边界差 {{ formatNumber(selectedReport.model.margin, 3) }}（非概率）
-            </small>
-            <small v-if="selectedReport.model.uncertain">模型标记为不确定，仅作复核参考</small>
-            <small v-if="selectedReport.model.ranking_note">{{ selectedReport.model.ranking_note }}</small>
-          </div>
-        </section>
+          <section class="region-provider-grid">
+            <div class="region-provider-card" :class="{ unavailable: !selectedReport.ocr.available }">
+              <span class="region-provider-title">文字识别</span>
+              <strong>{{ providerState(selectedReport.ocr) }}</strong>
+              <small>识别到 {{ selectedReport.ocr.line_count }} 行文字</small>
+            </div>
+            <div class="region-provider-card" :class="{ unavailable: !selectedReport.model.available }">
+              <span class="region-provider-title">场景识别</span>
+              <strong>{{ providerState(selectedReport.model) }}</strong>
+              <small>
+                {{ selectedReport.model.ranking_applied ? '已用于排序' : '未用于排序' }}
+                <template v-if="selectedReport.model.scene_available === false"> · 场景识别不可用</template>
+              </small>
+              <small v-if="typeof selectedReport.model.margin === 'number'">
+                排序差距 {{ formatNumber(selectedReport.model.margin, 3) }}（不是概率）
+              </small>
+              <small v-if="selectedReport.model.uncertain">结果不确定，仅供参考</small>
+              <small v-if="selectedReport.model.ranking_note">{{ selectedReport.model.ranking_note }}</small>
+            </div>
+          </section>
+        </details>
 
         <section class="region-observations">
           <div class="region-section-title">分析依据</div>
           <div v-if="!visibleObservations.length" class="region-report-empty">
-            没有可展示的真实 OCR/模型观察；不可用状态不会被猜测文本填充。
+            没有可展示的结果。
           </div>
           <article v-for="observation in visibleObservations" :key="observation.id" class="region-observation-card">
             <div class="region-observation-head">
@@ -321,16 +323,9 @@ function adoptionClassFor(report: RegionReport, observation: RegionObservation):
             </p>
             <p class="region-observation-evidence">{{ observation.evidence }}</p>
             <div class="region-observation-meta">
-              <span>{{ observation.source }}{{ observation.provider ? ' · ' + observation.provider : '' }}</span>
               <span>{{ trustLabel(observation) }}</span>
-              <span v-if="!observation.trust.affects_ranking">仅供参考，不影响地理排序</span>
-              <span v-if="typeof observation.trust.confidence === 'number'">
-                {{ observation.trust.confidence_kind || '置信度' }} {{ formatNumber(observation.trust.confidence, 3) }}
-              </span>
-              <span v-if="typeof observation.trust.raw_cosine === 'number'">
-                参考余弦 {{ formatNumber(observation.trust.raw_cosine, 3) }}（非概率）
-              </span>
-              <span v-if="observationHasBox(observation)">图中已标出证据框</span>
+              <span v-if="!observation.trust.affects_ranking">仅供参考，不影响排序</span>
+              <span v-if="observationHasBox(observation)">图中已标出位置</span>
             </div>
             <div
               v-if="canAdoptObservation(selectedReport, observation)"
@@ -346,10 +341,10 @@ function adoptionClassFor(report: RegionReport, observation: RegionObservation):
                 >
                   {{
                     adoptionIsPending(selectedReport, observation)
-                      ? '正在确认文字…'
+                      ? '正在处理…'
                       : adoptionFor(selectedReport, observation)?.status === 'failed'
-                        ? '重新确认文字并用于定位'
-                        : '确认文字并用于定位'
+                        ? '重新使用这段文字'
+                        : '使用这段文字定位'
                   }}
                 </button>
                 <button
@@ -359,7 +354,7 @@ function adoptionClassFor(report: RegionReport, observation: RegionObservation):
                   :disabled="waitReason"
                   @click="emit('retry-observation-adoption')"
                 >
-                  重试上次采用（同一事件）
+                  重试
                 </button>
               </div>
               <p
@@ -371,17 +366,17 @@ function adoptionClassFor(report: RegionReport, observation: RegionObservation):
                 {{ adoptionTextFor(selectedReport, observation) }}
               </p>
               <p class="region-adoption-hint">
-                仅提交报告 ID 与观察 ID；后端使用已保存的 OCR 原文检索，不会自动确认地点。
+                会用这段文字查询地点，不会自动确认。
               </p>
             </div>
             <p v-if="observation.kind === 'scene_hypothesis'" class="region-scene-note">
-              场景假设仅用于人工复核，不是拍摄地概率，也不参与引导确认。
+              场景线索仅供参考，不参与确认。
             </p>
           </article>
         </section>
 
         <section v-if="selectedReport.question_suggestions.length" class="region-questions">
-          <div class="region-section-title">建议追问（仅填入草稿）</div>
+          <div class="region-section-title">建议追问</div>
           <button
             v-for="question in selectedReport.question_suggestions"
             :key="question.id"
@@ -391,7 +386,7 @@ function adoptionClassFor(report: RegionReport, observation: RegionObservation):
             @click="emit('ask-question', question)"
           >
             <strong>{{ question.text }}</strong>
-            <small>{{ question.reason }} · 依据 {{ question.basis_observation_ids.length }} 条观察 · 点击只填入追问草稿，不确认文字，也不会自动确认地点</small>
+            <small>{{ question.reason }} · 依据 {{ question.basis_observation_ids.length }} 条 · 点击只填入草稿，不会确认地点</small>
           </button>
         </section>
       </article>

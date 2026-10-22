@@ -15,7 +15,7 @@ describe('normalizeApiError', () => {
 
   it('maps network failures to a stable Chinese message', () => {
     const normalized = normalizeApiError(new TypeError('Failed to fetch'))
-    expect(normalized.message).toBe('网络连接失败，请确认后端服务已启动')
+    expect(normalized.message).toBe('网络连接失败，请检查网络后重试')
     expect(normalized.status).toBeUndefined()
   })
 

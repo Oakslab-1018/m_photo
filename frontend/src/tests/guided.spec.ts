@@ -269,7 +269,7 @@ describe('useGuidedDialogue', () => {
     expect(applied).toBe(false)
     expect(api.dialogue).toHaveBeenCalledWith(7)
     expect(guided.dialogue.value?.revision).toBe(11)
-    expect(guided.conflict.value).toContain('已重新加载')
+    expect(guided.conflict.value).toContain('状态已更新')
     expect(guided.canRetry.value).toBe(true)
 
     await guided.retry()
@@ -563,7 +563,7 @@ describe('useGuidedDialogue', () => {
     expect(guided.topCandidates.value).toEqual([])
     expect(await guided.confirmLocation(japan)).toBe(false)
     expect(api.dialogueEvent).not.toHaveBeenCalled()
-    expect(guided.error.value).toContain('待核对观察')
+    expect(guided.error.value).toContain('请先处理上方 1 条观察')
   })
 
   it('treats confirm, reject and unknown statuses as handled and keeps unlock sticky for new observations', async () => {
@@ -692,7 +692,7 @@ describe('useGuidedDialogue', () => {
     expect(userPending.topCandidates.value).toEqual([])
     expect(userPending.locationConfirmationReady.value).toBe(false)
     expect(userPending.nextPhase()).toBe(false)
-    expect(userPending.error.value).toContain('待核对观察')
+    expect(userPending.error.value).toContain('请先处理上方 1 条观察')
     expect(await userPending.confirmLocation(japan)).toBe(false)
     expect(userPendingApi.dialogueEvent).not.toHaveBeenCalled()
 
@@ -901,7 +901,7 @@ describe('useGuidedDialogue', () => {
     expect(guided.reviewReady.value).toBe(false)
     expect(guided.nextPhase()).toBe(false)
     expect(guided.phase.value).toBe('review')
-    expect(guided.error.value).toContain('阻塞')
+    expect(guided.error.value).toContain('请先完成当前问题')
 
     await guided.answer('zh')
     expect(guided.reviewReady.value).toBe(true)

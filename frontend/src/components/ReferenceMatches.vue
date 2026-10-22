@@ -24,33 +24,27 @@ const hasAnyEvidence = computed(
   () => matches.value.length > 0 || regions.value.length > 0 || cosineRows.value.length > 0,
 )
 const isEmptyLibrary = computed(() => !hasReferenceData.value)
-
-/** Raw support/prototype coverage metric; never rendered as a probability. */
-function formatSupport(value: number): string {
-  if (!Number.isFinite(value)) return '—'
-  return Number.isInteger(value) ? String(value) : value.toFixed(3)
-}
 </script>
 
 <template>
-  <section class="reference-panel" aria-label="参考街景相似结果">
-    <h3 class="reference-title">参考街景相似结果</h3>
+  <section class="reference-panel" aria-label="参考街景">
+    <h3 class="reference-title">参考街景</h3>
     <p class="reference-disclaimer">
       {{ REFERENCE_MATCH_DISCLAIMER }}
     </p>
 
     <p v-if="!scores.length" class="reference-empty">
-      上传照片后显示街景参考。
+      上传照片后显示参考街景。
     </p>
     <p v-else-if="isEmptyLibrary" class="reference-empty">
-      未配置带标签的参考图库，暂无参考街景诊断。
+      还没有可用的参考图。
     </p>
     <p v-else-if="!hasAnyEvidence" class="reference-empty">
-      已配置参考图库，本次未返回可用的参考街景匹配。
+      这次没有匹配到参考街景。
     </p>
 
     <template v-else>
-      <div v-if="matches.length" class="reference-subtitle">Top {{ matches.length }} 参考图匹配</div>
+      <div v-if="matches.length" class="reference-subtitle">参考图（前 {{ matches.length }} 项）</div>
       <ol v-if="matches.length" class="reference-list">
         <li v-for="match in matches" :key="match.reference_id" class="reference-item">
           <div class="reference-line">
@@ -62,18 +56,16 @@ function formatSupport(value: number): string {
             <template v-if="match.city"> · {{ match.city }}</template>
             <template v-else-if="match.region"> · {{ match.region }}</template>
             <template v-if="match.viewpoint"> · {{ match.viewpoint }}</template>
-            <span class="reference-id">#{{ match.reference_id }}</span>
           </div>
         </li>
       </ol>
 
-      <div v-if="regions.length" class="reference-subtitle">国家/地区原型分数</div>
+      <div v-if="regions.length" class="reference-subtitle">按地区比较</div>
       <div v-if="regions.length" class="reference-regions">
         <div v-for="region in regions" :key="`${region.iso}-${region.region}`" class="reference-region">
           <span class="reference-place">{{ normalizeCountryIso(region.iso) }} · {{ region.region }}</span>
           <span class="reference-region-meta">
-            {{ formatReferenceCosine(region.raw_cosine) }} · 原型 {{ region.prototype_count }} ·
-            支持 {{ formatSupport(region.support) }}
+            {{ formatReferenceCosine(region.raw_cosine) }} · 参考图 {{ region.prototype_count }} 张
           </span>
         </div>
       </div>

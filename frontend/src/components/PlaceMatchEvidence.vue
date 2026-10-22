@@ -22,8 +22,8 @@ const attribution = computed(() =>
 
 <template>
   <div v-if="match" class="place-evidence" :class="{ 'place-evidence--candidate': candidateOnly }">
-    <span v-if="candidateOnly" class="place-evidence-status">{{ placeMatchVerificationLabel(match) }}（不作为地名核验）</span>
-    <span v-if="match.ambiguous">同名地点，需补充城市或区名后确认</span>
+    <span v-if="candidateOnly" class="place-evidence-status">{{ placeMatchVerificationLabel(match) }} · 不作为地名依据</span>
+    <span v-if="match.ambiguous">有多个同名地点，请补充城市或区名</span>
     <span v-if="queryTerms.length">文字线索：{{ queryTerms.join('、') }}</span>
     <PlaceSourceEvidence :sources="match.sources" />
     <small v-if="attribution">{{ attribution }}</small>

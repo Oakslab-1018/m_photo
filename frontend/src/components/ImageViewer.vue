@@ -95,16 +95,16 @@ const canAnalyze = computed(() => !interactionDisabled.value && buildRequest(fal
 const selectionText = computed(() => {
   if (draftRegion.value && draftRegion.value.w > 0 && draftRegion.value.h > 0) {
     const region = draftRegion.value
-    return '矩形 ROI：' + formatPercent(region.x) + ', ' + formatPercent(region.y) + ' · ' + formatPercent(region.w) + ' × ' + formatPercent(region.h)
+    return '已选区域 · ' + formatPercent(region.x) + ', ' + formatPercent(region.y) + ' · ' + formatPercent(region.w) + ' × ' + formatPercent(region.h)
   }
-  if (draftPoint.value) return '点选：' + formatPercent(draftPoint.value.x) + ', ' + formatPercent(draftPoint.value.y)
-  return '尚未选择区域'
+  if (draftPoint.value) return '已选位置 · ' + formatPercent(draftPoint.value.x) + ', ' + formatPercent(draftPoint.value.y)
+  return '还没选择区域'
 })
 const viewerTip = computed(() => {
-  if (interactionDisabled.value) return '分析中或当前忙碌，暂时锁定选区与引导操作'
-  if (mode.value === 'rect') return '框选模式：拖拽画出矩形 ROI；滚轮缩放，切换平移动态图'
-  if (mode.value === 'pan') return '平移模式：拖拽移动图片；滚轮缩放'
-  return '点选模式：单击图片选择点；拖拽平移，滚轮缩放；确认后点击“分析选定区域”'
+  if (interactionDisabled.value) return '正在分析，请稍候。'
+  if (mode.value === 'rect') return '拖拽框选要分析的区域；滚轮缩放。'
+  if (mode.value === 'pan') return '拖拽移动照片；滚轮缩放。'
+  return '单击照片选择要分析的位置。'
 })
 const reportBox = computed(() => selectedReport.value?.bbox_norm ?? null)
 const focusedBox = computed(() => clueRegionBox(props.focusedClue))
@@ -421,7 +421,7 @@ onBeforeUnmount(() => {
       <div class="viewer-header">
         <div class="viewer-heading">
           <span class="viewer-tip">{{ viewerTip }}</span>
-          <span v-if="analyzing" class="viewer-busy" role="status">分析中，暂不允许改选区或引导操作</span>
+          <span v-if="analyzing" class="viewer-busy" role="status">正在分析，请稍候。</span>
         </div>
         <div class="viewer-tools">
           <div class="viewer-mode-group" role="group" aria-label="图片交互模式">
@@ -444,7 +444,7 @@ onBeforeUnmount(() => {
 
       <div class="viewer-controls">
         <label class="viewer-scale-control">
-          <span>点击尺度</span>
+          <span>范围</span>
           <input v-model.number="scale" type="range" min="0.08" max="0.8" step="0.01" :disabled="interactionDisabled">
           <strong>{{ Math.round(scale * 100) }}%</strong>
         </label>
@@ -496,12 +496,12 @@ onBeforeUnmount(() => {
                   v-if="draftRegion"
                   class="draft-region"
                   :style="boxStyle(draftRegion)"
-                >ROI</span>
+                >选区</span>
                 <span
                   v-if="reportBox"
                   class="report-region-box"
                   :style="boxStyle(reportBox)"
-                >报告 ROI</span>
+                >分析区域</span>
                 <span
                   v-for="box in evidenceBoxes"
                   :key="`evidence-${box.id}`"
@@ -549,8 +549,8 @@ onBeforeUnmount(() => {
             @retry-observation-adoption="retryObservationAdoption"
           />
           <div v-else class="viewer-report-empty">
-            <strong>分析报告</strong>
-            <p>在左侧图片上点选或框选区域，点击「分析选定区域」后，这里会显示文字识别结果、场景线索与区域质量。</p>
+            <strong>区域分析</strong>
+            <p>在左侧照片上点选或框选一处，点“分析选定区域”后，这里会显示识别结果。</p>
           </div>
         </div>
       </div>

@@ -46,9 +46,9 @@ const LEVEL_LABELS: Record<GuidedLocationLevel, string> = {
 }
 
 const STAGE_TITLES: Record<GuidedStage, string> = {
-  country: '先确认国家 / 地区',
+  country: '确认国家 / 地区',
   city: '确认城市',
-  resolved: '已确认城市',
+  resolved: '定位完成',
 }
 
 const LOCALIZED_DIMENSION_PATTERN = Object.values({
@@ -69,10 +69,10 @@ const LOCALIZED_DIMENSION_PATTERN = Object.values({
 }).join('|')
 
 const QUESTION_TITLES: Record<GuidedQuestion['kind'], string> = {
-  review_clue: '核对一条观察',
-  ask: '补充一项线索',
-  confirm_location: '确认地点层级',
-  request_clue: '补充可观察线索',
+  review_clue: '核对观察',
+  ask: '补充线索',
+  confirm_location: '确认地点',
+  request_clue: '补充线索',
 }
 
 export function guidedStageTitle(stage: GuidedStage): string {
@@ -145,7 +145,7 @@ export function guidedFreeTextReceiptOutcome(
   if (status === 'applied') return { status: 'applied' }
   return {
     status: 'unconfirmed',
-    error: '服务器未返回可识别的回执，请核对最新状态后重试。',
+    error: '没有收到确认，请核对后再试。',
   }
 }
 
@@ -209,17 +209,17 @@ export function guidedQuestionTitle(question: GuidedQuestion): string {
 /** Brief user-facing rationale for the one pending question. */
 export function guidedQuestionReason(question: GuidedQuestion): string {
   if (isCorrectionQuestion(question)) {
-    return '确认后才更新证据或排除记录。'
+    return '确认后才会更新结果。'
   }
   switch (question.kind) {
     case 'review_clue':
-      return '请帮我们判断这条观察是否准确；确认观察不等于确认地点。'
+      return '请判断这条观察是否准确。核对观察不会确认地点。'
     case 'ask':
-      return '这项信息有助于区分当前候选，请选择最符合照片的答案。'
+      return '这项信息有助于区分候选，请选择最符合照片的答案。'
     case 'confirm_location':
-      return '需要你明确确认当前层级；自由文本和排序结果都不会自动前进。'
+      return '请选择并确认；输入文字或排序不会自动前进。'
     case 'request_clue':
-      return '补充一项可观察线索有助于检索目录并缩小候选范围。'
+      return '补充线索有助于缩小候选范围。'
   }
 }
 
@@ -404,24 +404,24 @@ export function guidedQuestionMessage(
   // hidden until the candidate phase; blocking ask/correction prompts stay
   // readable in the review box so they can never be swallowed by the gate.
   if (!locationCandidatesVisible && question.kind === 'confirm_location') {
-    return '下一步将展示地点候选，选择合适的地点后再确认。'
+    return '下一步会显示地点候选，选择后再确认。'
   }
   if (question.kind !== 'review_clue' || !clue) return safeGuidedText(question.message)
   const dimension = clue.dimension || question.dimension || ''
   const value = clueValueLabel(clue.value)
   if (dimension === 'building') {
-    return `我们初步判断这是‘${value}’的建筑风格，您觉得准确吗？`
+    return `照片里的建筑像是‘${value}’，对吗？`
   }
   if (dimension === 'language') {
-    return `我们初步判断画面中的文字语言是‘${value}’，您觉得准确吗？`
+    return `照片里的文字像是‘${value}’，对吗？`
   }
   if (dimension === 'signage' || dimension === 'place_name') {
-    return `我们初步判断画面中出现了‘${value}’，这项观察准确吗？`
+    return `照片里出现了‘${value}’，对吗？`
   }
   if (dimension === 'driving_side') {
-    return `我们初步判断这里可能是‘${value}’，您觉得准确吗？`
+    return `这里可能是‘${value}’，对吗？`
   }
-  return `我们初步判断这是‘${value}’的${dimensionLabel(dimension)}，您觉得准确吗？`
+  return `照片里的${dimensionLabel(dimension)}像是‘${value}’，对吗？`
 }
 
 /** Explicit server provenance outranks every model score. */
@@ -691,16 +691,16 @@ export function guidedCandidateComposition(
 function scoreTypeLabel(scoreType: string | null | undefined): string {
   switch ((scoreType ?? '').trim()) {
     case 'city_text_cosine':
-      return '城市文本余弦排序'
+      return '文字匹配'
     case 'city_reference_hybrid':
-      return '参考图融合排序'
+      return '参考图匹配'
     case 'city_clue_fusion':
-      return '线索融合排序'
+      return '线索匹配'
     case 'city_scene_clue_fusion':
     case 'city_scene_model_similarity':
-      return '多维线索融合'
+      return '综合匹配'
     default:
-      return '匹配排序'
+      return '匹配'
   }
 }
 
@@ -836,7 +836,7 @@ export function guidedCityClueImpactSummary(candidate: LocationCandidate): strin
   const parts: string[] = []
   if (impact.baseScore !== null && impact.finalScore !== null) {
     parts.push(
-      `图像原分 ${impact.baseScore.toFixed(3)} → 线索后 ${impact.finalScore.toFixed(3)}（排序分，非概率）`,
+      `匹配分 ${impact.baseScore.toFixed(3)} → ${impact.finalScore.toFixed(3)}（不是概率）`,
     )
   }
   if (impact.rankDelta !== null) {
@@ -856,19 +856,19 @@ export function candidateScoreLabel(candidate: LocationCandidate): string {
   const score = candidate.score
   const scoreText =
     typeof score === 'number' && Number.isFinite(score)
-      ? `${scoreTypeLabel(candidate.score_type)} ${score.toFixed(3)}（排序分，非概率）`
+      ? `${scoreTypeLabel(candidate.score_type)} ${score.toFixed(3)}（不是概率）`
       : ''
   if (candidate.selection_basis === 'user_text') {
     return scoreText
-      ? `线索匹配候选 · 来自你提供的文字线索；${scoreText}`
-      : '线索匹配候选 · 来自你提供的文字线索（非模型概率）'
+      ? `线索匹配候选 · 来自你输入的文字；${scoreText}`
+      : '线索匹配候选 · 来自你输入的文字（不是概率）'
   }
   if (candidate.selection_basis === 'catalog_search') {
     return scoreText
-      ? `目录检索匹配 · 来自目录名称查询；${scoreText}`
-      : '目录检索匹配 · 来自目录名称查询（非模型概率）'
+      ? `目录检索匹配 · 来自目录名称；${scoreText}`
+      : '目录检索匹配 · 来自目录名称（不是概率）'
   }
-  return scoreText || '目录候选（无模型评分）'
+  return scoreText || '目录候选'
 }
 
 export function candidatePointLabel(target: LocationTarget): string {
@@ -885,7 +885,7 @@ export function candidatePointLabel(target: LocationTarget): string {
     lng <= 180 &&
     !(Math.abs(lat) < 1e-9 && Math.abs(lng) < 1e-9)
   if (!hasPoint) return ''
-  return '坐标为代表点，非照片 GPS'
+  return '地图位置，不是照片 GPS'
 }
 
 export function pendingQuestionClue(dialogue: GuidedDialogue): ReviewedClue | null {

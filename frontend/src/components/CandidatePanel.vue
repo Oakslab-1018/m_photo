@@ -125,35 +125,29 @@ const guidedCandidateLevelName = computed(() =>
 const guidedSectionNote = computed(() => {
   const composition = guidedComposition.value
   if (composition.hasUserText) {
-    return composition.mixed ? '线索匹配优先 · 其余按排序分' : '线索匹配候选'
+    return composition.mixed ? '含线索匹配' : '线索匹配候选'
   }
   if (composition.hasCatalogSearch) {
-    return composition.mixed ? '目录检索优先 · 其余按排序分' : '目录检索候选'
+    return composition.mixed ? '含目录检索' : '目录检索候选'
   }
-  if (composition.hasModelScores) return '候选可信度前五'
-  return `目录候选（当前显示 ${guidedTopCandidates.value.length} 项）`
+  if (composition.hasModelScores) return '候选前五'
+  return `目录候选（${guidedTopCandidates.value.length} 项）`
 })
 const guidedSectionHint = computed(() => {
   const composition = guidedComposition.value
   if (!props.guidedConfirmationReady) {
-    return composition.hasModelScores && !composition.hasExplicitSelectionBasis
-      ? '新增观察待核对，排名仍可查看，但暂不能确认或排除地点。'
-      : '新增观察待核对，候选仍可查看，但暂不能确认或排除地点。'
+    return '有新的观察待核对，暂时不能确认或排除。'
   }
   if (composition.hasUserText) {
-    return composition.mixed
-      ? '带“线索匹配候选”的条目来自你提供的文字线索，优先展示且不是模型概率；其余条目保留真实排序分。'
-      : '带“线索匹配候选”的条目来自你提供的文字线索，优先展示且不是模型概率。'
+    return '标有“线索匹配候选”的条目来自你输入的文字。'
   }
   if (composition.hasCatalogSearch) {
-    return composition.mixed
-      ? '目录检索命中优先展示且不是模型概率；其余条目保留真实排序分。'
-      : '目录检索命中优先展示，不是模型概率。'
+    return '目录检索命中的条目优先显示。'
   }
   if (composition.hasModelScores) {
-    return '候选可信度前五 · 排序分仅供参考，不代表概率'
+    return '匹配度仅供参考。'
   }
-  return `按目录顺序展示，可输入${guidedCandidateLevelName.value}名称查找更多；尚无图像评分，不代表最可能的五个`
+  return `按目录顺序显示；可输入${guidedCandidateLevelName.value}名称，或补充照片里的线索。`
 })
 const countryCount = computed(() =>
   props.guidedMode
@@ -282,8 +276,8 @@ function isForeignCitySelection(): boolean {
         type="button"
         class="tabs-toggle"
         :aria-expanded="!collapsed"
-        :aria-label="collapsed ? '展开推理面板' : '收起推理面板'"
-        :title="collapsed ? '展开推理面板' : '收起推理面板'"
+        :aria-label="collapsed ? '展开候选面板' : '收起候选面板'"
+        :title="collapsed ? '展开候选面板' : '收起候选面板'"
         @click="emit('toggle-collapse')"
       >
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true" :class="{ open: !collapsed }">
@@ -295,17 +289,17 @@ function isForeignCitySelection(): boolean {
     <div v-if="surface !== 'references'" v-show="activeTab === 'country' && !collapsed" class="candidate-body">
       <template v-if="guidedMode">
         <div v-if="guidedDataReady === false" class="candidate-empty">
-          正在读取服务器保存的引导状态…
-          <span class="next">加载完成前不会显示旧的国家 / 地区候选</span>
+          正在加载…
+          <span class="next">加载完成前不会显示旧候选</span>
         </div>
         <div v-else-if="!guidedCandidatesUnlocked" class="candidate-empty candidate-locked">
-          先核对观察，再查看地点候选
-          <span class="next">处理完待核对观察后，这里会显示当前层级的候选。</span>
+          先核对观察，再查看候选
+          <span class="next">核对完成后，这里会显示候选。</span>
         </div>
         <template v-else>
           <div v-if="!guidedTopCandidates.length" class="candidate-empty">
-            暂无当前层级的地点候选
-            <span class="next">可通过下方对话补充线索，或直接输入地名检索目录</span>
+            暂无候选
+            <span class="next">可在下方补充线索，或直接输入地名。</span>
           </div>
           <template v-else>
             <div class="panel-hint">{{ guidedSectionNote }}</div>
@@ -352,11 +346,11 @@ function isForeignCitySelection(): boolean {
       <template v-else>
         <div v-if="!scores.length" class="candidate-empty">
           暂无候选国家
-          <span class="next">先上传照片并完成推理</span>
+          <span class="next">先上传照片并完成分析</span>
         </div>
         <template v-else>
           <div class="panel-hint">
-            按序候选 · 代表点不是照片 GPS；确认需二次确认
+            按顺序排列 · 地图位置不是照片 GPS · 确认前会再次询问
           </div>
           <article
             v-for="(candidate, index) in scores"
@@ -376,9 +370,9 @@ function isForeignCitySelection(): boolean {
                 <div class="candidate-name">
                   {{ displayCountryName(candidate) }}
                   <span v-if="regionScopeLabel(candidate)" class="tag region">
-                    区域命中 · {{ regionScopeLabel(candidate) }}
+                    地区 · {{ regionScopeLabel(candidate) }}
                   </span>
-                  <span v-if="confirmedIso === candidate.iso" class="tag">已确认国家</span>
+                  <span v-if="confirmedIso === candidate.iso" class="tag">已确认</span>
                 </div>
                 <div class="candidate-score">{{ scoreLabel(candidate) }}</div>
               </div>
@@ -401,7 +395,7 @@ function isForeignCitySelection(): boolean {
           <div v-if="exclusions.length" class="exclusion-note">
             <span class="exclusion-prefix">已排除</span>
             <span v-for="item in exclusions" :key="item.iso" class="exclusion-chip">{{ item.label }}</span>
-            <span class="exclusion-hint">区域排除仅影响该地区</span>
+            <span class="exclusion-hint">只影响该地区</span>
           </div>
         </template>
       </template>
@@ -409,12 +403,12 @@ function isForeignCitySelection(): boolean {
 
     <div v-if="surface !== 'references' && !guidedMode" v-show="activeTab === 'city' && !collapsed" class="candidate-body">
       <div v-if="guidedMode && guidedDataReady === false" class="candidate-empty">
-        正在读取服务器保存的引导状态…
+        正在加载…
         <span class="next">加载完成前不会显示旧的城市候选</span>
       </div>
       <div v-else-if="guidedMode && !guidedCandidatesUnlocked" class="candidate-empty candidate-locked">
         先核对观察，再查看城市候选
-        <span class="next">国家 / 地区与城市候选会在观察核对完成后显示。</span>
+        <span class="next">核对完成后会显示城市候选。</span>
       </div>
       <template v-else>
       <div class="city-toolbar">
@@ -437,25 +431,25 @@ function isForeignCitySelection(): boolean {
           </select>
         </label>
         <div class="panel-hint">
-          {{ confirmedIso ? '优先已确认国家，可浏览其他国家/地区（浏览不改变确认）' : '国家/地区选择仅为查询城市候选，不代表确认' }}
+          {{ confirmedIso ? '已选国家的城市优先；切换国家只改变查询，不改变确认' : '只用于查询城市，不会确认国家' }}
         </div>
         <button type="button" class="ghost-btn" :disabled="!cityPickerIso || cityBusy || busy" @click="requestCities">
-          {{ cityBusy ? '查询中…' : '查询城市候选' }}
+          {{ cityBusy ? '查询中…' : '查询城市' }}
         </button>
       </div>
       <div v-if="isForeignCitySelection()" class="inline-note">
-        正在查看「{{ cityPickerIso }}」的城市候选，此前结果可能属于其他国家/地区。
+        正在查看「{{ cityPickerIso }}」的城市，之前的结果可能属于别的国家。
       </div>
 
       <div v-if="cityNotice" class="inline-note">{{ cityNotice }}</div>
       <div v-if="!cityCount" class="candidate-empty">
         暂无城市候选
-        <span class="next">选择国家/地区后查询；城市仅为代表点，不是照片位置</span>
+        <span class="next">选择国家/地区后查询；城市位置是代表点，不是照片位置</span>
       </div>
       <template v-else>
         <div class="panel-hint">
           {{ cityScopeName }}<template v-if="cityFilterLabel"> · {{ cityFilterLabel }}</template>
-          城市候选代表点 · 非照片定位 · 共 {{ cityCount }} 个
+          · 共 {{ cityCount }} 个 · 位置不是照片 GPS
         </div>
         <article v-for="city in cityScores" :key="city.city_id" class="candidate-card city-card">
           <div class="candidate-main">
@@ -467,7 +461,7 @@ function isForeignCitySelection(): boolean {
               </div>
               <div class="candidate-score">{{ city.region }} · {{ cityScoreLabel(city) }}</div>
               <div v-if="cityMatchedClueCount(city)" class="candidate-score city-clues">
-                命中线索 {{ cityMatchedClueCount(city) }} 条（排序诊断，非概率）
+                匹配 {{ cityMatchedClueCount(city) }} 条线索
               </div>
             </div>
           </div>
@@ -478,11 +472,11 @@ function isForeignCitySelection(): boolean {
 
     <div v-if="surface !== 'candidates'" v-show="activeTab === 'reference' && !collapsed" class="candidate-body reference-tab">
       <div v-if="guidedMode && guidedDataReady === false" class="candidate-empty">
-        正在读取服务器保存的引导状态…
+        正在加载…
       </div>
       <div v-else-if="guidedMode && !guidedCandidatesUnlocked" class="candidate-empty candidate-locked">
-        先核对观察，再查看参考街景诊断
-        <span class="next">锁定期间的参考候选不会提前显示。</span>
+        先核对观察，再查看参考街景
+        <span class="next">核对完成前，参考候选不会提前显示。</span>
       </div>
       <ReferenceMatches v-else :scores="scores" />
     </div>

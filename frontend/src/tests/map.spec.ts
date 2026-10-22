@@ -71,20 +71,20 @@ describe('country marker hemispheres', () => {
     expect(candidate.title).not.toContain('已确认拍摄地')
 
     const [confirmed] = toMapMarkers(scores, 'GB')
-    expect(confirmed.title).toContain('用户已确认的国家')
-    expect(confirmed.title).toContain('非照片 GPS')
+    expect(confirmed.title).toContain('已确认国家')
+    expect(confirmed.title).toContain('不是照片 GPS')
     expect(confirmed.title).not.toContain('已确认拍摄地')
   })
 })
 
 describe('non-probabilistic evidence display', () => {
   const base = { iso: 'JP', name: 'Japan', name_zh: '日本', score: 1, lat: 0, lng: 0 }
-  it('shows raw cosine, not an artificial 100 percent', () => {
-    expect(scoreLabel({ ...base, raw_cosine: 0.27432 })).toBe('余弦相似度 0.274')
-    expect(scoreLabel(base)).toBe('规则权重 1.000')
+  it('shows raw image similarity, not an artificial 100 percent', () => {
+    expect(scoreLabel({ ...base, raw_cosine: 0.27432 })).toBe('图片相似度 0.274')
+    expect(scoreLabel(base)).toBe('规则匹配 1.000')
   })
 
-  it('shows composite and full-image cosine distinctly for hybrid_rank', () => {
+  it('shows composite and full-image similarity distinctly for hybrid_rank', () => {
     const hybrid = {
       ...base,
       score: 0.412,
@@ -93,10 +93,10 @@ describe('non-probabilistic evidence display', () => {
       fusion: { streetclip: 0.274, rules: 0.138 },
     }
     const label = scoreLabel(hybrid)
-    expect(label).toContain('融合排序 0.412')
-    expect(label).toContain('全图余弦 0.274')
-    expect(label).toContain('非概率')
+    expect(label).toContain('综合匹配 0.412')
+    expect(label).toContain('图片相似度 0.274')
+    expect(label).toContain('不是概率')
     expect(label).not.toContain('%')
-    expect(label).not.toBe(`余弦相似度 ${hybrid.raw_cosine.toFixed(3)}`)
+    expect(label).not.toBe(`图片相似度 ${hybrid.raw_cosine.toFixed(3)}`)
   })
 })

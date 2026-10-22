@@ -85,7 +85,7 @@ describe('topReferenceMatches', () => {
 
   it('never presents cosine similarity as a probability or percentage', () => {
     expect(REFERENCE_MATCH_DISCLAIMER).toContain('不是照片定位或 GPS')
-    expect(formatReferenceCosine(0.5)).toBe('余弦 0.500（非概率）')
+    expect(formatReferenceCosine(0.5)).toBe('相似度 0.500（不是概率）')
     expect(formatReferenceCosine(null)).toBeNull()
     expect(formatReferenceCosine(Number.NaN)).toBeNull()
     expect(REFERENCE_SIMILARITY_SEMANTICS).toContain('不是地点概率');

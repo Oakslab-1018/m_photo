@@ -57,18 +57,18 @@ export function scoreLabel(score: CountryScore): string {
 
   if (score.is_grouped || score.fusion?.aggregation === 'max') {
     return rawCosine != null
-      ? `地区汇总排序 ${composite.toFixed(3)} · 来源余弦 ${rawCosine.toFixed(3)}（非概率）`
-      : `地区汇总权重 ${composite.toFixed(3)}（非概率）`
+      ? `地区匹配 ${composite.toFixed(3)} · 图片相似度 ${rawCosine.toFixed(3)}（不是概率）`
+      : `地区匹配 ${composite.toFixed(3)}（不是概率）`
   }
   if (score.score_type === 'hybrid_rank') {
     // Composite fusion score must never be presented as a lone cosine/probability.
     return rawCosine != null
-      ? `融合排序 ${composite.toFixed(3)} · 全图余弦 ${rawCosine.toFixed(3)}（非概率）`
-      : `融合排序 ${composite.toFixed(3)}（非概率）`
+      ? `综合匹配 ${composite.toFixed(3)} · 图片相似度 ${rawCosine.toFixed(3)}（不是概率）`
+      : `综合匹配 ${composite.toFixed(3)}（不是概率）`
   }
 
   if (rawCosine != null) {
-    return `余弦相似度 ${rawCosine.toFixed(3)}`
+    return `图片相似度 ${rawCosine.toFixed(3)}`
   }
-  return `规则权重 ${composite.toFixed(3)}`
+  return `规则匹配 ${composite.toFixed(3)}`
 }

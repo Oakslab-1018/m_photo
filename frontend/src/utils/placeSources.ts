@@ -7,10 +7,10 @@ import type {
 
 const SOURCE_TYPE_LABELS: Record<PlaceSourceType, string> = {
   local_catalog: '本地地名库',
-  local_poi: '本地POI库',
+  local_poi: '本地地点库',
   local_road: '本地道路库',
-  web_search: '联网网页检索',
-  geocoder: '联网地名检索',
+  web_search: '网页来源',
+  geocoder: '地图检索',
 }
 
 const LOCAL_SOURCE_TYPES = new Set<PlaceSourceType>([
@@ -22,8 +22,8 @@ const LOCAL_SOURCE_TYPES = new Set<PlaceSourceType>([
 const WEB_SOURCE_TYPES = new Set<PlaceSourceType>(['web_search', 'geocoder'])
 
 const OBSERVATION_SOURCE_LABELS: Record<PlaceObservationSource, string> = {
-  ocr: 'OCR文字',
-  user: '用户补充',
+  ocr: '图片文字',
+  user: '你补充的',
 }
 
 const CONTROL_CHARACTERS = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g
@@ -221,8 +221,8 @@ export function mergePlaceMatches(
 export function placeSourceTypeLabel(source: PlaceSource): string {
   const type = knownSourceType(source.source_type)
   if (type) return SOURCE_TYPE_LABELS[type]
-  if (safeHttpSourceUrl(source.url)) return '联网来源'
-  return '来源待核实'
+  if (safeHttpSourceUrl(source.url)) return '网页来源'
+  return '待核实'
 }
 
 export function isWebPlaceSource(source: PlaceSource): boolean {
@@ -257,8 +257,7 @@ export function placeMatchVerificationLabel(match: PlaceMatch | null | undefined
   const networkSource = normalizePlaceSources(match?.sources).some(
     (source) => placeSourceGroup(source) === 'web',
   )
-  return networkKind || networkSource ? '联网候选 · 待验证' : '地点候选 · 待验证'
-}
+  return networkKind || networkSource ? '联网候选 · 待验证' : '地点候选 · 待验证'}
 
 export function observationSourceLabel(source: PlaceSource): string {
   const observation = knownObservationSource(source.observation_source)
@@ -269,10 +268,10 @@ export function legacyPlaceSourceLabel(value: unknown): string {
   const text = cleanText(value)
   if (!text) return ''
   const sourceType = knownSourceType(text)
-  if (sourceType) return `检索来源：${SOURCE_TYPE_LABELS[sourceType]}`
+  if (sourceType) return `来源：${SOURCE_TYPE_LABELS[sourceType]}`
   const observation = knownObservationSource(text)
-  if (observation) return `文字来源：${OBSERVATION_SOURCE_LABELS[observation]}`
-  if (safeHttpSourceUrl(text)) return '检索来源：联网来源'
+  if (observation) return `文字来自：${OBSERVATION_SOURCE_LABELS[observation]}`
+  if (safeHttpSourceUrl(text)) return '来源：网页'
   if (/^[a-z][a-z0-9_.:-]*$/i.test(text)) return '来源待核实'
   return `来源：${boundedSourceText(text, 160)}`
 }

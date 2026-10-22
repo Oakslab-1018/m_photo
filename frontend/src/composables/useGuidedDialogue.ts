@@ -121,11 +121,11 @@ function describePendingOperation(
     case 'backtrack':
       return { kind: event.type, label: '正在返回上一层级…' }
     case 'free_text':
-      return { kind: event.type, label: '正在解析补充线索…' }
+      return { kind: event.type, label: '正在理解你补充的线索…' }
     case 'adopt_observation':
-      return { kind: event.type, label: '正在确认 OCR 文字并检索地点…' }
+      return { kind: event.type, label: '正在用这段文字查询地点…' }
     default:
-      return { kind: event.type, label: '正在提交引导操作…' }
+      return { kind: event.type, label: '正在提交…' }
   }
 }
 
@@ -133,18 +133,18 @@ function validateEvent(input: GuidedEventInput): string | null {
   switch (input.type) {
     case 'confirm_location':
     case 'reject_location':
-      if (!input.target) return '请选择一个后端返回的地点候选。'
+      if (!input.target) return '请选择一个地点候选。'
       return null
     case 'confirm_clue':
     case 'reject_clue':
       if (!input.clue_id?.trim()) return '缺少要核对的线索。'
       return null
     case 'answer':
-      if (!input.question_id?.trim()) return '当前没有可回答的问题，请先重新加载。'
+      if (!input.question_id?.trim()) return '现在没有可回答的问题，请重新加载。'
       if (!input.value?.trim()) return '请选择一个答案。'
       return null
     case 'unknown':
-      if (!input.question_id?.trim()) return '当前没有可标记为不确定的问题。'
+      if (!input.question_id?.trim()) return '现在没有可标记的问题。'
       return null
     case 'retract':
       if (!input.target && !input.clue_id?.trim()) return '缺少要撤回的排除项。'
@@ -153,11 +153,11 @@ function validateEvent(input: GuidedEventInput): string | null {
       if (!input.level) return '缺少要返回的层级。'
       return null
     case 'free_text':
-      if (!input.text?.trim()) return '请输入文字线索或目录名称。'
+      if (!input.text?.trim()) return '请输入线索或地名。'
       return null
     case 'adopt_observation':
       if (!input.report_id?.trim() || !input.observation_id?.trim()) {
-        return '缺少区域报告或 OCR 观察。'
+        return '找不到这段文字，请重新分析区域。'
       }
       return null
   }
@@ -344,7 +344,7 @@ export function useGuidedDialogue(
 
   function applyResponse(response: GuidedDialogueResponse): void {
     if (!response?.dialogue || typeof response.dialogue.revision !== 'number') {
-      throw new ApiError({ message: '后端返回的引导状态不完整，请重试' })
+      throw new ApiError({ message: '返回的数据不完整，请重试' })
     }
     const previous = dialogue.value
     const previousIds = new Set(previous?.clues.map((clue) => clue.id) ?? [])
@@ -417,13 +417,13 @@ export function useGuidedDialogue(
   /** Explicit 下一步: only flips the UI phase, never sends an event. */
   function nextPhase(): boolean {
     if (!active.value || !dialogue.value) {
-      error.value = '引导状态尚未就绪，请先重新加载。'
+      error.value = '定位还没准备好，请先重新加载。'
       return false
     }
     if (!reviewReady.value) {
       error.value = hasPendingClues.value
-        ? `请先处理上方 ${pendingClueCount.value} 条待核对观察。`
-        : '请先完成当前阻塞问题，再查看地点候选。'
+        ? `请先处理上方 ${pendingClueCount.value} 条观察。`
+        : '请先完成当前问题，再查看地点候选。'
       return false
     }
     phase.value = 'candidates'
@@ -457,7 +457,7 @@ export function useGuidedDialogue(
   function backtrackPrevious(): Promise<boolean> {
     const level = previousLevel.value
     if (!level) {
-      error.value = '当前已是最初的层级，无法再返回。'
+      error.value = '已经是第一层，不能再返回。'
       return Promise.resolve(false)
     }
     return backtrack(level)
@@ -466,7 +466,7 @@ export function useGuidedDialogue(
   async function start(id?: number | null): Promise<boolean> {
     const target = id ?? activeSessionId.value ?? sessionId.value
     if (target === null || target === undefined) {
-      error.value = '当前没有会话，请先上传图片。'
+      error.value = '请先上传照片。'
       return false
     }
 
@@ -499,7 +499,7 @@ export function useGuidedDialogue(
       return true
     } catch (caught) {
       if (!isCurrent(token, target)) return false
-      error.value = normalizeApiError(caught, undefined, '引导定位启动失败，请重试').message
+      error.value = normalizeApiError(caught, undefined, '定位启动失败，请重试').message
       return false
     } finally {
       if (isCurrent(token, target)) loading.value = false
@@ -536,7 +536,7 @@ export function useGuidedDialogue(
       return true
     } catch (caught) {
       if (!isCurrent(token, target)) return false
-      error.value = normalizeApiError(caught, undefined, '无法读取引导状态，请重试').message
+      error.value = normalizeApiError(caught, undefined, '无法读取定位状态，请重试').message
       return false
     } finally {
       if (isCurrent(token, target)) {
@@ -637,7 +637,7 @@ export function useGuidedDialogue(
       const status = errorStatus(caught)
 
       if (status === 409) {
-        conflict.value = '服务端状态已更新，已重新加载；请核对最新引导后手动重试。'
+        conflict.value = '状态已更新，请核对最新结果后重试。'
         failedEvent.value = event
         failedQuestion.value = questionContext
         retryable.value = true
@@ -649,22 +649,22 @@ export function useGuidedDialogue(
         if (!reloaded || !canRetryFailedEvent(event, questionContext)) {
           discardFailedEvent(
             reloaded
-              ? '引导问题已更新，原操作已丢弃；请按最新问题重新操作。'
-              : '无法确认最新引导状态，原操作已丢弃；请重新加载后再试。',
+              ? '问题已更新，请按最新问题重新操作。'
+              : '无法确认最新状态，请重新加载后再试。',
           )
         }
         return false
       }
 
       if (status === 422) {
-        error.value = '当前操作与最新引导状态不一致，请按最新选项重新操作。'
+        error.value = '当前操作与最新状态不一致，请按最新选项重新操作。'
         failedEvent.value = null
         failedQuestion.value = null
         retryable.value = false
         return false
       }
 
-      error.value = normalizeApiError(caught, undefined, '引导操作失败，请稍后重试').message
+      error.value = normalizeApiError(caught, undefined, '操作失败，请稍后重试').message
       failedEvent.value = event
       failedQuestion.value = questionContext
       retryable.value = isRetryableStatus(status)
@@ -680,24 +680,24 @@ export function useGuidedDialogue(
   function send(input: GuidedEventInput): Promise<boolean> {
     const current = dialogue.value
     if (!active.value || !current) {
-      error.value = '引导状态尚未就绪，请先重新加载。'
+      error.value = '定位还没准备好，请重新加载。'
       return Promise.resolve(false)
     }
 
     if (input.type === 'confirm_location' || input.type === 'reject_location') {
       if (!locationConfirmationReady.value) {
         error.value = hasPendingClues.value
-          ? `请先处理上方 ${pendingClueCount.value} 条待核对观察，再选择地点。`
+          ? `请先处理上方 ${pendingClueCount.value} 条观察，再选择地点。`
           : phase.value === 'review'
-            ? '请先完成观察核对并点击“下一步”，再选择地点。'
-            : '地点候选尚未就绪，请先重新加载引导状态。'
+            ? '请先完成核对并点“下一步”，再选择地点。'
+            : '地点候选还没准备好，请重新加载。'
         return Promise.resolve(false)
       }
       if (
         input.target &&
         !actionableCandidates.value.some((candidate) => sameTarget(candidate.target, input.target as GuidedTargetRef))
       ) {
-        error.value = '该地点不在当前前五候选中，请从页面显示的候选重新选择。'
+        error.value = '这个地点不在当前候选中，请重新选择。'
         return Promise.resolve(false)
       }
     }
@@ -760,7 +760,7 @@ export function useGuidedDialogue(
   function confirmCountry(iso: string): Promise<boolean> {
     const target = targetForCountry(iso)
     if (!target) {
-      error.value = '该国家 / 地区不在当前引导候选中，请使用主引导面板的服务器候选。'
+      error.value = '这个国家 / 地区不在当前候选中，请从上方选择。'
       return Promise.resolve(false)
     }
     return confirmLocation(target)
@@ -769,7 +769,7 @@ export function useGuidedDialogue(
   function rejectCountry(iso: string): Promise<boolean> {
     const target = targetForCountry(iso)
     if (!target) {
-      error.value = '该国家 / 地区不在当前引导候选中，请使用主引导面板的服务器候选。'
+      error.value = '这个国家 / 地区不在当前候选中，请从上方选择。'
       return Promise.resolve(false)
     }
     return rejectLocation(target)
@@ -794,7 +794,7 @@ export function useGuidedDialogue(
   function answer(value: string, questionId?: string): Promise<boolean> {
     const id = questionId ?? dialogue.value?.pending_question?.id
     if (!id) {
-      error.value = '当前没有可回答的问题。'
+      error.value = '现在没有需要回答的问题。'
       return Promise.resolve(false)
     }
     return send({ type: 'answer', value, question_id: id })
@@ -808,7 +808,7 @@ export function useGuidedDialogue(
     // skip a review observation as well as a blocking ask/correction, but
     // never a location confirmation.
     if (!id || !question || question.kind === 'confirm_location') {
-      error.value = '当前没有可标记为不确定的问题。'
+      error.value = '现在没有可标记的问题。'
       return Promise.resolve(false)
     }
     return send({ type: 'unknown', question_id: id })
@@ -838,18 +838,18 @@ export function useGuidedDialogue(
     const report = reportId.trim()
     const observation = observationId.trim()
     if (!report || !observation) {
-      error.value = '缺少区域报告或 OCR 观察。'
+      error.value = '找不到这段文字，请重新分析区域。'
       return false
     }
 
     if (!active.value || !dialogue.value) {
       if (loading.value || applying.value) {
-        error.value = '引导状态正在初始化，请稍后再试。'
+        error.value = '正在准备，请稍后再试。'
         return false
       }
       const target = sessionId.value
       if (target === null || target === undefined) {
-        error.value = '当前没有会话，请先上传图片。'
+        error.value = '请先上传照片。'
         return false
       }
       const started = await start(target)
@@ -902,7 +902,7 @@ export function useGuidedDialogue(
     if (revision === undefined) {
       const reloaded = await reload(true)
       if (!reloaded) {
-        discardFailedEvent('无法确认最新引导状态，原操作已丢弃；请重新加载后再试。')
+        discardFailedEvent('无法确认最新状态，请重新加载后再试。')
         return false
       }
       revision = dialogue.value?.revision
@@ -910,7 +910,7 @@ export function useGuidedDialogue(
     if (revision === undefined) return false
 
     if (!canRetryFailedEvent(event, failedQuestion.value)) {
-      discardFailedEvent('引导问题已更新，原操作已丢弃；请按最新问题重新操作。')
+      discardFailedEvent('问题已更新，请按最新问题重新操作。')
       return false
     }
     return performEvent({ ...event, expected_revision: revision }, failedQuestion.value)

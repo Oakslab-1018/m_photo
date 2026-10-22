@@ -35,11 +35,11 @@ describe('ClueList rendering (SSR)', () => {
     expect(html).toMatch(/<strong[^>]*>3<\/strong> 个维度/)
     expect(html).toMatch(/<strong[^>]*>8<\/strong> 条线索/)
     expect(html).toContain('展开其余 2 条')
-    expect(html).toContain('用户补充')
-    expect(html).toContain('OCR 识别')
+    expect(html).toContain('你补充的')
+    expect(html).toContain('图片文字')
     expect(html).toContain('识别置信度 70%')
     expect(html).toContain('线索置信度 90%')
-    expect(html).toContain('不代表地点概率')
+    expect(html).toContain('不是地点概率')
   })
 
   it('marks reference-only clues and catalog-validated clues distinctly', async () => {
@@ -67,7 +67,7 @@ describe('ClueList rendering (SSR)', () => {
 
   it('shows the empty hint when no clues arrive', async () => {
     const html = await render(ClueList, { clues: [] })
-    expect(html).toContain('也可在对话中手动补充')
+    expect(html).toContain('上传照片后会自动识别线索。')
     expect(html).not.toContain('展开其余')
   })
 
@@ -120,7 +120,7 @@ describe('ClueList rendering (SSR)', () => {
 
     expect(html).toMatch(/class="ev"[^>]*>这是一条简短证据/)
     expect(html).toContain('class="clue-evidence-details"')
-    expect(html).toMatch(/<summary[^>]*>查看证据详情<\/summary>/)
+    expect(html).toMatch(/<summary[^>]*>查看依据<\/summary>/)
   })
 
   it('offers source-region jumps only for valid backend boxes', async () => {
@@ -150,8 +150,8 @@ describe('ClueList rendering (SSR)', () => {
       ],
     })
 
-    expect(html.match(/查看原图位置/g)).toHaveLength(2)
-    expect(html).toContain('查看原图位置')
+    expect(html.match(/class="locate-clue"/g)).toHaveLength(2)
+    expect(html).toContain('在照片中查看')
   })
 })
 
@@ -174,9 +174,9 @@ describe('ImageViewer evidence focus (SSR)', () => {
     })
 
     expect(html).toContain('class="focused-clue-box"')
-    expect(html).toContain('OCR 识别 · 来源区域')
-    expect(html).toContain('线索：出口（OCR 识别）')
-    expect(html).toContain('尚未选择区域')
+    expect(html).toContain('图片文字 · 来源区域')
+    expect(html).toContain('线索：出口（图片文字）')
+    expect(html).toContain('还没选择区域')
   })
 
   it('does not render source geometry when the focused clue has no real box', async () => {
@@ -216,7 +216,7 @@ describe('FeedbackBar rendering (SSR)', () => {
     expect(html).toContain('日语')
     expect(html).toContain('option-chip')
     expect(html).toContain('<textarea')
-    expect(html).toContain('我来补充（气候特征）')
+    expect(html).toContain('补充线索（气候特征）')
   })
 
   it('keeps confirm/reject affordances for confirm actions', async () => {
@@ -247,8 +247,8 @@ describe('FeedbackBar rendering (SSR)', () => {
       action: { kind: 'result', payload: { iso: 'JP', confidence } },
       busy: false,
     })
-    expect(html).toContain('高置信：已给出最佳匹配')
-    expect(html).toContain('已给出高置信国家判断，仍需您明确确认')
+    expect(html).toContain('已找到最可能的国家，请确认。')
+    expect(html).toContain('已给出最可能的国家，仍需你确认')
   })
 })
 

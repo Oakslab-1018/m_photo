@@ -88,11 +88,11 @@ let singleClickTimer: ReturnType<typeof setTimeout> | null = null
 function retryBasemap(): void {
   try {
     if (!lifecycle?.retryStyle()) {
-      mapError.value = '底图尚未就绪，暂时无法重试'
+      mapError.value = '地图还没准备好，请稍后重试'
       return
     }
   } catch (error) {
-    mapError.value = '底图样式重试失败，请稍后重试'
+    mapError.value = '地图加载失败，请稍后重试'
     console.warn('MapLibre retry failed', error)
   }
 }
@@ -196,9 +196,9 @@ const guidedMissingNote = computed(() => {
   if (!missing) return null
   const parentCount = guidedMap.value.fallbackPoints.length
   if (parentCount) {
-    return String(missing) + ' 个候选缺少有效目录坐标，未放置候选标记；选中后仅聚焦已确认父级范围'
+    return String(missing) + ' 个候选没有地图坐标，未显示标记；选中后会显示所属的已确认范围'
   }
-  return String(missing) + ' 个候选缺少有效目录坐标，未在地图放置标记'
+  return String(missing) + ' 个候选没有地图坐标，未显示标记'
 })
 
 const guidedSelectionNote = computed(() => {
@@ -208,9 +208,9 @@ const guidedSelectionNote = computed(() => {
   )
   if (!missing) return null
   const parent = nearestConfirmedParent()
-  if (!parent) return '此候选无有效目录坐标，当前没有可聚焦的已确认父级范围'
+  if (!parent) return '这个候选没有地图坐标，暂时无法定位'
   const parentLevel = parent.level ?? parent.kind
-  return '此候选无坐标，当前显示父级范围（' + locationLevelLabel(parentLevel) + ' · ' + parent.name + '）'
+  return '这个候选没有地图坐标，当前显示所属范围（' + locationLevelLabel(parentLevel) + ' · ' + parent.name + '）'
 })
 
 const guidedMapNotice = computed(() => guidedSelectionNote.value ?? guidedMissingNote.value)
@@ -227,10 +227,10 @@ function guidedCandidateNumber(point: MapPoint): number | null {
 
 function scoreText(point: MapPoint): string {
   if (point.isCurrentCandidate && typeof point.score === 'number' && Number.isFinite(point.score)) {
-    return ' · 排序分 ' + point.score.toFixed(3) + '（非概率）'
+    return ' · 匹配度 ' + point.score.toFixed(3) + '（不是概率）'
   }
   if (typeof point.cosine === 'number' && Number.isFinite(point.cosine)) {
-    return ' · 余弦 ' + point.cosine.toFixed(3) + '（非概率）'
+    return ' · 图片相似度 ' + point.cosine.toFixed(3) + '（不是概率）'
   }
   return ''
 }
@@ -246,36 +246,35 @@ function guidedPointTooltip(point: MapPoint): string {
   const score = scoreText(point)
 
   if (point.resolved) {
-    return '最终确认城市 ' + point.name + ' · 城市目录代表点，不是照片 GPS' + score
+    return '已确认城市 ' + point.name + ' · 位置是代表点，不是照片 GPS' + score
   }
   if (point.confirmed) {
-    const parentPrefix = isGuidedParentPoint(point) ? '已确认父级' : '已确认'
+    const parentPrefix = isGuidedParentPoint(point) ? '已确认的' : '已确认'
     return (
       parentPrefix +
       levelLabel +
       ' ' +
       point.name +
-      ' · 用户确认路径；坐标为代表点，不是照片 GPS' +
+      ' · 位置是代表点，不是照片 GPS' +
       score
     )
   }
   const actionHint = props.guidedConfirmationReady
     ? '双击确认'
-    : '完成新增观察核对后可双击确认'
+    : '核对新观察后才能确认'
   const candidateNumber = guidedCandidateNumber(point)
   const candidatePrefix = candidateNumber === null ? '候选' : '候选 ' + candidateNumber + ' · '
   if (level === 'city') {
-    return candidatePrefix + '城市 ' + point.name + ' · 城市目录代表点，不是照片 GPS' + score + ' · 单击选中，' + actionHint + '城市'
+    return candidatePrefix + '城市 ' + point.name + ' · 位置是代表点，不是照片 GPS' + score + ' · 单击选中，' + actionHint
   }
   return (
     candidatePrefix +
     '国家 / 地区 ' +
     point.name +
-    ' · 目录代表点，不是照片 GPS' +
+    ' · 位置是代表点，不是照片 GPS' +
     score +
     ' · 单击选中，' +
-    actionHint +
-    '国家 / 地区'
+    actionHint
   )
 }
 
@@ -317,10 +316,10 @@ function markerElement(point: MapPoint): HTMLElement {
   const tooltip = guidedMode.value
     ? guidedPointTooltip(point)
     : point.kind === 'city'
-      ? point.name + (point.subregion ? ' · ' + point.subregion : '') + ' · 城市代表点，不是照片位置' + scoreText(point)
+      ? point.name + (point.subregion ? ' · ' + point.subregion : '') + ' · 位置是代表点，不是照片 GPS' + scoreText(point)
       : point.name +
-        (point.subregion ? '（区域命中：' + point.subregion + '）' : '') +
-        (point.confirmed ? ' · 用户已确认的国家（非照片 GPS）' : '，单击选中，双击确认国家') +
+        (point.subregion ? '（区域：' + point.subregion + '）' : '') +
+        (point.confirmed ? ' · 已确认（不是照片 GPS）' : '，单击选中，双击确认') +
         scoreText(point)
   const level = point.level ?? point.kind
   const ariaLevel = locationLevelLabel(level)
@@ -512,8 +511,8 @@ onMounted(() => {
       viewportInsets: normalizedViewportInsets.value,
       onError: (failure) => {
         mapError.value = failure.kind === 'source'
-          ? '底图瓦片加载失败，请检查网络后重试'
-          : '底图样式加载失败，请检查网络或地图样式配置'
+          ? '地图加载失败，请检查网络后重试'
+          : '地图样式加载失败，请检查网络后重试'
         const error = failure.error as { message?: string } | undefined
         console.warn('MapLibre ' + failure.kind + ' error', error?.message ?? error)
       },
@@ -525,7 +524,7 @@ onMounted(() => {
     if (guidedMode.value) reframeGuided()
     else reframeLegacy()
   } catch (error) {
-    mapError.value = '地图初始化失败，请检查浏览器 WebGL 支持'
+    mapError.value = '地图无法显示，请确认浏览器支持 WebGL'
     console.warn('MapLibre init failed', error)
   }
 })
@@ -620,14 +619,14 @@ onBeforeUnmount(() => {
         class="maplibre-map geo-map__canvas"
         data-map-canvas
         role="application"
-        :aria-label="guidedMode ? '国家与城市引导候选代表点交互地图' : '候选国家与城市代表点交互地图'"
+        :aria-label="guidedMode ? '候选地图' : '候选国家与城市地图'"
       />
       <div v-if="styleConfig.demoOnly" class="map-badge demo geo-map__badge">
-        Demo 底图 · 仅开发预览，不可用于生产
+        Demo 底图 · 仅开发预览
       </div>
       <div class="geo-map__safe-center">
         <div v-if="!displayPoints.length" class="map-empty-overlay">
-          {{ guidedMode ? '当前阶段暂无坐标候选' : '上传照片后显示候选代表点' }}
+          {{ guidedMode ? '还没有可显示的地点' : '上传照片后显示候选地点' }}
         </div>
         <div v-if="mapError" class="map-error-overlay" role="status">
           <span>{{ mapError }}</span>
@@ -636,7 +635,7 @@ onBeforeUnmount(() => {
             class="ghost-btn map-error-overlay__retry"
             @click.stop="retryBasemap"
           >
-            重试底图
+            重试
           </button>
         </div>
       </div>
@@ -647,35 +646,35 @@ onBeforeUnmount(() => {
         {{ guidedMapNotice }}
       </div>
       <div v-if="guidedMode" class="map-legend">
-        <span><i class="legend-dot" />国家 / 地区候选</span>
-        <span><i class="legend-dot city" />城市候选</span>
-        <span><i class="legend-dot confirmed" />已确认路径</span>
-        <span v-if="guidedMap.fallbackPoints.length"><i class="legend-dot fallback" />已确认父级范围</span>
+        <span><i class="legend-dot" />国家 / 地区</span>
+        <span><i class="legend-dot city" />城市</span>
+        <span><i class="legend-dot confirmed" />已确认</span>
+        <span v-if="guidedMap.fallbackPoints.length"><i class="legend-dot fallback" />已确认范围</span>
       </div>
       <div v-else class="map-legend">
         <span><i class="legend-dot" />候选国家</span>
-        <span><i class="legend-dot city" />城市候选</span>
-        <span><i class="legend-dot confirmed" />用户已确认国家</span>
+        <span><i class="legend-dot city" />城市</span>
+        <span><i class="legend-dot confirmed" />已确认</span>
       </div>
       <span class="map-hint">
         {{ guidedMode
           ? (guidedConfirmationReady
-            ? '单击选中 · 双击确认 · 坐标为代表点，非照片 GPS'
-            : '待核对，暂不能确认 · 坐标为代表点，非照片 GPS')
-          : '单击选中 · 双击确认 · 代表点非照片 GPS' }}
+            ? '单击选中，双击确认 · 位置是代表点，不是照片 GPS'
+            : '核对完成前不能确认 · 位置是代表点，不是照片 GPS')
+          : '单击选中，双击确认 · 位置是代表点，不是照片 GPS' }}
       </span>
       <div class="focus-group">
         <template v-if="guidedMode">
           <button type="button" class="ghost-btn" :disabled="!displayPoints.length" @click="focusCurrentStage">
-            聚焦当前候选
+            显示当前候选
           </button>
           <button type="button" class="ghost-btn" :disabled="!hasConfirmedPathPoints" @click="focusConfirmedPath">
-            聚焦已确认路径
+            显示已确认路径
           </button>
         </template>
         <template v-else>
-          <button type="button" class="ghost-btn" :disabled="!countries.length" @click="focusCountries">聚焦国家</button>
-          <button type="button" class="ghost-btn" :disabled="!cities.length" @click="focusCities">聚焦城市</button>
+          <button type="button" class="ghost-btn" :disabled="!countries.length" @click="focusCountries">显示国家</button>
+          <button type="button" class="ghost-btn" :disabled="!cities.length" @click="focusCities">显示城市</button>
         </template>
       </div>
     </div>

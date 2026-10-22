@@ -157,10 +157,10 @@ describe('clue provenance', () => {
   })
 
   it('localizes provenance labels and treats unknown analyzers as heuristic', () => {
-    expect(clueSourceLabel({ dimension: 'language', value: 'ja', confidence: 0.9, source: 'user' })).toBe('用户补充')
-    expect(clueSourceLabel({ dimension: 'signage', value: '出口', confidence: 0.8, source: 'ocr' })).toBe('OCR 识别')
-    expect(clueSourceLabel({ dimension: 'vegetation', value: 'desert', confidence: 0.4, source: 'vegetation' })).toBe('启发式推断')
-    expect(clueSourceLabel({ dimension: 'other', value: 'x', confidence: 0.2, source: 'thermal' })).toBe('启发式推断')
+    expect(clueSourceLabel({ dimension: 'language', value: 'ja', confidence: 0.9, source: 'user' })).toBe('你补充的')
+    expect(clueSourceLabel({ dimension: 'signage', value: '出口', confidence: 0.8, source: 'ocr' })).toBe('图片文字')
+    expect(clueSourceLabel({ dimension: 'vegetation', value: 'desert', confidence: 0.4, source: 'vegetation' })).toBe('推断')
+    expect(clueSourceLabel({ dimension: 'other', value: 'x', confidence: 0.2, source: 'thermal' })).toBe('推断')
     expect(clueSourceLabel({ dimension: 'other', value: 'x', confidence: 0.2 })).toBe('')
   })
 })

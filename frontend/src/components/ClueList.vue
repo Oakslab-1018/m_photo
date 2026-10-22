@@ -149,14 +149,14 @@ function locateClue(clue: Clue): void {
 
 <template>
   <div ref="listRef" class="clue-list" aria-live="polite">
-    <div v-if="loading" class="empty-hint">正在提取线索…</div>
+    <div v-if="loading" class="empty-hint">正在分析照片…</div>
     <div v-else-if="!groups.length" class="empty-hint">
-      上传照片后自动提取线索，也可在对话中手动补充。
+      上传照片后会自动识别线索。
     </div>
     <template v-else>
       <div class="clue-overview">
         <span><strong>{{ groups.length }}</strong> 个维度 · <strong>{{ totalCount }}</strong> 条线索</span>
-        <span class="clue-overview-hint">按证据强度排序</span>
+        <span class="clue-overview-hint">按可靠度排序</span>
       </div>
       <details
         v-for="group in groups"
@@ -187,11 +187,11 @@ function locateClue(clue: Clue): void {
                   :data-provenance="clueProvenance(clue)"
                   :title="clue.source || undefined"
                 >{{ clueSourceLabel(clue) }}</span>
-                <span v-if="isReferenceOnly(clue)" class="tag reference-only" title="仅作观察展示，不参与排序">仅供参考</span>
+                <span v-if="isReferenceOnly(clue)" class="tag reference-only" title="仅供参考，不影响排序">仅供参考</span>
                 <span v-else-if="isCatalogValidated(clue)" class="tag validated" title="已按国家目录核对">目录已核对</span>
               </span>
             </div>
-            <div class="conf" title="置信度表示线索识别或推断的可靠度，不代表地点概率">
+            <div class="conf" title="表示线索识别或推断的可靠度，不是地点概率">
               <span class="conf-bar" aria-hidden="true">
                 <span class="conf-fill" :style="{ width: confidencePercent(clue.confidence) }" />
               </span>
@@ -201,14 +201,14 @@ function locateClue(clue: Clue): void {
               <button
                 type="button"
                 class="locate-clue"
-                title="在原始图片中定位后端标注的线索来源区域"
+                title="在照片中查看这条线索的来源位置"
                 @click.stop="locateClue(clue)"
-              >查看原图位置</button>
+              >在照片中查看</button>
             </div>
             <template v-if="evidenceText(clue)">
               <p v-if="!isLongEvidence(clue)" class="ev">{{ evidenceText(clue) }}</p>
               <details v-else class="clue-evidence-details">
-                <summary>查看证据详情</summary>
+                <summary>查看依据</summary>
                 <p class="ev">{{ evidenceText(clue) }}</p>
               </details>
             </template>

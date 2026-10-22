@@ -88,7 +88,7 @@ const cityBusy = ref(false)
 const errorMessage = ref<string | null>(null)
 const uploadNotice = ref<string | null>(null)
 const cityNotice = ref<string | null>(null)
-const pointStatus = ref('点选或框选区域后，点击“分析选定区域”；分析结果只作为线索。')
+const pointStatus = ref('在照片上点选或框选一处，然后点“分析选定区域”。')
 const pointStatusKind = ref<'idle' | 'loading' | 'success' | 'error'>('idle')
 const viewerOpen = ref(false)
 const focusedClue = ref<Clue | null>(null)
@@ -115,9 +115,9 @@ type MobileSheetState = 'peek' | 'half' | 'full'
 type EvidenceTab = 'photo' | 'clues' | 'references'
 
 const FOCUS_MODES: Array<{ key: FocusMode; label: string; hint: string }> = [
-  { key: 'collab', label: '协同', hint: '同时展开证据与推理' },
-  { key: 'map', label: '地图', hint: '收起两侧浮层，保留完整地图' },
-  { key: 'photo', label: '照片', hint: '展开证据台并收起推理' },
+  { key: 'collab', label: '全部', hint: '照片、地图和助手同时显示' },
+  { key: 'map', label: '地图', hint: '只看地图' },
+  { key: 'photo', label: '照片', hint: '只看照片和线索' },
 ]
 
 const commandBarRef = ref<HTMLElement | null>(null)
@@ -274,22 +274,22 @@ const countryOptions = computed(() => {
 const inferenceNotice = computed(() => safeGuidedText(session.inferenceNotice.value) || null)
 
 const sessionStatus = computed(() => {
-  if (uploading.value) return '分析中…'
+  if (uploading.value) return '正在分析照片…'
   if (guided.active.value) {
     const current = guided.dialogue.value
-    if (!current) return guided.loading.value ? '启动推理…' : '推理待重试'
+    if (!current) return guided.loading.value ? '正在准备…' : '加载失败，请重试'
     if (current.stage === 'resolved') {
-      return `完成 · ${targetLabel(current.confirmed.city)}`
+      return `已完成 · ${targetLabel(current.confirmed.city)}`
     }
     if (!guidedCandidateSurfaceVisible.value) {
-      if (guided.reviewReady.value) return '观察已核对'
+      if (guided.reviewReady.value) return '核对完成'
       const review = guided.reviewProgress.value
       return review
         ? `核对观察 ${review.current}/${review.total}`
-        : `待核对 ${guided.pendingClueCount.value} 条`
+        : `还要核对 ${guided.pendingClueCount.value} 条`
     }
     if (!guidedConfirmationReady.value) {
-      return `${guidedStageTitle(current.stage)} · 新增观察待核对`
+      return `${guidedStageTitle(current.stage)} · 有新观察待核对`
     }
     return `${guidedStageTitle(current.stage)} · ${guidedVisibleCandidates.value.length} 个候选`
   }
@@ -310,16 +310,14 @@ const countryBreadcrumb = computed(() => {
   if (guided.active.value) {
     return guidedCandidateSurfaceVisible.value ? '国家待确认' : '国家 / 地区'
   }
-  return hasSession.value ? '国家待确认' : '国家待定'
+  return hasSession.value ? '国家待确认' : '国家'
 })
 
 const cityBreadcrumb = computed(() => {
   const target = guided.dialogue.value?.confirmed.city
   if (target) return targetLabel(target)
   if (guided.active.value && guided.dialogue.value?.stage === 'city') return '城市待确认'
-  if (guided.active.value && guided.dialogue.value?.stage === 'resolved') return '城市已记录'
-  if (!guided.active.value && session.cityScores.value.length) return '城市诊断'
-  return '城市待定'
+  return '城市'
 })
 
 const historyAllowed = computed(
@@ -511,7 +509,7 @@ function onGlobalKeydown(event: KeyboardEvent): void {
 
 const liveStatus = computed<{ tone: FeedbackReceiptTone | 'info'; text: string }>(() => {
   const failed = pendingMessages.value.find((item) => item.status === 'failed')
-  if (failed) return { tone: 'warn', text: `发送失败：${failed.error ?? '未知错误'} · 可在对话中重试或删除` }
+  if (failed) return { tone: 'warn', text: `发送失败：${failed.error ?? '请重试'} · 可重试或删除` }
   if (guided.conflict.value) return { tone: 'warn', text: safeGuidedText(guided.conflict.value) }
   if (guided.error.value) return { tone: 'warn', text: safeGuidedText(guided.error.value) }
   if (
@@ -520,35 +518,35 @@ const liveStatus = computed<{ tone: FeedbackReceiptTone | 'info'; text: string }
   ) {
     return { tone: 'info', text: guided.pendingOperation.value.label }
   }
-  if (guided.applying.value) return { tone: 'info', text: '正在提交引导操作…' }
-  if (guided.loading.value) return { tone: 'info', text: '正在同步引导状态…' }
-  if (feedbackBusy.value) return { tone: 'info', text: '正在提交反馈，等待服务器回执…' }
-  if (uploading.value) return { tone: 'info', text: '正在分析图像…' }
+  if (guided.applying.value) return { tone: 'info', text: '正在处理…' }
+  if (guided.loading.value) return { tone: 'info', text: '正在加载…' }
+  if (feedbackBusy.value) return { tone: 'info', text: '正在发送…' }
+  if (uploading.value) return { tone: 'info', text: '正在分析照片…' }
   if (lastOutcome.value) return lastOutcome.value
   if (guided.active.value) {
     const current = guided.dialogue.value
-    if (!current) return { tone: 'muted', text: '等待引导状态' }
+    if (!current) return { tone: 'muted', text: '正在加载…' }
     if (current.stage === 'resolved') return { tone: 'ok', text: `已确认城市：${targetLabel(current.confirmed.city)}` }
     if (!guidedCandidateSurfaceVisible.value) {
       if (guided.reviewReady.value) {
-        return { tone: 'ok', text: '观察已核对 · 点击“下一步”查看候选' }
+        return { tone: 'ok', text: '核对完成 · 点“下一步”查看候选' }
       }
       const review = guided.reviewProgress.value
       return {
         tone: 'info',
         text: guidedPendingQuestionText.value
           || (review
-            ? `请先核对观察 · 第 ${review.current} / ${review.total}`
-            : `请先核对观察 · 待处理 ${guided.pendingClueCount.value} 条`),
+            ? `核对观察 · 第 ${review.current} / ${review.total} 条`
+            : `核对观察 · 还有 ${guided.pendingClueCount.value} 条`),
       }
     }
     if (!guidedConfirmationReady.value) {
-      return { tone: 'muted', text: '新增观察待核对，暂不能确认地点' }
+      return { tone: 'muted', text: '有新的观察，核对后才能确认地点' }
     }
     if (current.pending_question && !guided.confidenceShortcut.value) {
-      return { tone: 'info', text: guidedPendingQuestionText.value || '请继续完成观察核对。' }
+      return { tone: 'info', text: guidedPendingQuestionText.value || '请先回答上面的问题。' }
     }
-    return { tone: 'muted', text: `${guidedStageTitle(current.stage)} · 请确认或排除候选` }
+    return { tone: 'muted', text: `${guidedStageTitle(current.stage)} · 请选择或排除候选` }
   }
   if (hasSession.value) {
     if (session.confirmedIso.value) {
@@ -556,12 +554,12 @@ const liveStatus = computed<{ tone: FeedbackReceiptTone | 'info'; text: string }
       const scope = country ? regionScopeLabel(country) : null
       return {
         tone: 'ok',
-        text: `已确认：${country ? displayCountryName(country) : session.confirmedIso.value}${scope ? `（区域命中 ${scope}）` : ''}`,
+        text: `已确认：${country ? displayCountryName(country) : session.confirmedIso.value}${scope ? `（${scope}）` : ''}`,
       }
     }
-    return { tone: 'muted', text: `候选 ${session.scores.value.length} 个 · 可确认或排除候选` }
+    return { tone: 'muted', text: `候选 ${session.scores.value.length} 个 · 可确认或排除` }
   }
-  return { tone: 'muted', text: '上传照片后开始人机协同推理' }
+  return { tone: 'muted', text: '上传照片后开始定位' }
 })
 
 watch(
@@ -673,7 +671,7 @@ function resetTransientUi(): void {
   cityNotice.value = null
   citySourceIso.value = null
   citySourceLabel.value = null
-  pointStatus.value = '点选或框选区域后，点击“分析选定区域”；分析结果只作为线索。'
+  pointStatus.value = '在照片上点选或框选一处，然后点“分析选定区域”。'
   pointStatusKind.value = 'idle'
   resetGuidedFreeTextSubmission()
   resetObservationAdoption()
@@ -734,7 +732,7 @@ function newAnalysis(): void {
   errorMessage.value = null
   uploadNotice.value = null
   resetTransientUi()
-  orphanPending('原会话已变更，未收到服务器确认')
+  orphanPending('照片已更换，这条消息没有发出')
   lastOutcome.value = null
   historyOpen.value = false
   mobileEvidenceOpen.value = false
@@ -762,7 +760,7 @@ function onFile(file: File): void {
   cancelInFlightUi()
   resetTransientUi()
   releasePreviewUrl()
-  orphanPending('原会话已变更，未收到服务器确认')
+  orphanPending('照片已更换，这条消息没有发出')
   selectedFile.value = file
   localPreviewUrl.value = URL.createObjectURL(file)
   uploadNotice.value = null
@@ -777,7 +775,7 @@ async function upload(): Promise<void> {
   // A new upload supersedes city/feedback/point requests; their stale finally
   // blocks are epoch-guarded, so clear the shared busy flags here.
   cancelInFlightUi()
-  orphanPending('上传新图片期间未收到服务器确认')
+  orphanPending('分析新照片期间，这条消息没有发出')
   uploading.value = true
   uploadNotice.value = null
   errorMessage.value = null
@@ -871,8 +869,8 @@ function handleCityStaleness(prev: CandidateSnapshot): void {
     citySourceLabel.value = null
     cityNotice.value =
       affected === 'all'
-        ? '所选国家/地区已被排除，城市候选已清空。'
-        : '候选更新后该国家/地区已不在列表中，城市候选已清空。'
+        ? '所选国家/地区已被排除，城市列表已清空。'
+        : '该国家/地区已不在候选列表中，城市列表已清空。'
     return
   }
   const cluesChanged = clueSignature(session.clues.value) !== prev.clueSig
@@ -889,16 +887,16 @@ function handleCityStaleness(prev: CandidateSnapshot): void {
       session.clearCities()
       citySourceIso.value = null
       citySourceLabel.value = null
-      cityNotice.value = '该区域范围已被排除，城市候选已清空。'
+      cityNotice.value = '该区域已被排除，城市列表已清空。'
       return
     }
     session.setCityRows(kept)
     void requestCities(cityIso, prev.citySourceIso)
-    cityNotice.value = `已按新的排除条件过滤城市候选（移除 ${before - kept.length} 个），正在刷新…`
+    cityNotice.value = `已按新的排除条件筛选（移除 ${before - kept.length} 个），正在刷新…`
     return
   }
   if (cluesChanged || rankChanged) {
-    cityNotice.value = '线索或候选已更新，正在刷新城市候选…'
+    cityNotice.value = '线索已更新，正在刷新城市列表…'
     void requestCities(cityIso, prev.citySourceIso)
   }
 }
@@ -935,14 +933,14 @@ function finalizeFeedbackOutcome(response: FeedbackResponse, prev: CandidateSnap
     parts.push(receiptText(receipt))
   } else {
     // HTTP success alone is not understanding: without a receipt never claim it.
-    parts.push('服务器已接收反馈（暂无解读回执）')
+    parts.push('已收到反馈')
   }
   const notes: string[] = []
   if (response.done && response.iso) notes.push(`已确认国家：${countryLabel(response.iso)}`)
   const added = session.exclusions.value.filter((code) => !prev.exclusions.includes(code))
   if (added.length) notes.push(`已排除：${added.map((code) => exclusionLabel(code)).join('、')}`)
   if (clueSignature(session.clues.value) !== prev.clueSig) notes.push('线索已更新')
-  if (rankingSignature(session.scores.value) !== prev.rankSig) notes.push('候选排序已更新')
+  if (rankingSignature(session.scores.value) !== prev.rankSig) notes.push('候选已更新')
   if (notes.length) parts.push(notes.join(' · '))
   lastOutcome.value = { tone: receipt?.tone ?? 'muted', text: parts.join(' · ') }
   // Only an applied (or receipt-less legacy) response may invalidate city rows:
@@ -975,7 +973,7 @@ async function submitFeedback(
   try {
     const response = await api.feedback(id, payload)
     if (epoch !== sessionEpoch.value) {
-      updatePending(pending.id, { status: 'failed', error: '请求已被新的操作取代，未收到服务器确认' })
+      updatePending(pending.id, { status: 'failed', error: '已被新的操作取代，没有发出' })
       return
     }
     const authoritative = Array.isArray(response.messages) ? response.messages : null
@@ -989,7 +987,7 @@ async function submitFeedback(
     finalizeFeedbackOutcome(response, snapshot)
   } catch (caught) {
     if (epoch !== sessionEpoch.value) {
-      updatePending(pending.id, { status: 'failed', error: '请求已被新的操作取代，未收到服务器确认' })
+      updatePending(pending.id, { status: 'failed', error: '已被新的操作取代，没有发出' })
       return
     }
     const message = normalizeApiError(caught, undefined, '反馈发送失败').message
@@ -1009,7 +1007,7 @@ function retryPending(pending: PendingChatMessage): void {
     return
   }
   if (session.sessionId.value === null) {
-    updatePending(pending.id, { status: 'failed', error: '当前没有会话，请先上传图片' })
+    updatePending(pending.id, { status: 'failed', error: '请先上传照片' })
     return
   }
   // Never rebind an old-photo bubble to a different session or epoch: the user
@@ -1017,7 +1015,7 @@ function retryPending(pending: PendingChatMessage): void {
   if (pending.sessionId !== session.sessionId.value || pending.epoch !== sessionEpoch.value) {
     updatePending(pending.id, {
       status: 'failed',
-      error: '原会话已变更，未发送到当前会话；请重新输入或删除',
+      error: '照片已更换，请重新输入或删除这条消息',
       orphaned: true,
     })
     return
@@ -1206,10 +1204,10 @@ function onRegionSelectionChange(): void {
   regionRequestNonce += 1
   regionRequests.value = regionRequests.value.map((record): RegionAnalysisRecord =>
     record.status === 'pending'
-      ? { ...record, status: 'failed', error: '请求已被新的区域选择取代，未采用。' }
+      ? { ...record, status: 'failed', error: '已改用新的选区，这次分析没有采用。' }
       : record,
   )
-  pointStatus.value = '已选择新的区域，点击“分析选定区域”后再提交。'
+  pointStatus.value = '已选择新区域，点“分析选定区域”开始分析。'
   pointStatusKind.value = 'idle'
 }
 
@@ -1223,7 +1221,7 @@ async function analyzeRegionRequest(request: AnalyzePointRequest): Promise<void>
   normalized.client_request_id = requestId
   const existing = regionRequests.value.find((record) => record.id === requestId)
   if (existing && (existing.sessionId !== id || existing.epoch !== sessionEpoch.value)) {
-    markRegionRequest(requestId, { status: 'failed', error: '原会话已变更，请在当前图片上重新选择区域。' })
+    markRegionRequest(requestId, { status: 'failed', error: '照片已更换，请重新选择区域。' })
     return
   }
 
@@ -1251,7 +1249,7 @@ async function analyzeRegionRequest(request: AnalyzePointRequest): Promise<void>
   try {
     const response = await api.analyzePoint(id, normalized)
     if (stale()) {
-      markRegionRequest(requestId, { status: 'failed', error: '请求已被新的区域选择取代，未采用。' })
+      markRegionRequest(requestId, { status: 'failed', error: '已改用新的选区，这次分析没有采用。' })
       return
     }
 
@@ -1274,14 +1272,14 @@ async function analyzeRegionRequest(request: AnalyzePointRequest): Promise<void>
     let completionText: string
     if (!report) {
       completionText = newClueCount
-        ? `分析完成，发现 ${newClueCount} 条新线索；该响应没有区域报告，沿用原有线索。`
-        : '分析完成，没有新增线索；该响应没有区域报告，沿用原有线索。'
+        ? `分析完成，新增 ${newClueCount} 条线索。`
+        : '分析完成，没有新增线索。'
     } else if (report.dedupe === 'duplicate_request' || report.dedupe === 'duplicate_region') {
-      completionText = `分析完成：${report.summary || '该区域已有报告'}（未重复写入证据）`
+      completionText = `分析完成：${report.summary || '这处区域已经分析过了。'}`
     } else if (!applied) {
-      completionText = `分析完成：${report.summary || '未发现新增证据'}（报告已保留）`
+      completionText = `分析完成：${report.summary || '没有新增内容。'}`
     } else {
-      completionText = `分析完成：${report.summary || `发现 ${newClueCount} 条新线索`}`
+      completionText = `分析完成：${report.summary || `新增 ${newClueCount} 条线索`}`
     }
 
     // Evidence mutates in the same session; keep global busy true until the
@@ -1289,11 +1287,11 @@ async function analyzeRegionRequest(request: AnalyzePointRequest): Promise<void>
     if (guided.active.value) {
       const reloaded = await guided.reload()
       if (stale()) {
-        markRegionRequest(requestId, { status: 'failed', error: '请求已被新的区域选择取代，未采用。' })
+        markRegionRequest(requestId, { status: 'failed', error: '已改用新的选区，这次分析没有采用。' })
         return
       }
       if (!reloaded) {
-        const syncError = `区域分析已返回，但引导状态同步失败：${guided.error.value ?? '请重试'}`
+        const syncError = `区域分析完成，但最新状态加载失败：${guided.error.value ?? '请重试'}`
         markRegionRequest(requestId, { status: 'failed', error: syncError })
         pointStatus.value = syncError
         pointStatusKind.value = 'error'
@@ -1306,7 +1304,7 @@ async function analyzeRegionRequest(request: AnalyzePointRequest): Promise<void>
     pointStatusKind.value = 'success'
   } catch (caught) {
     if (stale()) {
-      markRegionRequest(requestId, { status: 'failed', error: '请求已被新的区域选择取代，未采用。' })
+      markRegionRequest(requestId, { status: 'failed', error: '已改用新的选区，这次分析没有采用。' })
       return
     }
     const message = normalizeApiError(caught, undefined, '局部区域分析失败').message
@@ -1396,12 +1394,12 @@ function observationAdoptionOutcome(
   if (status === 'unrecognized') {
     return {
       status: 'failed',
-      error: receipt?.summary?.trim() || '后端未能确认该 OCR 观察，地点未被自动确认。',
+      error: receipt?.summary?.trim() || '无法确认这段文字，请重试。',
     }
   }
   return {
     status: 'unconfirmed',
-    error: '服务器未返回可识别的采用回执，请核对最新引导状态后再试。',
+    error: '没有收到确认，请重新加载后再试。',
   }
 }
 
@@ -1442,7 +1440,7 @@ async function onAdoptObservation(request: ObservationAdoptionRequest): Promise<
       text: match?.observation.text?.trim() ?? '',
       status: 'failed',
       receipt: null,
-      error: '该 OCR 观察当前不可采用，请重新分析区域后重试。',
+      error: '这段文字现在不能使用，请重新分析区域。',
     }
     return
   }
@@ -1535,18 +1533,18 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
       (typeof response.source_region === 'string' ? response.source_region.trim() : null) || (responseSource ? CHINA_REGION_LABELS[responseSource] ?? null : null)
     cityNotice.value = [response.note, response.clue_note].filter(Boolean).join('；') || null
     if (response.status === 'unavailable') {
-      cityNotice.value ||= '模型服务当前不可用，暂时无法检索城市候选；可稍后重试。'
+      cityNotice.value ||= '城市查询暂时不可用，请稍后重试。'
     } else if (response.status === 'no_cities' || !response.city_scores.length) {
       cityNotice.value ||= source
-        ? '该区域暂无城市候选；可切换区域范围或稍后重试。'
-        : '该国家/地区暂无城市候选；可切换重试。'
+        ? '该区域暂无城市候选，可切换区域范围或稍后重试。'
+        : '该国家/地区暂无城市候选，可稍后重试。'
     }
   } catch {
     if (epoch !== sessionEpoch.value || requestNonce !== cityRequestNonce) return
     // Degrade inline: a failed city lookup must never raise a global error banner.
     session.clearCities()
     citySourceLabel.value = null
-    cityNotice.value = '城市候选服务不可用，可稍后重试。'
+    cityNotice.value = '城市查询失败，请稍后重试。'
   } finally {
     if (epoch === sessionEpoch.value && requestNonce === cityRequestNonce) cityBusy.value = false
   }
@@ -1565,11 +1563,11 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
         </span>
         <span class="command-brand__copy">
           <h1 class="command-brand__title">M-PHOTO</h1>
-          <span class="command-brand__sub">影像地理定位推理台</span>
+          <span class="command-brand__sub">照片定位助手</span>
         </span>
       </div>
 
-      <nav class="session-breadcrumb" aria-label="当前推理路径">
+      <nav class="session-breadcrumb" aria-label="当前定位进度">
         <span class="breadcrumb-step">
           <span class="breadcrumb-index">01</span>
           <span class="sr-only">国家</span>
@@ -1592,7 +1590,7 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
         <span class="command-session__text">{{ sessionStatus }}</span>
       </div>
 
-      <div class="focus-switch" role="group" aria-label="界面聚焦模式">
+      <div class="focus-switch" role="group" aria-label="界面布局">
         <button
           v-for="mode in FOCUS_MODES"
           :key="mode.key"
@@ -1627,14 +1625,14 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
         :aria-expanded="historyOpen"
         aria-controls="reasoning-history-drawer"
         :disabled="!historyAllowed"
-        :title="historyAllowed ? '打开推理记录' : '观察核对完成并解锁候选后可查看推理记录'"
+        :title="historyAllowed ? '打开对话记录' : '核对完成并查看候选后可打开对话记录'"
         @click="openHistory"
       >
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" aria-hidden="true">
           <path d="M3 12a9 9 0 1 0 3-6.7L3 8" />
           <path d="M3 3v5h5M12 7v5l3 2" />
         </svg>
-        <span class="command-action__label">记录</span>
+        <span class="command-action__label">对话</span>
       </button>
 
       <button type="button" class="command-action command-action--strong" @click="newAnalysis">
@@ -1645,7 +1643,7 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
       </button>
     </header>
 
-    <main class="map-stage" aria-label="沉浸式候选地图" :inert="backgroundInert">
+    <main class="map-stage" aria-label="候选地图" :inert="backgroundInert">
       <div ref="mapHostRef" class="map-host">
         <GeoMap
           :scores="guidedCountryScores"
@@ -1691,13 +1689,13 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
       class="dock-anchor evidence-dock-anchor"
       :class="{ 'is-mobile-open': isMobile && mobileEvidenceOpen, 'is-collapsed': showEvidenceThumbnail }"
       :inert="historyOpen"
-      aria-label="照片与证据"
+      aria-label="照片与线索"
     >
       <motion.button
         v-if="showEvidenceThumbnail"
         type="button"
         class="dock-thumbnail evidence-thumbnail"
-        aria-label="展开证据台"
+        aria-label="展开照片与线索"
         :initial="enterFrom"
         :animate="enterSettle"
         :transition="enterEase"
@@ -1714,7 +1712,7 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
           <span class="dock-thumbnail__badge">{{ session.imageUrl.value ? 'PHOTO' : 'UPLOAD' }}</span>
         </span>
         <span class="dock-thumbnail__copy">
-          <strong>证据台</strong>
+          <strong>照片与线索</strong>
           <small>{{ clueCount }} 条线索</small>
         </span>
       </motion.button>
@@ -1731,15 +1729,15 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
         <header class="dock-head">
           <div class="dock-heading">
             <span class="section-kicker">EVIDENCE</span>
-            <h2 id="evidence-dock-title">证据台</h2>
+            <h2 id="evidence-dock-title">照片与线索</h2>
           </div>
           <div class="dock-head__actions">
-            <span v-if="session.imageUrl.value" class="dock-state-chip">{{ regionReports.length }} 份报告</span>
+            <span v-if="session.imageUrl.value" class="dock-state-chip">{{ regionReports.length }} 次分析</span>
             <button
               v-if="!isMobile"
               type="button"
               class="icon-btn"
-              aria-label="收起证据台"
+              aria-label="收起照片与线索"
               title="收起为缩略图"
               @click="collapseEvidenceDock"
             >
@@ -1762,7 +1760,7 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
           </div>
         </header>
 
-        <div v-if="isMobile" class="evidence-mobile-tabs" role="tablist" aria-label="证据视图">
+        <div v-if="isMobile" class="evidence-mobile-tabs" role="tablist" aria-label="照片、线索与参考">
           <button type="button" role="tab" :aria-selected="mobileEvidenceTab === 'photo'" :class="{ active: mobileEvidenceTab === 'photo' }" @click="openMobileEvidence('photo')">照片</button>
           <button type="button" role="tab" :aria-selected="mobileEvidenceTab === 'clues'" :class="{ active: mobileEvidenceTab === 'clues' }" @click="openMobileEvidence('clues')">线索 <span>{{ clueCount }}</span></button>
           <button type="button" role="tab" :aria-selected="mobileEvidenceTab === 'references'" :class="{ active: mobileEvidenceTab === 'references' }" @click="openMobileEvidence('references')">参考</button>
@@ -1812,7 +1810,7 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
                 </svg>
                 区域分析
               </button>
-              <span class="evidence-footnote">框选后人工确认 · 坐标非照片 GPS</span>
+              <span class="evidence-footnote">分析结果仅作参考 · 位置不是照片 GPS</span>
             </div>
           </section>
 
@@ -1822,7 +1820,7 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
                 <span class="section-kicker">OBSERVATIONS</span>
                 <h3>线索 <span class="dock-count">{{ clueCount }}</span></h3>
               </div>
-              <span class="dock-muted">按强度</span>
+              <span class="dock-muted">按可靠度</span>
             </div>
             <ClueList
               :clues="session.clues.value"
@@ -1838,7 +1836,7 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
                 <span class="section-kicker">REFERENCES</span>
                 <h3>参考街景</h3>
               </div>
-              <span class="dock-muted">仅作诊断</span>
+              <span class="dock-muted">仅供参考</span>
             </div>
             <CandidatePanel
               surface="references"
@@ -1876,13 +1874,13 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
       :class="{ 'is-wide': reasoningWide, 'mobile-task-sheet': isMobile, 'is-collapsed': showReasoningTaskChip, 'is-guided-loading': guided.active.value && !guided.dialogue.value }"
       :data-sheet-state="mobileSheetState"
       :inert="backgroundInert"
-      aria-label="推理任务"
+      aria-label="定位任务"
     >
       <motion.button
         v-if="showReasoningTaskChip"
         type="button"
         class="reasoning-task-chip"
-        aria-label="展开推理任务"
+        aria-label="展开定位任务"
         :initial="enterFrom"
         :animate="enterSettle"
         :transition="enterEase"
@@ -1895,8 +1893,8 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
           </svg>
         </span>
         <span class="reasoning-task-chip__copy">
-          <span>推理任务</span>
-          <strong>{{ guided.active.value ? '引导定位' : '协同推理' }}</strong>
+          <span>定位任务</span>
+          <strong>定位助手</strong>
           <small>{{ liveStatus.text }}</small>
         </span>
         <span class="live-dot" :class="liveStatus.tone" aria-hidden="true" />
@@ -1913,7 +1911,7 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
         <header class="dock-head reasoning-dock__head">
           <div class="dock-heading">
             <span class="section-kicker">REASONING</span>
-            <h2 id="reasoning-dock-title">{{ guided.active.value ? '引导定位' : '协同推理' }}</h2>
+            <h2 id="reasoning-dock-title">定位助手</h2>
             <span class="dock-muted">{{ session.messages.value.length }} 条</span>
           </div>
           <div class="dock-head__actions">
@@ -1928,7 +1926,7 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
                 class="icon-btn width-toggle"
                 :class="{ active: reasoningWide }"
                 :aria-pressed="reasoningWide"
-                :aria-label="reasoningWide ? '还原推理面板宽度' : '加宽推理面板'"
+                :aria-label="reasoningWide ? '还原面板宽度' : '加宽面板'"
                 :title="reasoningWide ? '还原宽度' : '加宽到约 560px'"
                 @click="toggleReasoningWidth"
               >
@@ -1942,7 +1940,7 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
               <button
                 type="button"
                 class="icon-btn"
-                aria-label="收起推理面板"
+                aria-label="收起助手面板"
                 title="收起为任务卡"
                 @click="collapseReasoningDock"
               >
@@ -2109,12 +2107,12 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
           <header class="history-drawer__head">
             <div>
               <span class="section-kicker">HISTORY</span>
-              <h2 id="history-drawer-title">推理记录</h2>
-              <p>对话、回执与待发送反馈</p>
+              <h2 id="history-drawer-title">对话记录</h2>
+              <p>对话与待发送消息</p>
             </div>
             <div class="history-drawer__actions">
               <span>{{ session.messages.value.length }} 条</span>
-              <button type="button" class="icon-btn" data-modal-autofocus aria-label="关闭推理记录" @click="closeHistory">
+              <button type="button" class="icon-btn" data-modal-autofocus aria-label="关闭对话记录" @click="closeHistory">
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" aria-hidden="true">
                   <path d="M6 6l12 12M18 6 6 18" />
                 </svg>
@@ -2128,7 +2126,7 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
               :loading="pointBusy || feedbackBusy"
               tabindex="0"
               role="region"
-              aria-label="完整推理记录，可滚动查看"
+              aria-label="完整对话记录，可滚动查看"
               @retry="retryPending"
               @dismiss="dismissPending"
             />

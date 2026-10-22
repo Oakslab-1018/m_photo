@@ -34,9 +34,9 @@ const confidence = computed<ConfidenceRoute | null>(() => {
 })
 const confidenceLabel = computed(() => {
   if (!confidence.value) return ''
-  if (confidence.value.tier === 'high') return '🟢 高置信：已给出最佳匹配'
-  if (confidence.value.tier === 'medium') return '🟡 候选接近：请确认'
-  return '🟠 信息不足：继续补充线索'
+  if (confidence.value.tier === 'high') return '已找到最可能的国家，请确认。'
+  if (confidence.value.tier === 'medium') return '候选比较接近，请确认。'
+  return '信息不足，请补充线索。'
 })
 
 async function focusInput(): Promise<void> {
@@ -109,7 +109,7 @@ defineExpose({ focusInput })
         :disabled="busy"
         @click="confirmIso(action)"
       >
-        ✅ 确认这个国家
+        确认这个国家
       </button>
       <button
         v-if="action.kind === 'confirm' && action.payload?.iso"
@@ -118,7 +118,7 @@ defineExpose({ focusInput })
         :disabled="busy"
         @click="rejectIso(action)"
       >
-        ❌ 不是这里
+        不是这里
       </button>
       <button
         v-if="action.kind === 'ask' || action.kind === 'request_clue'"
@@ -126,10 +126,10 @@ defineExpose({ focusInput })
         class="action-btn"
         @click="focusInput"
       >
-        ✍️ 我来补充{{ action.payload?.dimensions?.length ? `（${action.payload.dimensions.map(dimensionLabel).join('、')}）` : '' }}
+        补充线索{{ action.payload?.dimensions?.length ? `（${action.payload.dimensions.map(dimensionLabel).join('、')}）` : '' }}
       </button>
-      <span v-if="action.kind === 'done'" class="action-note">🎉 推理已完成</span>
-      <span v-if="action.kind === 'result'" class="action-note">📍 已给出高置信国家判断，仍需您明确确认</span>
+      <span v-if="action.kind === 'done'" class="action-note">定位完成</span>
+      <span v-if="action.kind === 'result'" class="action-note">已给出最可能的国家，仍需你确认</span>
     </div>
 
     <div v-if="optionGroups.length" class="answer-options">
