@@ -17,7 +17,11 @@ ENV VITE_MAP_STYLE_URL=${VITE_MAP_STYLE_URL} \
 
 # package-lock.json 必须由前端 worker 提交，npm ci 依赖它保证可复现构建。
 COPY frontend/package.json frontend/package-lock.json ./
-RUN npm ci --no-audit --no-fund
+# 重试参数用于抵偿构建时 registry 的瞬时抖动；依赖版本仍完全由 lockfile 决定。
+RUN npm ci --no-audit --no-fund \
+    --fetch-retries=5 \
+    --fetch-retry-mintimeout=10000 \
+    --fetch-retry-maxtimeout=60000
 
 COPY frontend/ ./
 RUN npm run build
