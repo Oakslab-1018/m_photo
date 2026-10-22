@@ -1,6 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { AnimatePresence, motion, useReducedMotion } from 'motion-v'
+import { computed, onMounted, ref, watch } from 'vue'
 import { api } from '@/api'
 import { normalizeApiError } from '@/api/errors'
 import type {
@@ -11,25 +10,19 @@ import type {
   Clue,
   FeedbackPayload,
   FeedbackResponse,
-  GuidedEventReceipt,
   LocationTarget,
-  ObservationAdoptionRequest,
-  ObservationAdoptionStatus,
-  ObservationAdoptionSubmission,
   PendingChatMessage,
   RegionAnalysisRecord,
-  RegionObservation,
   RegionQuestion,
   RegionReport,
 } from '@/types'
 import { useGeoSession } from '@/composables/useGeoSession'
 import { useGuidedDialogue } from '@/composables/useGuidedDialogue'
-import { useImmersiveLayout } from '@/composables/useImmersiveLayout'
-import type { GuidedFreeTextSubmission } from '@/composables/useGuidedComposer'
+import { useGuidedSubmissions } from '@/composables/useGuidedSubmissions'
+import { useWorkspaceLayout } from '@/composables/useWorkspaceLayout'
 import { clueIdentity, clueValueLabel, countGroupedClues, dimensionLabel } from '@/utils/clues'
 import { isQuestionAction } from '@/utils/dialogue'
 import {
-  guidedFreeTextReceiptOutcome,
   guidedQuestionMessage,
   guidedStageTitle,
   guidedTargetKey,
@@ -37,7 +30,7 @@ import {
   safeGuidedText,
   targetLabel,
 } from '@/utils/guided'
-import { feedbackReceipt, receiptText, type FeedbackReceiptTone } from '@/utils/feedback'
+import { feedbackReceipt, receiptText } from '@/utils/feedback'
 import {
   mergeRegionReports,
   newRegionRequestId,
@@ -57,15 +50,19 @@ import {
   regionScopeLabel,
   type SourceRegionEntry,
 } from '@/utils/geo'
-import UploadPanel from '@/components/UploadPanel.vue'
-import ClueList from '@/components/ClueList.vue'
-import ChatLog from '@/components/ChatLog.vue'
+import CommandBar from '@/components/CommandBar.vue'
+import ErrorBanner from '@/components/ErrorBanner.vue'
+import EvidenceDock from '@/components/EvidenceDock.vue'
 import GeoMap from '@/components/GeoMap.vue'
-import FeedbackBar from '@/components/FeedbackBar.vue'
-import CandidatePanel from '@/components/CandidatePanel.vue'
+import HistoryDrawer from '@/components/HistoryDrawer.vue'
+import ReasoningDock from '@/components/ReasoningDock.vue'
 import ConfirmLocationDialog from '@/components/ConfirmLocationDialog.vue'
-import GuidedDialoguePanel from '@/components/GuidedDialoguePanel.vue'
 import ImageViewer from '@/components/ImageViewer.vue'
+import type {
+  CandidatePanelBindings,
+  GuidedDialogueBindings,
+  LiveStatus,
+} from '@/components/uiTypes'
 
 const session = useGeoSession()
 const guided = useGuidedDialogue(session.sessionId, {
@@ -99,7 +96,7 @@ const selectedGuidedTargetKey = ref<string | null>(null)
 const countryDirectory = ref<Country[]>([])
 const feedbackDraft = ref('')
 const pendingMessages = ref<PendingChatMessage[]>([])
-const lastOutcome = ref<{ tone: FeedbackReceiptTone | 'info'; text: string } | null>(null)
+const lastOutcome = ref<LiveStatus | null>(null)
 const citySourceIso = ref<string | null>(null)
 const citySourceLabel = ref<string | null>(null)
 const knownCountryNames = ref<Record<string, string>>({})
@@ -107,48 +104,6 @@ const regionRequests = ref<RegionAnalysisRecord[]>([])
 const immediateRegionReports = ref<RegionReport[]>([])
 const selectedRegionReportId = ref<string | null>(null)
 const guidedDraftText = ref<string | null>(null)
-const guidedFreeTextSubmission = ref<GuidedFreeTextSubmission | null>(null)
-const observationAdoption = ref<ObservationAdoptionSubmission | null>(null)
-
-type FocusMode = 'collab' | 'map' | 'photo'
-type MobileSheetState = 'peek' | 'half' | 'full'
-type EvidenceTab = 'photo' | 'clues' | 'references'
-
-const FOCUS_MODES: Array<{ key: FocusMode; label: string; hint: string }> = [
-  { key: 'collab', label: '全部', hint: '照片、地图和助手同时显示' },
-  { key: 'map', label: '地图', hint: '只看地图' },
-  { key: 'photo', label: '照片', hint: '只看照片和线索' },
-]
-
-const commandBarRef = ref<HTMLElement | null>(null)
-const mapHostRef = ref<HTMLElement | null>(null)
-const evidenceDockRef = ref<HTMLElement | null>(null)
-const reasoningDockRef = ref<HTMLElement | null>(null)
-const focusMode = ref<FocusMode>('collab')
-const leftCollapsed = ref(false)
-const rightCollapsed = ref(false)
-const reasoningWide = ref(false)
-const mobileSheetState = ref<MobileSheetState>('half')
-const mobileEvidenceOpen = ref(false)
-const mobileEvidenceTab = ref<EvidenceTab>('photo')
-const historyOpen = ref(false)
-const historyDialogRef = ref<HTMLElement | null>(null)
-const mobileEvidenceDialogRef = ref<HTMLElement | null>(null)
-const reduceMotion = useReducedMotion()
-const enterFrom = computed(() => (reduceMotion.value ? false : { opacity: 0, y: 8 }))
-const enterSettle = { opacity: 1, y: 0 }
-const enterEase = { duration: 0.24, ease: [0.2, 0.7, 0.2, 1] as const }
-
-const { mapInsets, isMobile, isCompact } = useImmersiveLayout({
-  commandBar: commandBarRef,
-  mapHost: mapHostRef,
-  leftDock: evidenceDockRef,
-  rightDock: reasoningDockRef,
-  includeTop: () => true,
-  includeLeft: () => focusMode.value !== 'map',
-  includeRight: () => focusMode.value !== 'map',
-  includeBottom: () => !mobileEvidenceOpen.value,
-})
 
 /** Monotonic session generation: stale responses can never overwrite newer state. */
 const sessionEpoch = ref(0)
@@ -156,8 +111,6 @@ const sessionEpoch = ref(0)
 let cityRequestNonce = 0
 let pendingNonce = 0
 let regionRequestNonce = 0
-let guidedFreeTextNonce = 0
-let observationAdoptionNonce = 0
 
 const regionReports = computed(() =>
   mergeRegionReports(regionReportsFromMessages(session.messages.value), immediateRegionReports.value),
@@ -172,6 +125,25 @@ const busy = computed(
     guided.loading.value ||
     guided.applying.value,
 )
+
+const {
+  guidedFreeTextSubmission,
+  observationAdoption,
+  observationAdoptionRetryable,
+  resetGuidedFreeTextSubmission,
+  resetObservationAdoption,
+  onGuidedFreeText,
+  onAdoptObservation,
+  retryObservationAdoption,
+  retryGuidedOperation,
+} = useGuidedSubmissions({
+  sessionId: session.sessionId,
+  sessionEpoch,
+  busy: () => busy.value,
+  regionReports: () => regionReports.value,
+  guided,
+  guidedDraftText,
+})
 const hasSession = computed(() => session.sessionId.value !== null)
 const previewUrl = computed(() => localPreviewUrl.value ?? session.imageUrl.value)
 /** Card count after grouping/dedupe, matching what the clue panel actually renders. */
@@ -206,14 +178,6 @@ const guidedRankingsUnlocked = computed(() => guided.rankingsUnlocked.value)
 const guidedCandidatesVisible = computed(() => guided.candidatesVisible.value)
 const guidedConfirmationReady = computed(() => guided.locationConfirmationReady.value)
 const guidedDataReady = computed(() => guided.dialogue.value !== null)
-const observationAdoptionRetryable = computed(() => {
-  const adoption = observationAdoption.value
-  return Boolean(
-    adoption &&
-    adoption.status === 'failed' &&
-    guided.isRetryableAdoption(adoption.report_id, adoption.observation_id),
-  )
-})
 const guidedVisibleCandidates = computed(() =>
   guided.confidenceShortcut.value
     ? guided.confidenceCandidates.value
@@ -222,6 +186,56 @@ const guidedVisibleCandidates = computed(() =>
 const guidedCandidateSurfaceVisible = computed(
   () => guidedCandidatesVisible.value || guided.confidenceShortcut.value !== null,
 )
+
+// This composable installs an immediate history-gate watcher, so initialize it
+// only after the guided candidate surface is available.
+const {
+  commandBarRef,
+  mapHostRef,
+  evidenceDockRef,
+  reasoningDockRef,
+  historyDialogRef,
+  mobileEvidenceDialogRef,
+  focusMode,
+  reasoningWide,
+  mobileSheetState,
+  mobileEvidenceOpen,
+  mobileEvidenceTab,
+  historyOpen,
+  mapInsets,
+  isMobile,
+  isCompact,
+  historyAllowed,
+  backgroundInert,
+  evidenceAnchorVisible,
+  reasoningAnchorVisible,
+  showEvidenceThumbnail,
+  showReasoningTaskChip,
+  setFocusMode,
+  expandEvidenceDock,
+  collapseEvidenceDock,
+  expandReasoningDock,
+  collapseReasoningDock,
+  toggleReasoningWidth,
+  setMobileSheetState,
+  openMobileEvidence,
+  closeMobileEvidence,
+  closeMobileEvidenceForViewer,
+  openHistory,
+  closeHistory,
+  restoreDefaultDocks,
+} = useWorkspaceLayout({
+  historyAllowed: () => !guided.active.value || guidedCandidateSurfaceVisible.value,
+})
+
+const layoutElementRefs = {
+  mapHost: mapHostRef,
+  commandBar: commandBarRef,
+  evidenceDock: evidenceDockRef,
+  reasoningDock: reasoningDockRef,
+  historyDialog: historyDialogRef,
+  mobileEvidenceDialog: mobileEvidenceDialogRef,
+}
 const guidedMapStage = computed(() => {
   if (!guided.active.value || !guided.dialogue.value) return null
   if (guided.dialogue.value.stage === 'resolved') return 'resolved'
@@ -320,194 +334,7 @@ const cityBreadcrumb = computed(() => {
   return '城市'
 })
 
-const historyAllowed = computed(
-  () => !guided.active.value || guidedCandidateSurfaceVisible.value,
-)
-
-const mobileEvidenceModalOpen = computed(
-  () => isMobile.value && mobileEvidenceOpen.value,
-)
-const backgroundInert = computed(
-  () => historyOpen.value || mobileEvidenceModalOpen.value,
-)
-const activeModal = computed<'history' | 'evidence' | null>(() => {
-  if (historyOpen.value) return 'history'
-  if (mobileEvidenceModalOpen.value) return 'evidence'
-  return null
-})
-
-const FOCUSABLE_SELECTOR = [
-  'a[href]',
-  'button:not([disabled])',
-  'input:not([disabled])',
-  'select:not([disabled])',
-  'textarea:not([disabled])',
-  '[contenteditable="true"]',
-  '[tabindex]:not([tabindex="-1"])',
-].join(',')
-
-let modalReturnFocus: HTMLElement | null = null
-let skipModalFocusRestore = false
-let modalFocusEpoch = 0
-
-function modalElement(modal: 'history' | 'evidence'): HTMLElement | null {
-  return modal === 'history' ? historyDialogRef.value : mobileEvidenceDialogRef.value
-}
-
-function focusableElements(container: HTMLElement): HTMLElement[] {
-  return Array.from(container.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(
-    (element) => element.getClientRects().length > 0 && element.getAttribute('aria-hidden') !== 'true',
-  )
-}
-
-function focusActiveModal(modal: 'history' | 'evidence'): void {
-  const container = modalElement(modal)
-  if (!container) return
-  const preferred = container.querySelector<HTMLElement>('[data-modal-autofocus]')
-  const target = preferred ?? focusableElements(container)[0] ?? container
-  target.focus()
-}
-
-function trapModalFocus(event: KeyboardEvent, modal: 'history' | 'evidence'): void {
-  const container = modalElement(modal)
-  if (!container) return
-  const focusable = focusableElements(container)
-  if (!focusable.length) {
-    event.preventDefault()
-    container.focus()
-    return
-  }
-  const first = focusable[0]
-  const last = focusable[focusable.length - 1]
-  const active = document.activeElement
-  if (event.shiftKey && (active === first || active === container || !container.contains(active))) {
-    event.preventDefault()
-    last.focus()
-  } else if (!event.shiftKey && (active === last || active === container || !container.contains(active))) {
-    event.preventDefault()
-    first.focus()
-  }
-}
-
-function restoreModalFocus(target: HTMLElement | null): void {
-  if (!target?.isConnected || target.getClientRects().length === 0) return
-  target.focus()
-}
-const evidenceAnchorVisible = computed(
-  () => (isMobile.value ? mobileEvidenceOpen.value : focusMode.value !== 'map'),
-)
-const reasoningAnchorVisible = computed(
-  () => (isMobile.value ? !mobileEvidenceOpen.value : focusMode.value !== 'map'),
-)
-const showEvidenceThumbnail = computed(() => !isMobile.value && leftCollapsed.value)
-const showReasoningTaskChip = computed(() => !isMobile.value && rightCollapsed.value)
-function setFocusMode(mode: FocusMode): void {
-  focusMode.value = mode
-  historyOpen.value = false
-  if (isMobile.value) {
-    if (mode === 'photo') {
-      mobileEvidenceOpen.value = true
-      mobileEvidenceTab.value = 'photo'
-      mobileSheetState.value = 'peek'
-    } else if (mode === 'map') {
-      mobileEvidenceOpen.value = false
-      mobileSheetState.value = 'peek'
-    } else {
-      mobileEvidenceOpen.value = false
-      mobileSheetState.value = 'half'
-    }
-    return
-  }
-  if (mode === 'photo') {
-    leftCollapsed.value = false
-    rightCollapsed.value = true
-  } else if (mode === 'map') {
-    leftCollapsed.value = true
-    rightCollapsed.value = true
-  } else {
-    rightCollapsed.value = false
-    if (!isCompact.value) leftCollapsed.value = false
-  }
-}
-
-function expandEvidenceDock(): void {
-  leftCollapsed.value = false
-  if (focusMode.value === 'map') focusMode.value = 'collab'
-}
-
-function collapseEvidenceDock(): void {
-  leftCollapsed.value = true
-}
-
-function expandReasoningDock(): void {
-  rightCollapsed.value = false
-  if (focusMode.value === 'map') focusMode.value = 'collab'
-}
-
-function collapseReasoningDock(): void {
-  rightCollapsed.value = true
-}
-
-function toggleReasoningWidth(): void {
-  reasoningWide.value = !reasoningWide.value
-}
-
-function setMobileSheetState(state: MobileSheetState): void {
-  mobileSheetState.value = state
-}
-
-function openMobileEvidence(tab: EvidenceTab): void {
-  historyOpen.value = false
-  mobileEvidenceTab.value = tab
-  mobileEvidenceOpen.value = true
-  mobileSheetState.value = 'peek'
-}
-
-function closeMobileEvidence(): void {
-  mobileEvidenceOpen.value = false
-}
-
-function openHistory(): void {
-  if (!historyAllowed.value) return
-  mobileEvidenceOpen.value = false
-  historyOpen.value = true
-}
-
-function closeHistory(): void {
-  historyOpen.value = false
-}
-
-function openFocusedClue(clue: Clue): void {
-  if (!session.imageUrl.value) return
-  focusedClue.value = clue
-  if (mobileEvidenceOpen.value) skipModalFocusRestore = true
-  mobileEvidenceOpen.value = false
-  viewerOpen.value = true
-}
-
-function openImageViewer(): void {
-  if (!session.imageUrl.value) return
-  focusedClue.value = null
-  if (mobileEvidenceOpen.value) skipModalFocusRestore = true
-  mobileEvidenceOpen.value = false
-  viewerOpen.value = true
-}
-
-function onGlobalKeydown(event: KeyboardEvent): void {
-  const modal = activeModal.value
-  if (!modal) return
-  if (event.key === 'Tab') {
-    trapModalFocus(event, modal)
-    return
-  }
-  if (event.key !== 'Escape') return
-  event.preventDefault()
-  event.stopPropagation()
-  if (modal === 'history') closeHistory()
-  else closeMobileEvidence()
-}
-
-const liveStatus = computed<{ tone: FeedbackReceiptTone | 'info'; text: string }>(() => {
+const liveStatus = computed<LiveStatus>(() => {
   const failed = pendingMessages.value.find((item) => item.status === 'failed')
   if (failed) return { tone: 'warn', text: `发送失败：${failed.error ?? '请重试'} · 可重试或删除` }
   if (guided.conflict.value) return { tone: 'warn', text: safeGuidedText(guided.conflict.value) }
@@ -563,52 +390,6 @@ const liveStatus = computed<{ tone: FeedbackReceiptTone | 'info'; text: string }
 })
 
 watch(
-  isCompact,
-  (compact) => {
-    if (compact && !isMobile.value) leftCollapsed.value = true
-  },
-  { immediate: true },
-)
-
-watch(isMobile, (mobile) => {
-  historyOpen.value = false
-  mobileEvidenceOpen.value = false
-  if (mobile) mobileSheetState.value = 'half'
-})
-
-watch(historyAllowed, (allowed) => {
-  if (!allowed) historyOpen.value = false
-})
-
-watch(
-  activeModal,
-  async (next, previous) => {
-    const epoch = ++modalFocusEpoch
-    if (next) {
-      if (!previous) {
-        modalReturnFocus = document.activeElement instanceof HTMLElement
-          ? document.activeElement
-          : null
-      }
-      await nextTick()
-      if (epoch === modalFocusEpoch) focusActiveModal(next)
-      return
-    }
-    if (!previous) return
-
-    const restoreTarget = modalReturnFocus
-    modalReturnFocus = null
-    await nextTick()
-    if (epoch !== modalFocusEpoch) return
-    if (skipModalFocusRestore) {
-      skipModalFocusRestore = false
-      return
-    }
-    restoreModalFocus(restoreTarget)
-  },
-)
-
-watch(
   [session.scores, countryDirectory],
   () => {
     const next = { ...knownCountryNames.value }
@@ -632,14 +413,6 @@ onMounted(async () => {
   }
 })
 
-onMounted(() => {
-  window.addEventListener('keydown', onGlobalKeydown)
-})
-
-onBeforeUnmount(() => {
-  window.removeEventListener('keydown', onGlobalKeydown)
-})
-
 function setError(caught: unknown, fallback: string): void {
   errorMessage.value = normalizeApiError(caught, undefined, fallback).message
 }
@@ -647,16 +420,6 @@ function setError(caught: unknown, fallback: string): void {
 function releasePreviewUrl(): void {
   if (localPreviewUrl.value?.startsWith('blob:')) URL.revokeObjectURL(localPreviewUrl.value)
   localPreviewUrl.value = null
-}
-
-function resetGuidedFreeTextSubmission(): void {
-  guidedFreeTextNonce += 1
-  guidedFreeTextSubmission.value = null
-}
-
-function resetObservationAdoption(): void {
-  observationAdoptionNonce += 1
-  observationAdoption.value = null
 }
 
 function resetTransientUi(): void {
@@ -722,6 +485,20 @@ function feedbackContent(payload: FeedbackPayload): string {
   }
 }
 
+function openFocusedClue(clue: Clue): void {
+  if (!session.imageUrl.value) return
+  focusedClue.value = clue
+  closeMobileEvidenceForViewer()
+  viewerOpen.value = true
+}
+
+function openImageViewer(): void {
+  if (!session.imageUrl.value) return
+  focusedClue.value = null
+  closeMobileEvidenceForViewer()
+  viewerOpen.value = true
+}
+
 function newAnalysis(): void {
   sessionEpoch.value += 1
   guided.clear()
@@ -734,10 +511,7 @@ function newAnalysis(): void {
   resetTransientUi()
   orphanPending('照片已更换，这条消息没有发出')
   lastOutcome.value = null
-  historyOpen.value = false
-  mobileEvidenceOpen.value = false
-  rightCollapsed.value = false
-  if (!isCompact.value) leftCollapsed.value = false
+  restoreDefaultDocks()
 }
 
 function validateFile(file: File): string | null {
@@ -788,8 +562,7 @@ async function upload(): Promise<void> {
     resetTransientUi()
     selectedIso.value = session.scores.value[0]?.iso ?? null
     lastOutcome.value = null
-    rightCollapsed.value = false
-    if (!isCompact.value) leftCollapsed.value = false
+    restoreDefaultDocks()
     void guided.start(response.session_id)
   } catch (caught) {
     if (epoch === sessionEpoch.value) setError(caught, '上传失败，请稍后重试')
@@ -1329,191 +1102,6 @@ function useRegionQuestion(question: RegionQuestion): void {
   if (!guided.active.value) feedbackDraft.value = text
 }
 
-async function onGuidedFreeText(text: string): Promise<void> {
-  const submitted = text.trim()
-  if (!submitted) return
-  const nonce = ++guidedFreeTextNonce
-  const sessionId = session.sessionId.value
-  guidedFreeTextSubmission.value = { text: submitted, status: 'pending', receipt: null }
-  const applied = await guided.freeText(submitted)
-  if (nonce !== guidedFreeTextNonce || session.sessionId.value !== sessionId) return
-  if (!applied) {
-    guidedFreeTextSubmission.value = {
-      text: submitted,
-      status: 'failed',
-      error: guided.error.value ?? guided.conflict.value ?? '提交失败，请重试。',
-      receipt: null,
-    }
-    return
-  }
-
-  // Snapshot the receipt produced by this exact event before any later guided
-  // action can replace the shared latest receipt.
-  const receipt = guided.receipt.value ? { ...guided.receipt.value } : null
-  const outcome = guidedFreeTextReceiptOutcome(receipt)
-  if (outcome.status === 'failed') {
-    guidedFreeTextSubmission.value = {
-      text: submitted,
-      status: 'failed',
-      error: outcome.error ?? '没有识别到新的线索，请修改后重试。',
-      receipt,
-    }
-    return
-  }
-
-  guidedDraftText.value = null
-  // Preserve the server's distinction between an applied mutation and an
-  // acknowledged pre-existing clue; never relabel unchanged as applied.
-  guidedFreeTextSubmission.value = { text: submitted, status: outcome.status, receipt }
-}
-
-function findRegionObservation(
-  reportId: string,
-  observationId: string,
-): { report: RegionReport; observation: RegionObservation } | null {
-  const report = regionReports.value.find((item) => item.id === reportId)
-  const observation = report?.observations.find((item) => item.id === observationId)
-  return report && observation ? { report, observation } : null
-}
-
-function canAdoptRegionObservation(report: RegionReport, observation: RegionObservation): boolean {
-  return (
-    observation.kind === 'ocr_text' &&
-    report.ocr.available &&
-    report.ocr.state.toLowerCase() !== 'mock' &&
-    Boolean(observation.text?.trim())
-  )
-}
-
-function observationAdoptionOutcome(
-  receipt: GuidedEventReceipt | null,
-): { status: Exclude<ObservationAdoptionStatus, 'pending'>; error?: string | null } {
-  const status = receipt?.status?.trim().toLowerCase() ?? ''
-  if (status === 'applied') return { status: 'applied' }
-  if (status === 'unchanged') return { status: 'unchanged' }
-  if (status === 'unrecognized') {
-    return {
-      status: 'failed',
-      error: receipt?.summary?.trim() || '无法确认这段文字，请重试。',
-    }
-  }
-  return {
-    status: 'unconfirmed',
-    error: '没有收到确认，请重新加载后再试。',
-  }
-}
-
-function completeObservationAdoption(
-  base: ObservationAdoptionSubmission,
-  applied: boolean,
-): void {
-  if (!applied) {
-    observationAdoption.value = {
-      ...base,
-      status: 'failed',
-      receipt: null,
-      error: guided.error.value ?? guided.conflict.value ?? '确认文字失败，请重试。',
-    }
-    return
-  }
-  const receipt = guided.receipt.value ? { ...guided.receipt.value } : null
-  const outcome = observationAdoptionOutcome(receipt)
-  observationAdoption.value = {
-    ...base,
-    status: outcome.status,
-    receipt,
-    error: outcome.error ?? null,
-  }
-}
-
-async function onAdoptObservation(request: ObservationAdoptionRequest): Promise<void> {
-  if (busy.value) return
-  const reportId = request.report_id.trim()
-  const observationId = request.observation_id.trim()
-  if (!reportId || !observationId) return
-
-  const match = findRegionObservation(reportId, observationId)
-  if (!match || !canAdoptRegionObservation(match.report, match.observation)) {
-    observationAdoption.value = {
-      report_id: reportId,
-      observation_id: observationId,
-      text: match?.observation.text?.trim() ?? '',
-      status: 'failed',
-      receipt: null,
-      error: '这段文字现在不能使用，请重新分析区域。',
-    }
-    return
-  }
-
-  const sessionId = session.sessionId.value
-  if (sessionId === null) return
-  const epoch = sessionEpoch.value
-  const nonce = ++observationAdoptionNonce
-  const base: ObservationAdoptionSubmission = {
-    report_id: reportId,
-    observation_id: observationId,
-    text: match.observation.text!.trim(),
-    status: 'pending',
-    receipt: null,
-    error: null,
-  }
-  observationAdoption.value = base
-  const applied = await guided.adoptObservation(reportId, observationId)
-  if (
-    nonce !== observationAdoptionNonce ||
-    session.sessionId.value !== sessionId ||
-    epoch !== sessionEpoch.value
-  ) {
-    return
-  }
-  completeObservationAdoption(base, applied)
-}
-
-async function retryObservationAdoption(): Promise<void> {
-  if (busy.value) return
-  const current = observationAdoption.value
-  if (
-    !current ||
-    current.status !== 'failed' ||
-    !guided.isRetryableAdoption(current.report_id, current.observation_id)
-  ) {
-    return
-  }
-
-  const sessionId = session.sessionId.value
-  if (sessionId === null) return
-  const epoch = sessionEpoch.value
-  const nonce = ++observationAdoptionNonce
-  const base: ObservationAdoptionSubmission = {
-    ...current,
-    status: 'pending',
-    receipt: null,
-    error: null,
-  }
-  observationAdoption.value = base
-  const applied = await guided.retry()
-  if (
-    nonce !== observationAdoptionNonce ||
-    session.sessionId.value !== sessionId ||
-    epoch !== sessionEpoch.value
-  ) {
-    return
-  }
-  completeObservationAdoption(base, applied)
-}
-
-async function retryGuidedOperation(): Promise<void> {
-  const current = observationAdoption.value
-  if (
-    current?.status === 'failed' &&
-    guided.isRetryableAdoption(current.report_id, current.observation_id)
-  ) {
-    await retryObservationAdoption()
-    return
-  }
-  await guided.retry()
-}
-
 async function requestCities(iso: string, sourceIso?: string | null): Promise<void> {
   const target = normalizeIsoCode(iso)
   const id = session.sessionId.value
@@ -1549,102 +1137,74 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
     if (epoch === sessionEpoch.value && requestNonce === cityRequestNonce) cityBusy.value = false
   }
 }
+
+const candidatePanelBindings = computed<CandidatePanelBindings>(() => ({
+  scores: guidedCountryScores.value,
+  confirmedIso: session.confirmedIso.value,
+  selectedIso: selectedIso.value,
+  exclusions: exclusionChips.value,
+  busy: busy.value,
+  guidedCandidates: guidedVisibleCandidates.value,
+  guidedCandidatesUnlocked: guidedCandidateSurfaceVisible.value,
+  guidedConfirmationReady: guidedConfirmationReady.value,
+  guidedDataReady: guidedDataReady.value,
+  guidedStage: guided.dialogue.value?.stage ?? null,
+  cityScores: visibleCityScores.value,
+  cityCountryIso: session.cityCountryIso.value,
+  citiesStatus: session.citiesStatus.value,
+  countryOptions: countryOptions.value,
+  cityBusy: cityBusy.value,
+  cityNotice: cityNotice.value,
+  citySourceIso: citySourceIso.value,
+  citySourceLabel: citySourceLabel.value,
+}))
+
+const guidedDialogueBindings = computed<GuidedDialogueBindings>(() => ({
+  dialogue: guided.dialogue.value,
+  candidates: guided.topCandidates.value,
+  action: guided.action.value,
+  confidence: guided.confidence.value,
+  confidenceShortcut: guided.confidenceShortcut.value,
+  confidenceCandidates: guided.confidenceCandidates.value,
+  loading: guided.loading.value,
+  applying: guided.applying.value,
+  externalBusy: uploading.value || feedbackBusy.value || pointBusy.value || cityBusy.value,
+  error: guided.error.value,
+  conflict: guided.conflict.value,
+  canRetry: guided.canRetry.value,
+  receipt: guided.receipt.value,
+  selectedGuidedTargetKey: selectedGuidedTargetKey.value,
+  suggestedFreeText: guidedDraftText.value,
+  freeTextSubmission: guidedFreeTextSubmission.value,
+  phase: guided.phase.value,
+  candidatesUnlocked: guidedRankingsUnlocked.value,
+  canReviewBack: guided.canReviewBack.value,
+  locationConfirmationReady: guidedConfirmationReady.value,
+  recentClueIds: guided.recentClueIds.value,
+}))
 </script>
 
 <template>
   <div class="app-shell immersive-app" :class="{ 'is-mobile-layout': isMobile, 'is-compact-layout': isCompact }">
-    <header ref="commandBarRef" class="command-bar" aria-label="地理定位命令栏" :inert="backgroundInert">
-      <div class="command-brand">
-        <span class="command-brand__mark" aria-hidden="true">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9">
-            <circle cx="12" cy="12" r="8.4" />
-            <path d="M3.8 12h16.4M12 3.6c2.4 2.5 3.6 5.3 3.6 8.4S14.4 17.9 12 20.4c-2.4-2.5-3.6-5.3-3.6-8.4S9.6 6.1 12 3.6z" />
-          </svg>
-        </span>
-        <span class="command-brand__copy">
-          <h1 class="command-brand__title">M-PHOTO</h1>
-          <span class="command-brand__sub">照片定位助手</span>
-        </span>
-      </div>
-
-      <nav class="session-breadcrumb" aria-label="当前定位进度">
-        <span class="breadcrumb-step">
-          <span class="breadcrumb-index">01</span>
-          <span class="sr-only">国家</span>
-          <strong :title="countryBreadcrumb">{{ countryBreadcrumb }}</strong>
-        </span>
-        <span class="breadcrumb-arrow" aria-hidden="true">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
-            <path d="M5 12h14M14 7l5 5-5 5" />
-          </svg>
-        </span>
-        <span class="breadcrumb-step breadcrumb-step--city">
-          <span class="breadcrumb-index">02</span>
-          <span class="sr-only">城市</span>
-          <strong :title="cityBreadcrumb">{{ cityBreadcrumb }}</strong>
-        </span>
-      </nav>
-
-      <div class="command-session" :class="liveStatus.tone" :title="sessionStatus">
-        <span class="session-dot" :class="{ active: hasSession, busy }" />
-        <span class="command-session__text">{{ sessionStatus }}</span>
-      </div>
-
-      <div class="focus-switch" role="group" aria-label="界面布局">
-        <button
-          v-for="mode in FOCUS_MODES"
-          :key="mode.key"
-          type="button"
-          class="focus-mode-btn"
-          :class="{ active: focusMode === mode.key }"
-          :aria-pressed="focusMode === mode.key"
-          :aria-label="mode.label"
-          :title="mode.hint"
-          @click="setFocusMode(mode.key)"
-        >
-          <svg v-if="mode.key === 'collab'" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" aria-hidden="true">
-            <path d="M8 9h6M8 13h4M6 18l-3 2 1-4a7 7 0 1 1 12 0" />
-            <path d="M13 10h5M13 14h3M18 18l3 2-1-4a6 6 0 0 0-4-5" />
-          </svg>
-          <svg v-else-if="mode.key === 'map'" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" aria-hidden="true">
-            <path d="m3 6 5-2 8 3 5-2v14l-5 2-8-3-5 2zM8 4v14M16 7v14" />
-          </svg>
-          <svg v-else width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" aria-hidden="true">
-            <rect x="3" y="4" width="18" height="16" rx="2.5" />
-            <circle cx="9" cy="9" r="1.7" />
-            <path d="m21 15-5-5L6 20" />
-          </svg>
-          <span class="focus-label">{{ mode.label }}</span>
-        </button>
-      </div>
-
-      <button
-        type="button"
-        class="command-action"
-        :class="{ active: historyOpen }"
-        :aria-expanded="historyOpen"
-        aria-controls="reasoning-history-drawer"
-        :disabled="!historyAllowed"
-        :title="historyAllowed ? '打开对话记录' : '核对完成并查看候选后可打开对话记录'"
-        @click="openHistory"
-      >
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" aria-hidden="true">
-          <path d="M3 12a9 9 0 1 0 3-6.7L3 8" />
-          <path d="M3 3v5h5M12 7v5l3 2" />
-        </svg>
-        <span class="command-action__label">对话</span>
-      </button>
-
-      <button type="button" class="command-action command-action--strong" @click="newAnalysis">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" aria-hidden="true">
-          <path d="M12 5v14M5 12h14" />
-        </svg>
-        <span class="command-action__label">新建</span>
-      </button>
-    </header>
+    <CommandBar
+      :root-ref="layoutElementRefs.commandBar"
+      :background-inert="backgroundInert"
+      :has-session="hasSession"
+      :busy="busy"
+      :session-status="sessionStatus"
+      :live-tone="liveStatus.tone"
+      :country-breadcrumb="countryBreadcrumb"
+      :city-breadcrumb="cityBreadcrumb"
+      :focus-mode="focusMode"
+      :history-open="historyOpen"
+      :history-allowed="historyAllowed"
+      @focus-mode="setFocusMode"
+      @open-history="openHistory"
+      @new-analysis="newAnalysis"
+    />
 
     <main class="map-stage" aria-label="候选地图" :inert="backgroundInert">
-      <div ref="mapHostRef" class="map-host">
+      <div :ref="layoutElementRefs.mapHost" class="map-host">
         <GeoMap
           :scores="guidedCountryScores"
           :confirmed-iso="session.confirmedIso.value"
@@ -1669,489 +1229,110 @@ async function requestCities(iso: string, sourceIso?: string | null): Promise<vo
       </div>
     </main>
 
-    <AnimatePresence>
-      <motion.div
-        v-if="isMobile && mobileEvidenceOpen"
-        key="mobile-evidence-backdrop"
-        class="mobile-evidence-backdrop"
-        aria-hidden="true"
-        :initial="reduceMotion ? false : { opacity: 0 }"
-        :animate="{ opacity: 1 }"
-        :exit="{ opacity: 0 }"
-        :transition="{ duration: reduceMotion ? 0 : 0.18 }"
-        @click="closeMobileEvidence"
-      />
-    </AnimatePresence>
-
-    <aside
-      v-show="evidenceAnchorVisible"
-      ref="evidenceDockRef"
-      class="dock-anchor evidence-dock-anchor"
-      :class="{ 'is-mobile-open': isMobile && mobileEvidenceOpen, 'is-collapsed': showEvidenceThumbnail }"
+    <EvidenceDock
+      :root-ref="layoutElementRefs.evidenceDock"
+      :dialog-ref="layoutElementRefs.mobileEvidenceDialog"
+      :visible="evidenceAnchorVisible"
+      :collapsed="showEvidenceThumbnail"
+      :is-mobile="isMobile"
+      :mobile-open="mobileEvidenceOpen"
       :inert="historyOpen"
-      aria-label="照片与线索"
-    >
-      <motion.button
-        v-if="showEvidenceThumbnail"
-        type="button"
-        class="dock-thumbnail evidence-thumbnail"
-        aria-label="展开照片与线索"
-        :initial="enterFrom"
-        :animate="enterSettle"
-        :transition="enterEase"
-        @click="expandEvidenceDock"
-      >
-        <span class="dock-thumbnail__media">
-          <img v-if="previewUrl" :src="previewUrl" alt="" />
-          <span v-else class="dock-thumbnail__empty" aria-hidden="true">
-            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
-              <rect x="3" y="4" width="18" height="16" rx="2.5" />
-              <path d="m21 15-5-5L6 20" />
-            </svg>
-          </span>
-          <span class="dock-thumbnail__badge">{{ session.imageUrl.value ? 'PHOTO' : 'UPLOAD' }}</span>
-        </span>
-        <span class="dock-thumbnail__copy">
-          <strong>照片与线索</strong>
-          <small>{{ clueCount }} 条线索</small>
-        </span>
-      </motion.button>
+      :image-present="Boolean(session.imageUrl.value)"
+      :preview-url="previewUrl"
+      :clue-count="clueCount"
+      :region-report-count="regionReports.length"
+      :click-points="clickPoints"
+      :clues="session.clues.value"
+      :recent-clue-keys="recentClueKeys"
+      :uploading="uploading"
+      :upload-notice="uploadNotice"
+      :selected-file-name="selectedFile?.name ?? null"
+      :has-session="hasSession"
+      :has-local-preview="Boolean(localPreviewUrl)"
+      :candidates="candidatePanelBindings"
+      :guided-active="guided.active.value"
+      :guided-country-allowed="!guided.active.value || guided.dialogue.value?.stage === 'country'"
+      :mobile-tab="mobileEvidenceTab"
+      @expand="expandEvidenceDock"
+      @collapse="collapseEvidenceDock"
+      @close="closeMobileEvidence"
+      @open-tab="openMobileEvidence"
+      @file="onFile"
+      @upload="upload"
+      @open-viewer="openImageViewer"
+      @locate-clue="openFocusedClue"
+    />
 
-      <section
-        v-else
-        ref="mobileEvidenceDialogRef"
-        class="floating-dock evidence-dock"
-        :role="isMobile ? 'dialog' : undefined"
-        :aria-modal="isMobile ? 'true' : undefined"
-        :tabindex="isMobile ? -1 : undefined"
-        aria-labelledby="evidence-dock-title"
-      >
-        <header class="dock-head">
-          <div class="dock-heading">
-            <span class="section-kicker">EVIDENCE</span>
-            <h2 id="evidence-dock-title">照片与线索</h2>
-          </div>
-          <div class="dock-head__actions">
-            <span v-if="session.imageUrl.value" class="dock-state-chip">{{ regionReports.length }} 次分析</span>
-            <button
-              v-if="!isMobile"
-              type="button"
-              class="icon-btn"
-              aria-label="收起照片与线索"
-              title="收起为缩略图"
-              @click="collapseEvidenceDock"
-            >
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" aria-hidden="true">
-                <path d="m15 18-6-6 6-6" />
-              </svg>
-            </button>
-            <button
-              v-else
-              type="button"
-              class="icon-btn"
-              data-modal-autofocus
-              aria-label="关闭照片与线索浮层"
-              @click="closeMobileEvidence"
-            >
-              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" aria-hidden="true">
-                <path d="M6 6l12 12M18 6 6 18" />
-              </svg>
-            </button>
-          </div>
-        </header>
-
-        <div v-if="isMobile" class="evidence-mobile-tabs" role="tablist" aria-label="照片、线索与参考">
-          <button type="button" role="tab" :aria-selected="mobileEvidenceTab === 'photo'" :class="{ active: mobileEvidenceTab === 'photo' }" @click="openMobileEvidence('photo')">照片</button>
-          <button type="button" role="tab" :aria-selected="mobileEvidenceTab === 'clues'" :class="{ active: mobileEvidenceTab === 'clues' }" @click="openMobileEvidence('clues')">线索 <span>{{ clueCount }}</span></button>
-          <button type="button" role="tab" :aria-selected="mobileEvidenceTab === 'references'" :class="{ active: mobileEvidenceTab === 'references' }" @click="openMobileEvidence('references')">参考</button>
-        </div>
-
-        <div class="evidence-scroll">
-          <section v-if="!isMobile || mobileEvidenceTab === 'photo'" class="evidence-section evidence-section--photo">
-            <div class="dock-section-heading">
-              <div>
-                <span class="section-kicker">PHOTO</span>
-                <h3>照片</h3>
-              </div>
-              <span v-if="session.imageUrl.value" class="dock-muted">点击更换</span>
-            </div>
-
-            <UploadPanel
-              :preview-url="previewUrl"
-              :click-points="clickPoints"
-              :disabled="uploading"
-              @file="onFile"
-            />
-            <div v-if="uploadNotice" class="inline-error">{{ uploadNotice }}</div>
-            <div v-if="selectedFile" class="file-chip">
-              <span>{{ selectedFile.name }}</span>
-              <span class="state">{{ hasSession && !localPreviewUrl ? '已分析' : '待上传' }}</span>
-            </div>
-            <button
-              v-if="selectedFile && (!hasSession || localPreviewUrl)"
-              type="button"
-              class="primary-btn upload-btn"
-              :disabled="uploading"
-              @click="upload"
-            >
-              {{ uploading ? '上传并分析中…' : '上传并分析' }}
-            </button>
-
-            <div class="evidence-actions">
-              <button
-                type="button"
-                class="ghost-btn evidence-viewer-btn"
-                :disabled="!session.imageUrl.value"
-                @click="openImageViewer"
-              >
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" aria-hidden="true">
-                  <circle cx="11" cy="11" r="6.5" />
-                  <path d="m16 16 4 4M8 11h6M11 8v6" />
-                </svg>
-                区域分析
-              </button>
-              <span class="evidence-footnote">分析结果仅作参考 · 位置不是照片 GPS</span>
-            </div>
-          </section>
-
-          <section v-if="!isMobile || mobileEvidenceTab === 'clues'" class="evidence-section evidence-section--clues">
-            <div class="dock-section-heading">
-              <div>
-                <span class="section-kicker">OBSERVATIONS</span>
-                <h3>线索 <span class="dock-count">{{ clueCount }}</span></h3>
-              </div>
-              <span class="dock-muted">按可靠度</span>
-            </div>
-            <ClueList
-              :clues="session.clues.value"
-              :loading="uploading"
-              :recent-clue-keys="recentClueKeys"
-              @locate-clue="openFocusedClue"
-            />
-          </section>
-
-          <section v-if="!isMobile || mobileEvidenceTab === 'references'" class="evidence-section evidence-section--references">
-            <div class="dock-section-heading">
-              <div>
-                <span class="section-kicker">REFERENCES</span>
-                <h3>参考街景</h3>
-              </div>
-              <span class="dock-muted">仅供参考</span>
-            </div>
-            <CandidatePanel
-              surface="references"
-              embedded
-              :scores="guidedCountryScores"
-              :confirmed-iso="session.confirmedIso.value"
-              :selected-iso="selectedIso"
-              :exclusions="exclusionChips"
-              :busy="busy"
-              :guided-mode="guided.active.value"
-              :guided-country-allowed="!guided.active.value || guided.dialogue.value?.stage === 'country'"
-              :guided-candidates="guidedVisibleCandidates"
-              :guided-candidates-unlocked="guidedCandidateSurfaceVisible"
-              :guided-confirmation-ready="guidedConfirmationReady"
-              :guided-data-ready="guidedDataReady"
-              :guided-stage="guided.dialogue.value?.stage ?? null"
-              :city-scores="visibleCityScores"
-              :city-country-iso="session.cityCountryIso.value"
-              :cities-status="session.citiesStatus.value"
-              :country-options="countryOptions"
-              :city-busy="cityBusy"
-              :city-notice="cityNotice"
-              :city-source-iso="citySourceIso"
-              :city-source-label="citySourceLabel"
-            />
-          </section>
-        </div>
-      </section>
-    </aside>
-
-    <aside
-      v-show="reasoningAnchorVisible"
-      ref="reasoningDockRef"
-      class="dock-anchor reasoning-dock-anchor"
-      :class="{ 'is-wide': reasoningWide, 'mobile-task-sheet': isMobile, 'is-collapsed': showReasoningTaskChip, 'is-guided-loading': guided.active.value && !guided.dialogue.value }"
-      :data-sheet-state="mobileSheetState"
+    <ReasoningDock
+      :root-ref="layoutElementRefs.reasoningDock"
+      :visible="reasoningAnchorVisible"
+      :collapsed="showReasoningTaskChip"
+      :wide="reasoningWide"
+      :is-mobile="isMobile"
+      :sheet-state="mobileSheetState"
       :inert="backgroundInert"
-      aria-label="定位任务"
-    >
-      <motion.button
-        v-if="showReasoningTaskChip"
-        type="button"
-        class="reasoning-task-chip"
-        aria-label="展开定位任务"
-        :initial="enterFrom"
-        :animate="enterSettle"
-        :transition="enterEase"
-        @click="expandReasoningDock"
-      >
-        <span class="reasoning-task-chip__icon" aria-hidden="true">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9">
-            <path d="M21 12a8 8 0 0 1-8 8H4l2-3a8 8 0 1 1 15-5z" />
-            <path d="M8 10h8M8 14h5" />
-          </svg>
-        </span>
-        <span class="reasoning-task-chip__copy">
-          <span>定位任务</span>
-          <strong>定位助手</strong>
-          <small>{{ liveStatus.text }}</small>
-        </span>
-        <span class="live-dot" :class="liveStatus.tone" aria-hidden="true" />
-      </motion.button>
+      :guided-active="guided.active.value"
+      :guided-loading="guided.active.value && !guided.dialogue.value"
+      :messages="session.messages.value"
+      :pending-messages="pendingMessages"
+      :live-status="liveStatus"
+      :question-pending="questionPending"
+      :inference-notice="inferenceNotice"
+      :guided="guidedDialogueBindings"
+      :candidates="candidatePanelBindings"
+      :feedback-action="session.action.value"
+      :feedback-draft="feedbackDraft"
+      :feedback-busy="feedbackBusy || uploading"
+      :has-session="hasSession"
+      :legacy-loading="pointBusy || feedbackBusy"
+      @expand="expandReasoningDock"
+      @collapse="collapseReasoningDock"
+      @toggle-width="toggleReasoningWidth"
+      @sheet-state="setMobileSheetState"
+      @update:feedback-draft="feedbackDraft = $event"
+      @feedback="onFeedback"
+      @retry-pending="retryPending"
+      @dismiss-pending="dismissPending"
+      @confirm="onCountryConfirm"
+      @reject="onCountryReject"
+      @select-country="selectedIso = $event"
+      @select-guided-target="selectGuidedTarget"
+      @confirm-guided-target="confirmGuidedTarget"
+      @reject-guided-target="rejectGuidedTarget"
+      @request-cities="requestCities"
+      @select-location="selectGuidedTarget"
+      @confirm-location="confirmGuidedTarget"
+      @reject-location="rejectGuidedTarget"
+      @confirm-clue="guided.confirmClue"
+      @reject-clue="guided.rejectClue"
+      @answer="(payload) => guided.answer(payload.value)"
+      @unknown="guided.unknown()"
+      @retract-target="guided.retractTarget"
+      @retract-clue="guided.retractClue"
+      @backtrack="guided.backtrack"
+      @next-phase="guided.nextPhase()"
+      @back-to-review="guided.returnToReview()"
+      @review-back="guided.reviewBack()"
+      @free-text="onGuidedFreeText"
+      @retry="retryGuidedOperation"
+    />
 
-      <motion.section
-        v-show="!showReasoningTaskChip"
-        class="floating-dock reasoning-dock"
-        aria-labelledby="reasoning-dock-title"
-        :initial="enterFrom"
-        :animate="enterSettle"
-        :transition="enterEase"
-      >
-        <header class="dock-head reasoning-dock__head">
-          <div class="dock-heading">
-            <span class="section-kicker">REASONING</span>
-            <h2 id="reasoning-dock-title">定位助手</h2>
-            <span class="dock-muted">{{ session.messages.value.length }} 条</span>
-          </div>
-          <div class="dock-head__actions">
-            <div v-if="isMobile" class="sheet-state-switch" role="group" aria-label="任务面板高度">
-              <button type="button" :class="{ active: mobileSheetState === 'peek' }" :aria-pressed="mobileSheetState === 'peek'" title="精简高度，保留输入框" @click="setMobileSheetState('peek')">精简</button>
-              <button type="button" :class="{ active: mobileSheetState === 'half' }" :aria-pressed="mobileSheetState === 'half'" title="半屏展开任务" @click="setMobileSheetState('half')">半屏</button>
-              <button type="button" :class="{ active: mobileSheetState === 'full' }" :aria-pressed="mobileSheetState === 'full'" title="全屏展开任务" @click="setMobileSheetState('full')">全屏</button>
-            </div>
-            <template v-else>
-              <button
-                type="button"
-                class="icon-btn width-toggle"
-                :class="{ active: reasoningWide }"
-                :aria-pressed="reasoningWide"
-                :aria-label="reasoningWide ? '还原面板宽度' : '加宽面板'"
-                :title="reasoningWide ? '还原宽度' : '加宽到约 560px'"
-                @click="toggleReasoningWidth"
-              >
-                <svg v-if="!reasoningWide" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" aria-hidden="true">
-                  <path d="M4 5v14M20 5v14M8 12h8M11 9l3 3-3 3" />
-                </svg>
-                <svg v-else width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" aria-hidden="true">
-                  <path d="M4 5v14M20 5v14M8 12h8M13 9l-3 3 3 3" />
-                </svg>
-              </button>
-              <button
-                type="button"
-                class="icon-btn"
-                aria-label="收起助手面板"
-                title="收起为任务卡"
-                @click="collapseReasoningDock"
-              >
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" aria-hidden="true">
-                  <path d="m9 6 6 6-6 6" />
-                </svg>
-              </button>
-            </template>
-          </div>
-        </header>
+    <HistoryDrawer
+      :dialog-ref="layoutElementRefs.historyDialog"
+      :open="historyOpen"
+      :messages="session.messages.value"
+      :pending-messages="pendingMessages"
+      :loading="pointBusy || feedbackBusy"
+      @close="closeHistory"
+      @retry="retryPending"
+      @dismiss="dismissPending"
+    />
 
-        <motion.div
-          :key="`${liveStatus.tone}:${liveStatus.text}`"
-          class="reasoning-live"
-          :class="liveStatus.tone"
-          role="status"
-          aria-live="polite"
-          :initial="reduceMotion ? false : { opacity: 0.4 }"
-          :animate="{ opacity: 1 }"
-          :transition="{ duration: reduceMotion ? 0 : 0.2 }"
-        >
-          <span class="live-dot" aria-hidden="true" />
-          <span>{{ liveStatus.text }}</span>
-          <span v-if="questionPending" class="chat-alert">待回答</span>
-        </motion.div>
-
-        <div class="reasoning-body" :class="{ 'has-legacy-candidates': !guided.active.value }">
-          <motion.div
-            v-if="inferenceNotice"
-            class="inference-notice reasoning-notice"
-            role="status"
-            :initial="enterFrom"
-            :animate="enterSettle"
-            :transition="enterEase"
-          >
-            {{ inferenceNotice }}
-          </motion.div>
-
-          <div class="reasoning-grid">
-            <div class="reasoning-primary">
-              <GuidedDialoguePanel
-                v-if="guided.active.value"
-                :dialogue="guided.dialogue.value"
-                :candidates="guided.topCandidates.value"
-                :action="guided.action.value"
-                :confidence="guided.confidence.value"
-                :confidence-shortcut="guided.confidenceShortcut.value"
-                :confidence-candidates="guided.confidenceCandidates.value"
-                :loading="guided.loading.value"
-                :applying="guided.applying.value"
-                :external-busy="uploading || feedbackBusy || pointBusy || cityBusy"
-                :error="guided.error.value"
-                :conflict="guided.conflict.value"
-                :can-retry="guided.canRetry.value"
-                :receipt="guided.receipt.value"
-                :selected-guided-target-key="selectedGuidedTargetKey"
-                :suggested-free-text="guidedDraftText"
-                :free-text-submission="guidedFreeTextSubmission"
-                :phase="guided.phase.value"
-                :candidates-unlocked="guidedRankingsUnlocked"
-                :can-review-back="guided.canReviewBack.value"
-                :location-confirmation-ready="guidedConfirmationReady"
-                :recent-clue-ids="guided.recentClueIds.value"
-                @select-location="selectGuidedTarget"
-                @confirm-location="confirmGuidedTarget"
-                @reject-location="rejectGuidedTarget"
-                @confirm-clue="guided.confirmClue"
-                @reject-clue="guided.rejectClue"
-                @answer="(payload) => guided.answer(payload.value)"
-                @unknown="guided.unknown()"
-                @retract-target="guided.retractTarget"
-                @retract-clue="guided.retractClue"
-                @backtrack="guided.backtrack"
-                @next-phase="guided.nextPhase()"
-                @back-to-review="guided.returnToReview()"
-                @review-back="guided.reviewBack()"
-                @free-text="onGuidedFreeText"
-                @retry="retryGuidedOperation"
-              />
-
-              <div v-else class="legacy-reasoning">
-                <div class="legacy-thread">
-                  <ChatLog
-                    :messages="session.messages.value"
-                    :pending="pendingMessages"
-                    :loading="pointBusy || feedbackBusy"
-                    @retry="retryPending"
-                    @dismiss="dismissPending"
-                  />
-                </div>
-                <FeedbackBar
-                  v-model:draft="feedbackDraft"
-                  :action="session.action.value"
-                  :busy="feedbackBusy || uploading"
-                  :disabled="!hasSession"
-                  @feedback="onFeedback"
-                />
-              </div>
-            </div>
-
-            <CandidatePanel
-              v-if="!guided.active.value"
-              surface="candidates"
-              class="legacy-candidate-panel"
-              :scores="guidedCountryScores"
-              :confirmed-iso="session.confirmedIso.value"
-              :selected-iso="selectedIso"
-              :exclusions="exclusionChips"
-              :busy="busy"
-              :guided-mode="false"
-              :guided-country-allowed="true"
-              :guided-candidates="guidedVisibleCandidates"
-              :guided-candidates-unlocked="guidedCandidateSurfaceVisible"
-              :guided-confirmation-ready="guidedConfirmationReady"
-              :guided-data-ready="guidedDataReady"
-              :guided-stage="guided.dialogue.value?.stage ?? null"
-              :city-scores="visibleCityScores"
-              :city-country-iso="session.cityCountryIso.value"
-              :cities-status="session.citiesStatus.value"
-              :country-options="countryOptions"
-              :city-busy="cityBusy"
-              :city-notice="cityNotice"
-              :city-source-iso="citySourceIso"
-              :city-source-label="citySourceLabel"
-              @confirm="onCountryConfirm"
-              @reject="onCountryReject"
-              @select-country="selectedIso = $event"
-              @select-guided-target="selectGuidedTarget"
-              @confirm-guided-target="confirmGuidedTarget"
-              @reject-guided-target="rejectGuidedTarget"
-              @request-cities="requestCities"
-            />
-          </div>
-        </div>
-      </motion.section>
-    </aside>
-
-    <AnimatePresence>
-      <motion.div
-        v-if="historyOpen"
-        key="history-layer"
-        class="history-layer"
-        :initial="reduceMotion ? false : { opacity: 0 }"
-        :animate="{ opacity: 1 }"
-        :exit="{ opacity: 0 }"
-        :transition="{ duration: reduceMotion ? 0 : 0.18 }"
-      >
-        <div class="drawer-backdrop" @click="closeHistory" />
-        <motion.div
-          class="history-drawer-shell"
-          :initial="reduceMotion ? false : { opacity: 0, x: 18 }"
-          :animate="{ opacity: 1, x: 0 }"
-          :transition="{ duration: reduceMotion ? 0 : 0.24, ease: [0.2, 0.7, 0.2, 1] }"
-        >
-        <aside
-          id="reasoning-history-drawer"
-          ref="historyDialogRef"
-          class="history-drawer"
-          role="dialog"
-          aria-modal="true"
-          tabindex="-1"
-          aria-labelledby="history-drawer-title"
-        >
-          <header class="history-drawer__head">
-            <div>
-              <span class="section-kicker">HISTORY</span>
-              <h2 id="history-drawer-title">对话记录</h2>
-              <p>对话与待发送消息</p>
-            </div>
-            <div class="history-drawer__actions">
-              <span>{{ session.messages.value.length }} 条</span>
-              <button type="button" class="icon-btn" data-modal-autofocus aria-label="关闭对话记录" @click="closeHistory">
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" aria-hidden="true">
-                  <path d="M6 6l12 12M18 6 6 18" />
-                </svg>
-              </button>
-            </div>
-          </header>
-          <div class="history-drawer__body">
-            <ChatLog
-              :messages="session.messages.value"
-              :pending="pendingMessages"
-              :loading="pointBusy || feedbackBusy"
-              tabindex="0"
-              role="region"
-              aria-label="完整对话记录，可滚动查看"
-              @retry="retryPending"
-              @dismiss="dismissPending"
-            />
-          </div>
-        </aside>
-        </motion.div>
-      </motion.div>
-    </AnimatePresence>
-
-    <AnimatePresence>
-      <motion.div
-        v-if="errorMessage"
-        key="error-banner"
-        class="error-banner"
-        role="alert"
-        :inert="backgroundInert"
-        :initial="reduceMotion ? false : { opacity: 0, y: 10 }"
-        :animate="{ opacity: 1, y: 0 }"
-        :exit="{ opacity: 0, y: 6 }"
-        :transition="{ duration: reduceMotion ? 0 : 0.2 }"
-      >
-        <span>{{ errorMessage }}</span>
-        <button type="button" aria-label="关闭错误提示" @click="errorMessage = null">×</button>
-      </motion.div>
-    </AnimatePresence>
+    <ErrorBanner
+      :message="errorMessage"
+      :inert="backgroundInert"
+      @close="errorMessage = null"
+    />
 
     <ConfirmLocationDialog
       v-if="confirmCandidate"
