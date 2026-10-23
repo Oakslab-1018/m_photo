@@ -47,7 +47,7 @@ def main():
    files.update({str(directory/rel):value for rel,value in hashes(directory).items()})
   live={str(root/rel):sha(root/rel) for rel in ('inference/streetclip/predictor.py','inference/streetclip/service.py','inference/streetclip/app.py','inference/streetclip/config.py','inference/gpuocr/runtime.py')}
   write(control/'snapshot.json',{'created_at':now(),'frozen_files':files,'live_inference_files':live})
-  job={'schema_version':1,'kind':'accelerated_three_arm_eval','status':'prepared','repo_root':str(root),'run_dir':str(run),'prepared_at':now(),'expected_samples':2997,'reused_samples':reused,'new_samples':2997-reused,'ocr_device_new':'cuda','ocr_device_reused':'per_record','mixed_runtime':True,'workers':2,'batch_size':4,'geocoder_enabled':False,'llm_enabled':False,'capture':str(run/'capture'),'replay':str(replay_dir),'automatic_restart':False}
+  job={'schema_version':1,'kind':'accelerated_three_arm_eval','status':'prepared','repo_root':str(root),'run_dir':str(run),'prepared_at':now(),'expected_samples':2997,'reused_samples':reused,'new_samples':2997-reused,'ocr_device_new':'cuda','ocr_device_reused':'per_record','mixed_runtime':True,'workers':2,'batch_size':4,'geocoder_enabled':False,'llm_enabled':False,'capture':str(run/'capture'),'replay':str(run/'replay'),'automatic_restart':False}
   write(jobfile,job);print('Prepared '+str(run));return
  if not a.execute:raise RuntimeError('Use --prepare or --execute')
  job=json.loads(jobfile.read_text(encoding='utf-8'));reused=int(job['reused_samples']);snapshot=json.loads((control/'snapshot.json').read_text(encoding='utf-8'))
